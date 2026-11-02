@@ -33,13 +33,11 @@ if os.getcwd() not in sys.path:
 COLAB_CELL_SCRAPE_AND_EXTRACT = """
 import os
 from perception.detector import ClashRoyaleDetector
-from configs.constants import DEFAULT_DECK_CLASSES
 from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
 
-# Step 1: Initialize detector with 2.6 Hog Cycle card classes (or pass --weights path)
+# Step 1: Initialize detector with global card vocabulary & optional unit weights
 detector = ClashRoyaleDetector(
-    weights=None,  # Pass path to trained yolov8_cr_units.pt if available
-    card_classes=DEFAULT_DECK_CLASSES,
+    weights="checkpoints/yolov8_cr_units.pt" if os.path.exists("checkpoints/yolov8_cr_units.pt") else None
 )
 
 # Step 2: Initialize retroactive trajectory extractor
@@ -53,7 +51,7 @@ extractor = YouTubeTrajectoryExtractor(
 # High-level Clash Royale tournament / top ladder replay URLs
 YOUTUBE_VOD_URLS = [
     # (url, player_side: 'bottom' or 'top')
-    ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "bottom"),
+    ("https://www.youtube.com/watch?v=VIDEO_ID_HERE", "bottom"),
 ]
 
 os.makedirs("./data/trajectories", exist_ok=True)
@@ -82,8 +80,7 @@ COLAB_CELL_TRAIN = """
     --save_dir ./checkpoints \
     --epochs 25 \
     --batch_size 64 \
-    --lr 1e-3 \
-    --synthetic
+    --lr 1e-3
 
 # Download trained checkpoints to your local Windows machine
 from google.colab import files

@@ -37,8 +37,8 @@ The extractor downloads YouTube tournament/top ladder match VoDs, samples frames
 
 ```python
 # Cell 2: Extract Trajectories from YouTube Gameplay
+import os
 from perception.detector import ClashRoyaleDetector
-from configs.constants import DEFAULT_DECK_CLASSES
 from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
 
 # Add YouTube match URLs with player perspective ('bottom' or 'top')
@@ -47,7 +47,10 @@ YOUTUBE_URLS = [
     ("https://www.youtube.com/watch?v=VIDEO_ID_2", "top"),
 ]
 
-detector = ClashRoyaleDetector(card_classes=DEFAULT_DECK_CLASSES)
+# Initialize detector with global card vocabulary & optional weights
+detector = ClashRoyaleDetector(
+    weights="checkpoints/yolov8_cr_units.pt" if os.path.exists("checkpoints/yolov8_cr_units.pt") else None
+)
 extractor = YouTubeTrajectoryExtractor(
     detector=detector,
     lookback_frames=5,   # 500ms lookback before card leaves hand
