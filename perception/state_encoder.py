@@ -38,6 +38,66 @@ class Detection:
     category: str = "ground"  # 'ground', 'air', 'building', 'spell', 'clock'
 
 
+def canonicalize_perspective(
+    arena_grid: np.ndarray,
+    tower_hps: List[float],
+    player_side: str = "bottom",
+) -> Tuple[np.ndarray, List[float]]:
+    """
+    Canonicalizes perspective so ally is always on the bottom.
+    If player_side == 'top':
+      - Rotates arena grid 180 degrees.
+      - Swaps ally (channels 0,1,2) and enemy (channels 3,4,5).
+      - Swaps ally and enemy tower HPs (with left/right mirror).
+    """
+    if player_side.lower() == "bottom":
+        return arena_grid, tower_hps
+
+    # 1. Rotate 180 degrees on spatial axes (height=1, width=2)
+    # rot90 twice flips both vertical and horizontal
+    canon_grid = np.rot90(arena_grid, 2, axes=(1, 2)).copy()
+
+    # 2. Swap ally and enemy channels:
+    # 0 (ally_ground) <-> 3 (enemy_ground)
+    # 1 (ally_air)    <-> 4 (enemy_air)
+    # 2 (ally_bldg)   <-> 5 (enemy_bldg)
+    ally_channels = canon_grid[0:3].copy()
+    enemy_channels = canon_grid[3:6].copy()
+    canon_grid[0:3] = enemy_channels
+    canon_grid[3:6] = ally_channels
+
+    # 3. Swap tower HPs: [ally_k, ally_l, ally_r, enemy_k, enemy_l, enemy_r]
+    # For top player, enemy towers become their ally towers, mirrored horizontally
+    canon_hps = [
+        tower_hps[3], tower_hps[5], tower_hps[4],
+        tower_hps[0], tower_hps[2], tower_hps[1]
+    ]
+
+    return canon_grid, canon_hps
+
+
+def canonicalize_tile_coordinate(tile_y: int, tile_x: int, player_side: str = "bottom") -> Tuple[int, int]:
+    """Rotates tile coordinate 180 degrees if player_side is 'top'."""
+    if player_side.lower() == "top":
+        return (ARENA_ROWS - 1) - tile_y, (ARENA_COLS - 1) - tile_x
+    return tile_y, tile_x
+
+
+def stack_spatial_frames(grid_frames: List[np.ndarray], target_frames: int = 4) -> np.ndarray:
+    """
+    Stacks last 4 frames of arena_grid (each 8, 32, 18) into (32, 32, 18) float32.
+    If fewer than target_frames exist, repeats the oldest frame.
+    """
+    if not grid_frames:
+        return np.zeros((target_frames * 8, ARENA_ROWS, ARENA_COLS), dtype=np.float32)
+
+    frames = list(grid_frames)
+    while len(frames) < target_frames:
+        frames.insert(0, frames[0].copy())
+    recent_frames = frames[-target_frames:]
+    return np.concatenate(recent_frames, axis=0).astype(np.float32)
+
+
 class StateEncoder:
     """
     Encodes raw visual perception and UI readings into neural network inputs.
@@ -106,7 +166,8 @@ class StateEncoder:
         hand_card_ids: List[int],
         tower_hps: Optional[List[float]] = None,
         time_left: float = 180.0,
-        est_enemy_elixir: float = 5.0,
+        est_enemy_elixir: float = 0.5,  # Constant 0.5 in v1
+        last_action: Tuple[int, int] = (0, 0),  # (action_card 0..4, action_tile 0..575)
         frame_width: Optional[int] = None,
         frame_height: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -119,7 +180,8 @@ class StateEncoder:
             tower_hps: List of 6 floats [0.0..1.0] for:
                        [ally_king, ally_left, ally_right, enemy_king, enemy_left, enemy_right]
             time_left: Match time remaining in seconds (e.g. 180.0 down to 0.0)
-            est_enemy_elixir: Estimated enemy elixir (0.0 to 10.0)
+            est_enemy_elixir: Constant 0.5 in v1
+            last_action: Tuple of (last_card_slot, last_tile_idx)
             frame_width, frame_height: Optional viewport dimensions for coordinate normalization
 
         Returns:
@@ -185,9 +247,17 @@ class StateEncoder:
 
         # ----------------------------------------------------------------------
         # 2. Build Scalars Vector: (12,) normalized to [0, 1]
+        # Features:
+        # [0]: ally_elixir_norm
+        # [1]: est_enemy_elixir = 0.5 (constant in v1)
+        # [2]: time_norm (time_left / 300.0)
+        # [3..8]: 6x tower_hps [ak, al, ar, ek, el, er]
+        # [9]: last_action_card / 4.0
+        # [10]: last_action_tile / 575.0
+        # [11]: is_double_elixir (1.0 if time_left <= 120.0 else 0.0)
         # ----------------------------------------------------------------------
         ally_elixir_norm = float(np.clip(elixir / 10.0, 0.0, 1.0))
-        enemy_elixir_norm = float(np.clip(est_enemy_elixir / 10.0, 0.0, 1.0))
+        enemy_elixir_norm = 0.5  # Constant in v1
         time_norm = float(np.clip(time_left / 300.0, 0.0, 1.0))
 
         ak_hp = float(np.clip(tower_hps[0], 0.0, 1.0))
@@ -197,9 +267,10 @@ class StateEncoder:
         el_hp = float(np.clip(tower_hps[4], 0.0, 1.0))
         er_hp = float(np.clip(tower_hps[5], 0.0, 1.0))
 
+        last_card, last_tile = last_action
+        last_card_norm = float(np.clip(last_card / 4.0, 0.0, 1.0))
+        last_tile_norm = float(np.clip(last_tile / max(1.0, float(TOTAL_TILES - 1)), 0.0, 1.0))
         is_double_elixir = 1.0 if time_left <= 120.0 else 0.0
-        is_overtime = 1.0 if time_left <= 60.0 and (ak_hp > 0 and ek_hp > 0) else 0.0
-        ally_king_active = 1.0 if (ak_hp < 0.999 or al_hp <= 0.05 or ar_hp <= 0.05) else 0.0
 
         scalars = np.array([
             ally_elixir_norm,
@@ -211,10 +282,12 @@ class StateEncoder:
             ek_hp,
             el_hp,
             er_hp,
+            last_card_norm,
+            last_tile_norm,
             is_double_elixir,
-            is_overtime,
-            ally_king_active,
         ], dtype=np.float32)
+
+        assert scalars.shape == (12,), f"Expected scalars shape (12,), got {scalars.shape}"
 
         # ----------------------------------------------------------------------
         # 3. Build Legal Card Action Mask: (5,)

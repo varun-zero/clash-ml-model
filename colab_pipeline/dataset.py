@@ -82,6 +82,13 @@ class ClashRoyaleDataset(Dataset):
             scalar[4], scalar[5] = scalar[5], scalar[4]
             scalar[7], scalar[8] = scalar[8], scalar[7]
 
+            # Mirror last action tile in scalars (index 10)
+            prev_tile = int(round(scalar[10] * 575.0))
+            if prev_tile > 0:
+                py = prev_tile // ARENA_COLS
+                px = prev_tile % ARENA_COLS
+                scalar[10] = (py * ARENA_COLS + ((ARENA_COLS - 1) - px)) / 575.0
+
             # 3. Flip action tile column
             tile_y = atile // ARENA_COLS
             tile_x = atile % ARENA_COLS

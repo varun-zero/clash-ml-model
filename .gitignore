@@ -18,3 +18,4 @@ data/trajectories/*.npz
 *.log
 .vscode/
 .idea/
+

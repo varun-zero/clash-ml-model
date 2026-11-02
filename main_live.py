@@ -3,7 +3,7 @@ CR-Zero Real-Time Inference Execution Engine (Windows 11 Runtime).
 Operates at 5-10 Hz on RTX 3050 6GB GPU:
 DXCam -> YOLO Detection (FP16) -> StateEncoder -> DeckConditionedPolicy -> ADB Harness.
 """
-from typing import Optional
+from typing import Optional, List, Tuple
 import os
 import sys
 import time
@@ -11,6 +11,7 @@ import signal
 import cv2
 import numpy as np
 import torch
+from collections import deque
 
 # Ensure repository root is in sys.path
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -20,12 +21,16 @@ if REPO_ROOT not in sys.path:
 from configs.constants import (
     ARENA_COLS,
     ARENA_ROWS,
+    DEFAULT_DECK_CLASSES,
+    NUM_CARD_CLASSES_V1,
+    STACKED_GRID_CHANNELS,
+    NUM_SCALARS,
     CARD_DATABASE,
     grid_to_screen_pixel,
     hand_slot_to_screen_pixel,
 )
 from perception.detector import ClashRoyaleDetector
-from perception.state_encoder import StateEncoder
+from perception.state_encoder import StateEncoder, stack_spatial_frames
 from policy.model import DeckConditionedPolicy
 from controller.adb_harness import ADBHarness
 from controller.screen_capture import WindowCapture
@@ -39,17 +44,21 @@ class CRZeroLiveAgent:
     def __init__(
         self,
         checkpoint_path: str = "./checkpoints/cr_zero_policy_best.pt",
-        yolo_path: Optional[str] = None,
+        weights: Optional[str] = None,
         device_address: str = "127.0.0.1:5555",
         screen_width: int = 540,
         screen_height: int = 960,
         target_hz: float = 5.0,
+        temperature: float = 0.7,
+        play_thresh: float = 0.35,
         show_debug_window: bool = True,
         use_fp16: bool = True,
     ):
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.target_dt = 1.0 / max(1.0, target_hz)
+        self.temperature = temperature
+        self.play_thresh = play_thresh
         self.show_debug_window = show_debug_window
         self.running = False
 
@@ -66,15 +75,21 @@ class CRZeroLiveAgent:
 
         # 2. Vision Perception (YOLO / Template / Heuristics)
         self.detector = ClashRoyaleDetector(
-            model_path=yolo_path,
+            weights=weights,
             conf_threshold=0.35,
             device="cuda:0" if torch.cuda.is_available() else "cpu",
             use_fp16=use_fp16,
+            card_classes=DEFAULT_DECK_CLASSES,
         )
         self.encoder = StateEncoder()
 
-        # 3. Decision Policy Model
-        self.policy = DeckConditionedPolicy(num_card_classes=135, card_emb_dim=16, num_scalars=12).to(self.torch_device)
+        # 3. Decision Policy Model (Stacked 32 channels, 12 scalars, 10 card classes)
+        self.policy = DeckConditionedPolicy(
+            num_card_classes=NUM_CARD_CLASSES_V1,
+            card_emb_dim=16,
+            num_scalars=12,
+            in_channels=STACKED_GRID_CHANNELS,
+        ).to(self.torch_device)
         self._load_policy_weights(checkpoint_path)
         self.policy.eval()
 
@@ -101,12 +116,16 @@ class CRZeroLiveAgent:
         """Main real-time control loop."""
         self.running = True
         print("\n" + "=" * 60)
-        print("CR-Zero Live Loop Active (Target: 5 Hz). Press Ctrl+C or 'q' to stop.")
+        print(f"CR-Zero Live Loop Active (Target: {1.0/self.target_dt:.1f} Hz, Temp: {self.temperature}, Thresh: {self.play_thresh}).")
+        print("Press Ctrl+C or 'q' to stop.")
         print("=" * 60 + "\n")
 
         fps_timer = time.time()
         frame_counter = 0
         fps = 0.0
+
+        grid_history = deque(maxlen=4)
+        last_action = (0, 0)
 
         try:
             while self.running:
@@ -119,19 +138,32 @@ class CRZeroLiveAgent:
 
                 # Step 2: Vision & Observation parsing
                 t_det0 = time.perf_counter()
-                obs = self.detector.parse_frame(frame)
+                obs = self.detector.parse_frame(
+                    frame,
+                    time_left=180.0,
+                    est_enemy_elixir=0.5,
+                    last_action=last_action,
+                )
                 dt_det = (time.perf_counter() - t_det0) * 1000.0
 
                 arena_grid = obs["arena_grid"]
+                grid_history.append(arena_grid.copy())
+                # Stack last 4 frames into (32, 32, 18)
+                stacked_grid = stack_spatial_frames(list(grid_history), target_frames=4)
+
                 scalars = obs["scalars"]
-                legal_card_mask = obs["legal_card_mask"]
+                legal_card_mask = obs["legal_card_mask"].copy()
                 hand_ids = obs["hand_ids"]
                 elixir = obs["elixir"]
+
+                # No-Wait guard at elixir == 10: force playing a card so elixir is never burned
+                if elixir >= 9.8 and legal_card_mask[1:].any():
+                    legal_card_mask[0] = False
 
                 # Step 3: Policy evaluation
                 t_pol0 = time.perf_counter()
                 # Prepare tensors on GPU
-                grid_tensor = torch.from_numpy(arena_grid).unsqueeze(0).to(self.torch_device)
+                grid_tensor = torch.from_numpy(stacked_grid).unsqueeze(0).to(self.torch_device)
                 scalar_tensor = torch.from_numpy(scalars).unsqueeze(0).to(self.torch_device)
                 hand_tensor = torch.tensor([hand_ids], dtype=torch.long, device=self.torch_device)
                 cmask_tensor = torch.from_numpy(legal_card_mask).unsqueeze(0).to(self.torch_device)
@@ -140,16 +172,21 @@ class CRZeroLiveAgent:
                 default_tile_mask = self.encoder.get_legal_tile_mask(card_id=0)
                 tmask_tensor = torch.from_numpy(default_tile_mask).unsqueeze(0).to(self.torch_device)
 
-                # Forward pass
+                # Forward pass with temperature sampling
                 chosen_slot, chosen_tile, card_conf, tile_conf = self.policy.predict_action(
                     arena_grid=grid_tensor,
                     scalars=scalar_tensor,
                     hand_card_ids=hand_tensor,
                     legal_card_mask=cmask_tensor,
                     legal_tile_mask=tmask_tensor,
-                    temperature=0.8,
+                    temperature=self.temperature,
                     deterministic=False,
                 )
+
+                # Play threshold check: if card confidence is low and waiting is legal, revert to Wait
+                if chosen_slot > 0 and card_conf < self.play_thresh and legal_card_mask[0]:
+                    chosen_slot = 0
+                    chosen_tile = 0
 
                 # If card slot chosen > 0 (i.e. play a card 1..4), recalculate tile with true card legality
                 if chosen_slot > 0:
@@ -164,7 +201,7 @@ class CRZeroLiveAgent:
                         hand_card_ids=hand_tensor,
                         legal_card_mask=cmask_tensor,
                         legal_tile_mask=tmask_tensor,
-                        temperature=0.8,
+                        temperature=self.temperature,
                     )
                 dt_pol = (time.perf_counter() - t_pol0) * 1000.0
 
@@ -179,8 +216,10 @@ class CRZeroLiveAgent:
                     card_meta = CARD_DATABASE.get(played_card_id, {"name": f"Card #{played_card_id}"})
                     self.adb.play_card(slot_idx, tile_y, tile_x, non_blocking=True)
                     action_desc = f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) [Conf: {card_conf*100:.1f}%]"
+                    last_action = (chosen_slot, chosen_tile)
                 else:
                     action_desc = f"WAIT (Elixir: {elixir:.1f}/10) [Conf: {card_conf*100:.1f}%]"
+                    last_action = (0, 0)
                 dt_act = (time.perf_counter() - t_act0) * 1000.0
 
                 # FPS and Latency bookkeeping
@@ -281,21 +320,57 @@ class CRZeroLiveAgent:
         print("[CR-Zero] Shutdown complete.")
 
 
+def run_dummy_tap(
+    device_address: str = "127.0.0.1:5555",
+    screen_width: int = 540,
+    screen_height: int = 960,
+):
+    """
+    Executes a single fixed card tap sequence (slot 0 -> tile 20, 9) to test ADB actuation and exits.
+    """
+    print(f"\n[CR-Zero Dummy] Initiating dummy ADB tap mode on {device_address}...")
+    adb = ADBHarness(
+        device_address=device_address,
+        screen_width=screen_width,
+        screen_height=screen_height,
+        tap_delay_ms=40,
+    )
+    try:
+        print("[CR-Zero Dummy] Dispatching fixed tap: Slot 0 -> Arena Tile (20, 9)...")
+        adb.play_card(slot_idx=0, tile_y=20, tile_x=9, non_blocking=False)
+        time.sleep(0.5)
+        print("[CR-Zero Dummy] Fixed test tap successfully executed.")
+    except Exception as e:
+        print(f"[CR-Zero Dummy] Notice: Tap dispatch encountered: {e}")
+    finally:
+        adb.close()
+    print("[CR-Zero Dummy] Dummy test completed cleanly.\n")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="CR-Zero Real-Time Live Windows Agent")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/cr_zero_policy_best.pt", help="Policy checkpoint")
-    parser.add_argument("--yolo", type=str, default=None, help="YOLO model path (.pt or .onnx)")
+    parser.add_argument("--weights", "--yolo", dest="weights", type=str, default=None, help="YOLO model path (.pt or .onnx)")
     parser.add_argument("--device", type=str, default="127.0.0.1:5555", help="ADB device host:port")
     parser.add_argument("--hz", type=float, default=5.0, help="Inference frequency (Hz)")
+    parser.add_argument("--temp", "--temperature", dest="temp", type=float, default=0.7, help="Temperature for action sampling (default: 0.7)")
+    parser.add_argument("--play-thresh", type=float, default=0.35, help="Confidence threshold to play a card vs wait (default: 0.35)")
     parser.add_argument("--no-debug", action="store_true", help="Disable debug visual window")
+    parser.add_argument("--dummy", action="store_true", help="Run dummy mode: tap fixed card/tile to test ADB and exit")
     args = parser.parse_args()
+
+    if args.dummy:
+        run_dummy_tap(device_address=args.device)
+        return
 
     agent = CRZeroLiveAgent(
         checkpoint_path=args.checkpoint,
-        yolo_path=args.yolo,
+        weights=args.weights,
         device_address=args.device,
         target_hz=args.hz,
+        temperature=args.temp,
+        play_thresh=args.play_thresh,
         show_debug_window=not args.no_debug,
     )
     agent.run()

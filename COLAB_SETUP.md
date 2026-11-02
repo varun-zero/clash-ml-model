@@ -22,8 +22,8 @@ if torch.cuda.is_available():
     print(f"Active GPU:      {torch.cuda.get_device_name(0)}")
 
 # Clone repository or upload your files
-!git clone https://github.com/your-username/CR-Zero.git
-%cd CR-Zero
+!git clone https://github.com/varun-zero/clash-ml-model.git
+%cd clash-ml-model
 import sys, os
 if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
@@ -37,27 +37,32 @@ The extractor downloads YouTube tournament/top ladder match VoDs, samples frames
 
 ```python
 # Cell 2: Extract Trajectories from YouTube Gameplay
+from perception.detector import ClashRoyaleDetector
+from configs.constants import DEFAULT_DECK_CLASSES
 from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
 
-# Add YouTube match URLs (tournament gameplay, top 200 ladder matches)
+# Add YouTube match URLs with player perspective ('bottom' or 'top')
 YOUTUBE_URLS = [
-    "https://www.youtube.com/watch?v=VIDEO_ID_1",
-    "https://www.youtube.com/watch?v=VIDEO_ID_2",
+    ("https://www.youtube.com/watch?v=VIDEO_ID_1", "bottom"),
+    ("https://www.youtube.com/watch?v=VIDEO_ID_2", "top"),
 ]
 
+detector = ClashRoyaleDetector(card_classes=DEFAULT_DECK_CLASSES)
 extractor = YouTubeTrajectoryExtractor(
+    detector=detector,
     lookback_frames=5,   # 500ms lookback before card leaves hand
     lookahead_frames=2,  # 200ms forward lookahead
-    wait_ratio=0.5       # 1 Wait sample for every 2 Card plays (prevents spamming)
+    wait_ratio=0.5       # 1 Wait sample for every 2 Card plays (~33% waits in dataset)
 )
 
 os.makedirs("./data/trajectories", exist_ok=True)
 
-for i, url in enumerate(YOUTUBE_URLS):
+for i, (url, player_side) in enumerate(YOUTUBE_URLS):
     out_shard = f"./data/trajectories/shard_{i:03d}.npz"
-    print(f"Processing VoD [{i+1}/{len(YOUTUBE_URLS)}]: {url}")
+    print(f"Processing VoD [{i+1}/{len(YOUTUBE_URLS)}] (Side: {player_side}): {url}")
     dataset = extractor.process_video(
         video_source=url,
+        player_side=player_side,
         output_npz_path=out_shard,
         max_duration_seconds=360  # 6 minutes per match
     )

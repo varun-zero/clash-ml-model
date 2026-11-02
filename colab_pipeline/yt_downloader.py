@@ -27,8 +27,8 @@ def download_youtube_vod(
     else:
         url = url_or_id
 
-    # Format selection: best mp4 video <= max_resolution + best m4a audio
-    format_selector = f"bestvideo[height<={max_resolution}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_resolution}][ext=mp4]/best"
+    # Format selection: AVC1 encoded mp4 <= 720p for fast OpenCV decoding
+    format_selector = "bestvideo[height<=720][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][vcodec^=avc1][ext=mp4]/best[height<=720][ext=mp4]/best"
 
     cmd = [
         "yt-dlp",

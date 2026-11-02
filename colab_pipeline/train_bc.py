@@ -26,7 +26,14 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from configs.constants import NUM_TOTAL_CARDS, TOTAL_TILES, ARENA_ROWS, ARENA_COLS
+from configs.constants import (
+    NUM_TOTAL_CARDS,
+    NUM_CARD_CLASSES_V1,
+    STACKED_GRID_CHANNELS,
+    TOTAL_TILES,
+    ARENA_ROWS,
+    ARENA_COLS,
+)
 from policy.model import DeckConditionedPolicy
 from colab_pipeline.dataset import ClashRoyaleDataset, create_dataloaders
 
@@ -51,6 +58,7 @@ def export_to_onnx(
 ):
     """
     Exports trained DeckConditionedPolicy to ONNX with dynamic batch axis.
+    Always calls model.eval() and exports with teacher_card_action=None.
     """
     try:
         import onnx
@@ -58,25 +66,26 @@ def export_to_onnx(
         print(f"[Export] Notice: 'onnx' Python package is not installed. Skipping ONNX export. Install with 'pip install onnx'.")
         return
 
-    model.eval()
-    dummy_grid = torch.randn(1, 8, 32, 18, device=device)
+    model.eval()  # Mandatory eval before ONNX export
+    dummy_grid = torch.randn(1, 32, 32, 18, device=device)
     dummy_scalar = torch.randn(1, 12, device=device)
-    dummy_hand = torch.tensor([[20, 21, 22, 2]], dtype=torch.long, device=device)
+    dummy_hand = torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device)
     dummy_cmask = torch.ones(1, 5, dtype=torch.bool, device=device)
     dummy_tmask = torch.ones(1, 576, dtype=torch.bool, device=device)
 
     os.makedirs(os.path.dirname(os.path.abspath(export_path)), exist_ok=True)
 
-    print(f"[Export] Exporting ONNX model to {export_path}...")
+    print(f"[Export] Exporting ONNX model to {export_path} (teacher_card_action=None)...")
     try:
+        # Explicitly pass teacher_card_action=None
         torch.onnx.export(
             model,
-            (dummy_grid, dummy_scalar, dummy_hand, dummy_cmask, dummy_tmask),
+            (dummy_grid, dummy_scalar, dummy_hand, dummy_cmask, dummy_tmask, None),
             export_path,
             export_params=True,
             opset_version=17,
             do_constant_folding=True,
-            input_names=["arena_grid", "scalars", "hand_card_ids", "legal_card_mask", "legal_tile_mask"],
+            input_names=["arena_grid", "scalars", "hand_card_ids", "legal_card_mask", "legal_tile_mask", "teacher_card_action"],
             output_names=["masked_card_logits", "masked_tile_logits"],
             dynamic_axes={
                 "arena_grid": {0: "batch_size"},
@@ -105,8 +114,11 @@ def train_one_epoch(
     total_loss_accum = 0.0
     card_loss_accum = 0.0
     tile_loss_accum = 0.0
+
     card_correct = 0
-    tile_correct = 0
+    wait_correct = 0
+    total_waits = 0
+    tile_within_2_count = 0
     total_samples = 0
     total_card_plays = 0
 
@@ -116,6 +128,12 @@ def train_one_epoch(
     for batch in loader:
         grid, scalar, hand, cmask, tmask, target_card, target_tile = [b.to(device) for b in batch]
         B = grid.size(0)
+
+        # Force target tile to be legal in mask
+        played_mask = target_card > 0
+        if played_mask.any():
+            b_indices = torch.arange(B, device=device)[played_mask]
+            tmask[b_indices, target_tile[played_mask]] = True
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -134,7 +152,6 @@ def train_one_epoch(
             loss_card = card_criterion(card_logits, target_card)
 
             # 2. Tile loss (only on frames where card was actually played: target_card > 0)
-            played_mask = target_card > 0
             if played_mask.any():
                 loss_tile = tile_criterion(tile_logits[played_mask], target_tile[played_mask])
             else:
@@ -157,9 +174,24 @@ def train_one_epoch(
         pred_cards = torch.argmax(card_logits, dim=-1)
         card_correct += (pred_cards == target_card).sum().item()
 
+        # Wait accuracy (target_card == 0)
+        wait_mask = target_card == 0
+        if wait_mask.any():
+            wait_correct += (pred_cards[wait_mask] == 0).sum().item()
+            total_waits += wait_mask.sum().item()
+
+        # Tile-within-2-tiles metric
         if played_mask.any():
             pred_tiles = torch.argmax(tile_logits[played_mask], dim=-1)
-            tile_correct += (pred_tiles == target_tile[played_mask]).sum().item()
+            targ_tiles = target_tile[played_mask]
+
+            pred_y = pred_tiles // ARENA_COLS
+            pred_x = pred_tiles % ARENA_COLS
+            targ_y = targ_tiles // ARENA_COLS
+            targ_x = targ_tiles % ARENA_COLS
+
+            dist = torch.sqrt((pred_y.float() - targ_y.float()) ** 2 + (pred_x.float() - targ_x.float()) ** 2)
+            tile_within_2_count += (dist <= 2.0).sum().item()
             total_card_plays += played_mask.sum().item()
 
         total_samples += B
@@ -169,7 +201,8 @@ def train_one_epoch(
         "card_loss": card_loss_accum / max(1, total_samples),
         "tile_loss": tile_loss_accum / max(1, total_card_plays),
         "card_acc": card_correct / max(1, total_samples),
-        "tile_acc": tile_correct / max(1, total_card_plays),
+        "wait_acc": wait_correct / max(1, total_waits),
+        "tile_within_2": tile_within_2_count / max(1, total_card_plays),
     }
 
 
@@ -187,7 +220,9 @@ def evaluate(
     card_loss_accum = 0.0
     tile_loss_accum = 0.0
     card_correct = 0
-    tile_correct = 0
+    wait_correct = 0
+    total_waits = 0
+    tile_within_2_count = 0
     total_samples = 0
     total_card_plays = 0
     tile_dist_errors = []
@@ -195,6 +230,12 @@ def evaluate(
     for batch in loader:
         grid, scalar, hand, cmask, tmask, target_card, target_tile = [b.to(device) for b in batch]
         B = grid.size(0)
+
+        # Force target tile legal in mask
+        played_mask = target_card > 0
+        if played_mask.any():
+            b_indices = torch.arange(B, device=device)[played_mask]
+            tmask[b_indices, target_tile[played_mask]] = True
 
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
             card_logits, tile_logits = model(
@@ -207,7 +248,6 @@ def evaluate(
             )
             loss_card = card_criterion(card_logits, target_card)
 
-            played_mask = target_card > 0
             if played_mask.any():
                 loss_tile = tile_criterion(tile_logits[played_mask], target_tile[played_mask])
             else:
@@ -223,13 +263,24 @@ def evaluate(
         pred_cards = torch.argmax(card_logits, dim=-1)
         card_correct += (pred_cards == target_card).sum().item()
 
+        wait_mask = target_card == 0
+        if wait_mask.any():
+            wait_correct += (pred_cards[wait_mask] == 0).sum().item()
+            total_waits += wait_mask.sum().item()
+
         if played_mask.any():
             pred_tiles = torch.argmax(tile_logits[played_mask], dim=-1)
-            tile_correct += (pred_tiles == target_tile[played_mask]).sum().item()
+            targ_tiles = target_tile[played_mask]
+
+            pred_y = pred_tiles // ARENA_COLS
+            pred_x = pred_tiles % ARENA_COLS
+            targ_y = targ_tiles // ARENA_COLS
+            targ_x = targ_tiles % ARENA_COLS
+
+            dist = torch.sqrt((pred_y.float() - targ_y.float()) ** 2 + (pred_x.float() - targ_x.float()) ** 2)
+            tile_within_2_count += (dist <= 2.0).sum().item()
             total_card_plays += played_mask.sum().item()
-            tile_dist_errors.append(
-                compute_tile_distance_error(pred_tiles, target_tile[played_mask])
-            )
+            tile_dist_errors.append(float(dist.mean().item()))
 
         total_samples += B
 
@@ -238,7 +289,8 @@ def evaluate(
         "val_card_loss": card_loss_accum / max(1, total_samples),
         "val_tile_loss": tile_loss_accum / max(1, total_card_plays),
         "val_card_acc": card_correct / max(1, total_samples),
-        "val_tile_acc": tile_correct / max(1, total_card_plays),
+        "val_wait_acc": wait_correct / max(1, total_waits),
+        "val_tile_within_2": tile_within_2_count / max(1, total_card_plays),
         "val_tile_dist_err": float(np.mean(tile_dist_errors)) if tile_dist_errors else 0.0,
     }
 
@@ -246,9 +298,12 @@ def evaluate(
 def generate_synthetic_shard(output_path: str, num_samples: int = 500):
     """Generates synthetic dataset shard for instant pipeline testing."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    grids = np.random.randn(num_samples, 8, 32, 18).astype(np.float32)
+    # Stacked 4 frames = 32 channels
+    grids = np.random.randn(num_samples, 32, 32, 18).astype(np.float32)
     scalars = np.random.rand(num_samples, 12).astype(np.float32)
-    hands = np.random.randint(1, 110, size=(num_samples, 4), dtype=np.int64)
+    scalars[:, 1] = 0.5  # Constant in v1
+    # 2.6 Hog card IDs: 1..8
+    hands = np.random.randint(1, 9, size=(num_samples, 4), dtype=np.int64)
     cmasks = np.ones((num_samples, 5), dtype=bool)
     tmasks = np.ones((num_samples, 576), dtype=bool)
 
@@ -311,7 +366,12 @@ def main():
     )
 
     # Model, Optimizer, Scheduler, Mixed Precision Scaler
-    model = DeckConditionedPolicy(num_card_classes=NUM_TOTAL_CARDS, card_emb_dim=16, num_scalars=12).to(device)
+    model = DeckConditionedPolicy(
+        num_card_classes=NUM_CARD_CLASSES_V1,
+        card_emb_dim=16,
+        num_scalars=12,
+        in_channels=32,
+    ).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
     scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=(device.type == "cuda"))
@@ -320,9 +380,9 @@ def main():
     best_pt_path = os.path.join(args.save_dir, "cr_zero_policy_best.pt")
     best_onnx_path = os.path.join(args.save_dir, "cr_zero_policy_best.onnx")
 
-    print("\n" + "=" * 70)
-    print("Epoch | Train Loss | Card Acc | Tile Acc | Val Loss | Val Card | Val Tile | Tile Err")
-    print("=" * 70)
+    print("\n" + "=" * 85)
+    print("Epoch | Train Loss | Card Acc | Wait Acc | Tile<=2 | Val Loss | Val Card | Val Wait | Val Tile<=2")
+    print("=" * 85)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -342,12 +402,12 @@ def main():
             f"{epoch:02d}/{args.epochs:02d} | "
             f"{train_stats['loss']:.4f}     | "
             f"{train_stats['card_acc'] * 100:.1f}%    | "
-            f"{train_stats['tile_acc'] * 100:.1f}%    | "
+            f"{train_stats['wait_acc'] * 100:.1f}%    | "
+            f"{train_stats['tile_within_2'] * 100:.1f}%   | "
             f"{val_stats['val_loss']:.4f}   | "
             f"{val_stats['val_card_acc'] * 100:.1f}%     | "
-            f"{val_stats['val_tile_acc'] * 100:.1f}%     | "
-            f"{val_stats['val_tile_dist_err']:.2f} tiles "
-            f"({dt:.1f}s)"
+            f"{val_stats['val_wait_acc'] * 100:.1f}%     | "
+            f"{val_stats['val_tile_within_2'] * 100:.1f}% ({dt:.1f}s)"
         )
 
         # Save checkpoint if best

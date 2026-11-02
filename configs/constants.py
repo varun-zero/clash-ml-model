@@ -65,6 +65,29 @@ TOWER_BOXES: Dict[str, Tuple[float, float, float, float]] = {
 # ID 0 is strictly reserved for "Wait / No-Op / Empty"
 # ==============================================================================
 
+# v1 Default Deck: 2.6 Hog Cycle (10 classes: 0=Wait, 1..8=2.6 Hog Cards, 9=Unknown)
+# Compatible with KataCR card_classification dataset
+DEFAULT_DECK_CLASSES: List[Dict] = [
+    {"id": 0, "name": "Wait", "cost": 0, "is_spell": False, "category": "none"},
+    {"id": 1, "name": "Hog Rider", "cost": 4, "is_spell": False, "category": "ground"},
+    {"id": 2, "name": "Cannon", "cost": 3, "is_spell": False, "category": "building"},
+    {"id": 3, "name": "Musketeer", "cost": 4, "is_spell": False, "category": "ground"},
+    {"id": 4, "name": "Ice Golem", "cost": 2, "is_spell": False, "category": "ground"},
+    {"id": 5, "name": "Ice Spirit", "cost": 1, "is_spell": False, "category": "ground"},
+    {"id": 6, "name": "Skeletons", "cost": 1, "is_spell": False, "category": "ground"},
+    {"id": 7, "name": "Fireball", "cost": 4, "is_spell": True, "category": "spell"},
+    {"id": 8, "name": "The Log", "cost": 2, "is_spell": True, "category": "spell"},
+    {"id": 9, "name": "Unknown", "cost": 0, "is_spell": False, "category": "none"},
+]
+
+NUM_CARD_CLASSES_V1: int = len(DEFAULT_DECK_CLASSES)  # 10
+STACKED_GRID_CHANNELS: int = 32  # 4 frames * 8 channels = 32
+NUM_SCALARS: int = 12
+
+DECK_ID_TO_COST: Dict[int, int] = {c["id"]: c["cost"] for c in DEFAULT_DECK_CLASSES}
+DECK_ID_TO_IS_SPELL: Dict[int, bool] = {c["id"]: c["is_spell"] for c in DEFAULT_DECK_CLASSES}
+DECK_NAME_TO_ID: Dict[str, int] = {c["name"].lower(): c["id"] for c in DEFAULT_DECK_CLASSES}
+
 CARD_DATABASE: Dict[int, Dict] = {
     0: {"name": "Wait", "cost": 0, "is_spell": False, "category": "none"},
     1: {"name": "Arrows", "cost": 3, "is_spell": True, "category": "spell"},

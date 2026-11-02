@@ -20,9 +20,9 @@ if torch.cuda.is_available():
 # Step 3: Clone or link repository if not already in workspace
 import os
 import sys
-if not os.path.exists("CR-Zero"):
-    !git clone https://github.com/your-username/CR-Zero.git
-    %cd CR-Zero
+if not os.path.exists("clash-ml-model"):
+    !git clone https://github.com/varun-zero/clash-ml-model.git
+    %cd clash-ml-model
 if os.getcwd() not in sys.path:
     sys.path.insert(0, os.getcwd())
 """
@@ -31,28 +31,40 @@ if os.getcwd() not in sys.path:
 # CELL 2: Scrape YouTube Gameplay & Reconstruct Trajectories
 # ==============================================================================
 COLAB_CELL_SCRAPE_AND_EXTRACT = """
+import os
+from perception.detector import ClashRoyaleDetector
+from configs.constants import DEFAULT_DECK_CLASSES
 from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
+
+# Step 1: Initialize detector with 2.6 Hog Cycle card classes (or pass --weights path)
+detector = ClashRoyaleDetector(
+    weights=None,  # Pass path to trained yolov8_cr_units.pt if available
+    card_classes=DEFAULT_DECK_CLASSES,
+)
+
+# Step 2: Initialize retroactive trajectory extractor
+extractor = YouTubeTrajectoryExtractor(
+    detector=detector,
+    lookback_frames=5,   # 500ms lookback before card leaves hand
+    lookahead_frames=2,  # 200ms forward lookahead
+    wait_ratio=0.5       # 1 Wait sample for every 2 Card plays (~33% waits in dataset)
+)
 
 # High-level Clash Royale tournament / top ladder replay URLs
 YOUTUBE_VOD_URLS = [
-    # Top 1 ladder match or CRL world finals VoD link
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # Replace with actual CR match VoD URL
+    # (url, player_side: 'bottom' or 'top')
+    ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "bottom"),
 ]
-
-extractor = YouTubeTrajectoryExtractor(
-    lookback_frames=5,   # 500ms lookback before card leaves hand
-    lookahead_frames=2,  # 200ms forward lookahead
-    wait_ratio=0.5       # 1 Wait sample for every 2 Card plays (balanced dataset)
-)
 
 os.makedirs("./data/trajectories", exist_ok=True)
 
-for i, url in enumerate(YOUTUBE_VOD_URLS):
+for i, (url, player_side) in enumerate(YOUTUBE_VOD_URLS):
     output_shard = f"./data/trajectories/shard_{i:03d}.npz"
     try:
-        print(f"--- Extracting Trajectory from VoD {i+1}/{len(YOUTUBE_VOD_URLS)} ---")
+        print(f"--- Extracting Trajectory from VoD {i+1}/{len(YOUTUBE_VOD_URLS)} (Side: {player_side}) ---")
         dataset = extractor.process_video(
             video_source=url,
+            player_side=player_side,
             output_npz_path=output_shard,
             max_duration_seconds=300 # Extract first 5 minutes per VoD
         )

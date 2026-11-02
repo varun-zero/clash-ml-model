@@ -8,7 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from configs.constants import NUM_TOTAL_CARDS, TOTAL_TILES, ARENA_ROWS, ARENA_COLS
+from configs.constants import (
+    NUM_TOTAL_CARDS,
+    NUM_CARD_CLASSES_V1,
+    STACKED_GRID_CHANNELS,
+    NUM_SCALARS,
+    TOTAL_TILES,
+    ARENA_ROWS,
+    ARENA_COLS,
+)
 
 
 class ResidualBlock2D(nn.Module):
@@ -32,7 +40,7 @@ class DeckConditionedPolicy(nn.Module):
     """
     Modular policy network conditioned on arbitrary deck compositions.
     Architecture:
-      1. Spatial CNN: Encodes (B, 8, 32, 18) board tensor into 2560-dim vector.
+      1. Spatial CNN: Encodes (B, 32, 32, 18) stacked 4-frame board tensor into 2560-dim vector.
       2. Card Embeddings + Scalar MLP: Encodes hand card IDs and 12 game scalars into 128-dim vector.
       3. Shared Trunk: 512-dim fusion representation.
       4. Head 1 (Card Head): 5 action logits [Wait, Slot0, Slot1, Slot2, Slot3] with Elixir legality mask.
@@ -40,28 +48,34 @@ class DeckConditionedPolicy(nn.Module):
     """
     def __init__(
         self,
-        num_card_classes: int = NUM_TOTAL_CARDS,
+        num_card_classes: int = NUM_CARD_CLASSES_V1,
         card_emb_dim: int = 16,
         num_scalars: int = 12,
+        in_channels: int = STACKED_GRID_CHANNELS,  # 32 channels (4 stacked frames)
         use_residual: bool = True,
     ):
         super().__init__()
+        # Strict dimension assertions at initialization
+        assert num_scalars == 12, f"Expected 12 scalars, got {num_scalars}"
+        assert in_channels == 32, f"Expected 32 spatial input channels, got {in_channels}"
+
         self.num_card_classes = num_card_classes
         self.card_emb_dim = card_emb_dim
         self.num_scalars = num_scalars
+        self.in_channels = in_channels
         self.use_residual = use_residual
 
         # 0. Card ID Embedding Layer (0 = Wait / Empty Card)
         self.card_emb = nn.Embedding(num_card_classes, card_emb_dim, padding_idx=0)
 
-        # 1. Spatial Arena CNN: Input (B, 8, 32, 18)
-        # Conv1: (B, 8, 32, 18) -> (B, 32, 32, 18)
+        # 1. Spatial Arena CNN: Input (B, 32, 32, 18)
+        # Conv1: (B, 32, 32, 18) -> (B, 32, 32, 18)
         # Conv2: (B, 32, 32, 18) -> (B, 64, 16, 9)
         # Conv3: (B, 64, 16, 9) -> (B, 64, 8, 5)
         # Flatten: 64 * 8 * 5 = 2560
         if use_residual:
             self.spatial_conv = nn.Sequential(
-                nn.Conv2d(8, 32, kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(32),
                 nn.SiLU(),
                 ResidualBlock2D(32),
@@ -76,7 +90,7 @@ class DeckConditionedPolicy(nn.Module):
             )
         else:
             self.spatial_conv = nn.Sequential(
-                nn.Conv2d(8, 32, kernel_size=3, padding=1),
+                nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
                 nn.BatchNorm2d(32),
                 nn.SiLU(),
                 nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
@@ -89,7 +103,7 @@ class DeckConditionedPolicy(nn.Module):
             )
 
         # 2. Scalar + Hand Embedding Encoder
-        # Scalars: [ally_elixir, est_enemy_elixir, time_rem, 6x tower_hp, double_elixir, overtime, king_active] -> 12 floats
+        # Scalars (12): [ally_elixir, est_enemy_elixir=0.5, time_rem, 6x tower_hp, last_card, last_tile, double_elixir]
         # Plus 4 cards in hand: 4 * card_emb_dim
         self.scalar_mlp = nn.Sequential(
             nn.Linear(num_scalars + (4 * card_emb_dim), 128),
@@ -129,8 +143,8 @@ class DeckConditionedPolicy(nn.Module):
         """
         Forward pass.
         Args:
-            arena_grid: (B, 8, 32, 18) float32
-            scalars: (B, num_scalars) float32
+            arena_grid: (B, 32, 32, 18) float32 (4 stacked frames)
+            scalars: (B, 12) float32
             hand_card_ids: (B, 4) int64
             legal_card_mask: (B, 5) bool
             legal_tile_mask: (B, 576) bool
@@ -141,13 +155,9 @@ class DeckConditionedPolicy(nn.Module):
         """
         B = arena_grid.size(0)
 
-        # If incoming scalars dimension is 9, pad with zeros up to num_scalars
-        if scalars.size(-1) < self.num_scalars:
-            pad = torch.zeros(
-                B, self.num_scalars - scalars.size(-1),
-                device=scalars.device, dtype=scalars.dtype
-            )
-            scalars = torch.cat([scalars, pad], dim=-1)
+        # Dimension checks
+        assert arena_grid.size(1) == self.in_channels, f"Expected {self.in_channels} channels (4 stacked frames), got {arena_grid.size(1)}"
+        assert scalars.size(-1) == self.num_scalars, f"Expected {self.num_scalars} scalars, got {scalars.size(-1)}"
 
         # 1. Spatial representation (B, 2560)
         spatial_feat = self.spatial_conv(arena_grid)

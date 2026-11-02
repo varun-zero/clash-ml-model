@@ -19,6 +19,9 @@ from configs.constants import (
     ELIXIR_BAR_BOX,
     ELIXIR_TEXT_BOX,
     TOWER_BOXES,
+    DEFAULT_DECK_CLASSES,
+    DECK_ID_TO_COST,
+    DECK_ID_TO_IS_SPELL,
     CARD_DATABASE,
     CARD_NAME_TO_ID,
     screen_to_grid,
@@ -29,13 +32,17 @@ from perception.state_encoder import StateEncoder, Detection
 class ClashRoyaleDetector:
     """
     Perception engine wrapping YOLO detection, UI cropping, and board parsing.
+    Supports customizable card deck classes (default: 2.6 Hog Cycle v1, 10 classes).
     """
     def __init__(
         self,
-        model_path: Optional[str] = None,
+        weights: Optional[str] = None,
+        model_path: Optional[str] = None,  # Backward compatible alias
         conf_threshold: float = 0.35,
         device: str = "cuda:0",
         use_fp16: bool = True,
+        card_classes: Optional[List[Dict]] = None,
+        require_weights: bool = False,
     ):
         self.conf_threshold = conf_threshold
         self.device = device
@@ -44,11 +51,23 @@ class ClashRoyaleDetector:
         self.model = None
         self.onnx_session = None
 
-        if model_path and os.path.exists(model_path):
-            self._load_model(model_path)
+        # Configurable hand card classes (v1 = 2.6 Hog Cycle, 10 classes)
+        self.card_classes = card_classes or DEFAULT_DECK_CLASSES
+        self.card_names = {c["name"].lower(): c["id"] for c in self.card_classes}
+
+        weights_file = weights or model_path
+        if weights_file:
+            if not os.path.exists(weights_file):
+                raise FileNotFoundError(f"[Detector] Specified --weights file not found: {weights_file}")
+            self._load_model(weights_file)
+        elif require_weights:
+            raise ValueError("[Detector] --weights path is required and cannot be empty.")
 
     def _load_model(self, model_path: str):
         """Loads Ultralytics YOLO or ONNX model."""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"[Detector] Model file not found: {model_path}")
+
         if model_path.endswith(".onnx"):
             try:
                 import onnxruntime as ort
@@ -57,13 +76,13 @@ class ClashRoyaleDetector:
                 sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self.onnx_session = ort.InferenceSession(model_path, sess_opts, providers=providers)
             except Exception as e:
-                print(f"[Detector] Warning: Could not initialize ONNX session ({e}). Falling back to dummy.")
+                print(f"[Detector] Warning: Could not initialize ONNX session ({e}).")
         else:
             try:
                 from ultralytics import YOLO
                 self.model = YOLO(model_path)
             except Exception as e:
-                print(f"[Detector] Warning: Could not load Ultralytics YOLO ({e}).")
+                raise RuntimeError(f"[Detector] Failed to load Ultralytics YOLO from {model_path}: {e}")
 
     def detect_raw(self, frame: np.ndarray) -> List[Detection]:
         """
@@ -85,19 +104,25 @@ class ClashRoyaleDetector:
                     coords = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf[0].cpu().numpy())
                     cls_id = int(box.cls[0].cpu().numpy())
-                    name = self.model.names.get(cls_id, "")
+                    name = self.model.names.get(cls_id, "").lower()
 
-                    # Convention: classes with 'enemy_' prefix or cls_id >= 50
-                    is_ally = not name.startswith("enemy_")
-                    category = "ground"
-                    if "air" in name or "dragon" in name or "minion" in name or "balloon" in name:
+                    # Check for overlay / emote detections
+                    if "emote" in name or "banner" in name or "overlay" in name or "text" in name:
+                        category = "emote"
+                    elif "selected" in name or "card_selected" in name or "highlight" in name:
+                        category = "selected"
+                    elif "clock" in name or "drop" in name or cls_id == 999:
+                        category = "clock"
+                    elif "air" in name or "dragon" in name or "minion" in name or "balloon" in name:
                         category = "air"
                     elif "tower" in name or "hut" in name or "cannon" in name:
                         category = "building"
                     elif "spell" in name or "barrel" in name:
                         category = "spell"
-                    elif "clock" in name or cls_id == 999:
-                        category = "clock"
+                    else:
+                        category = "ground"
+
+                    is_ally = not name.startswith("enemy_")
 
                     detections.append(
                         Detection(
@@ -112,7 +137,6 @@ class ClashRoyaleDetector:
                         )
                     )
         elif self.onnx_session is not None:
-            # Preprocess frame for ONNX: resize, float32, normalize
             input_shape = self.onnx_session.get_inputs()[0].shape
             in_h, in_w = (input_shape[2], input_shape[3]) if len(input_shape) == 4 else (640, 640)
             img = cv2.resize(frame, (in_w, in_h))
@@ -121,12 +145,9 @@ class ClashRoyaleDetector:
 
             input_name = self.onnx_session.get_inputs()[0].name
             outputs = self.onnx_session.run(None, {input_name: img})
-            # Outputs format: (1, num_boxes, num_classes + 4) or similar depending on YOLO export
-            # We parse boxes exceeding conf_threshold
             raw_boxes = outputs[0]
             if len(raw_boxes.shape) == 3:
                 raw_boxes = raw_boxes[0]
-            # Handle transpose if YOLOv8 output is (num_classes + 4, num_boxes)
             if raw_boxes.shape[0] < raw_boxes.shape[1] and raw_boxes.shape[0] in (84, 85):
                 raw_boxes = raw_boxes.T
 
@@ -183,22 +204,11 @@ class ClashRoyaleDetector:
     def read_hand_cards(self, frame: np.ndarray) -> List[int]:
         """
         Reads the 4 card IDs in the player's hand slots 0..3.
-        Returns list of 4 integer card IDs (defaulting to Knight/Archers/Goblins/Fireball if unread).
+        Defaults to 2.6 Hog cycle starters: [1, 2, 3, 4]
+        (1: Hog Rider, 2: Cannon, 3: Musketeer, 4: Ice Golem).
         """
-        h, w = frame.shape[:2]
-        card_ids = [20, 21, 22, 2]  # Default fallback archetypes
-
-        for slot_idx, (sx1, sy1, sx2, sy2) in enumerate(HAND_SLOTS):
-            x1, y1 = int(sx1 * w), int(sy1 * h)
-            x2, y2 = int(sx2 * w), int(sy2 * h)
-            slot_crop = frame[y1:y2, x1:x2]
-            if slot_crop.size == 0:
-                continue
-
-            # Template matching or classifier placeholder
-            # If YOLO detects a hand card specifically, we assign it;
-            # otherwise slot maintains current ID.
-        return card_ids
+        # Default 2.6 Hog card IDs: 1 (Hog Rider), 2 (Cannon), 3 (Musketeer), 4 (Ice Golem)
+        return [1, 2, 3, 4]
 
     def read_tower_hps(self, frame: np.ndarray) -> List[float]:
         """
@@ -225,10 +235,8 @@ class ClashRoyaleDetector:
             green_mask = cv2.inRange(hsv, np.array([35, 70, 70]), np.array([85, 255, 255]))
             green_pixels = np.sum(green_mask > 0)
             if green_pixels < 10:
-                # Tower may still be full HP (no bar shown until damaged) or destroyed
                 hps[i] = 1.0
             else:
-                # Normalize HP based on observed green bar width
                 hps[i] = 0.8
         return hps
 
@@ -236,7 +244,8 @@ class ClashRoyaleDetector:
         self,
         frame: np.ndarray,
         time_left: float = 180.0,
-        est_enemy_elixir: float = 5.0
+        est_enemy_elixir: float = 0.5,
+        last_action: Tuple[int, int] = (0, 0),
     ) -> Dict[str, Any]:
         """
         Processes a full 9:16 frame and extracts all observation components:
@@ -249,6 +258,8 @@ class ClashRoyaleDetector:
             - clock_coords: list of (tile_y, tile_x)
             - tower_hps: list of 6 floats
             - detections: list of Detection
+            - selected_slot: Optional[int] (0..3) if selected card highlight detected
+            - has_overlay: bool (True if emote or text banner detected)
         """
         h, w = frame.shape[:2]
         detections = self.detect_raw(frame)
@@ -256,8 +267,11 @@ class ClashRoyaleDetector:
         hand_ids = self.read_hand_cards(frame)
         tower_hps = self.read_tower_hps(frame)
 
-        # Detect deployment clocks
+        # Detect deployment clocks, card highlights, and emote overlays
         clock_coords: List[Tuple[int, int]] = []
+        selected_slot: Optional[int] = None
+        has_overlay: bool = False
+
         for det in detections:
             if det.category == "clock":
                 center_x = (det.x1 + det.x2) / 2.0
@@ -265,6 +279,15 @@ class ClashRoyaleDetector:
                 gpos = screen_to_grid(center_x, center_y)
                 if gpos is not None:
                     clock_coords.append(gpos)
+            elif det.category == "selected":
+                cx = (det.x1 + det.x2) / 2.0
+                cy = (det.y1 + det.y2) / 2.0
+                for s_idx, (sx1, sy1, sx2, sy2) in enumerate(HAND_SLOTS):
+                    if sx1 <= cx <= sx2 and sy1 <= cy <= sy2:
+                        selected_slot = s_idx
+                        break
+            elif det.category == "emote":
+                has_overlay = True
 
         # Encode state tensors
         arena_grid, scalars, legal_card_mask = self.encoder.encode(
@@ -274,6 +297,7 @@ class ClashRoyaleDetector:
             tower_hps=tower_hps,
             time_left=time_left,
             est_enemy_elixir=est_enemy_elixir,
+            last_action=last_action,
             frame_width=w,
             frame_height=h,
         )
@@ -287,5 +311,7 @@ class ClashRoyaleDetector:
             "clock_coords": clock_coords,
             "tower_hps": tower_hps,
             "detections": detections,
+            "selected_slot": selected_slot,
+            "has_overlay": has_overlay,
         }
 

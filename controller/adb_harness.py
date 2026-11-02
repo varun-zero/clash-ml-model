@@ -96,11 +96,16 @@ class ADBHarness:
                     self._init_persistent_shell()
 
         # Fallback to direct subprocess call
-        subprocess.run(
-            [self.adb_binary, "-s", self.device_address, "shell", cmd_str],
-            capture_output=True,
-            timeout=2
-        )
+        try:
+            subprocess.run(
+                [self.adb_binary, "-s", self.device_address, "shell", cmd_str],
+                capture_output=True,
+                timeout=2
+            )
+        except FileNotFoundError:
+            print(f"[ADB] Warning: '{self.adb_binary}' executable not found in PATH.")
+        except Exception as e:
+            print(f"[ADB] Command execution error: {e}")
 
     def _dispatch_loop(self):
         """Background worker thread consuming tap commands without blocking inference."""
