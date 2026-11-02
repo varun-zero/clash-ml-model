@@ -74,11 +74,12 @@ class CRZeroLiveAgent:
         self.torch_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         print(f"[CR-Zero] Initializing (Device: {self.torch_device}, RuleBot: {use_rule_bot}, DryRun: {dry_run})...")
 
-        # 1. Screen Capture Engine (Client Area)
+        # 1. Screen Capture Engine (Client Area + Direct ADB Socket Fallback)
         self.capture = WindowCapture(
             window_title_keyword="BlueStacks",
             target_width=screen_width or 540,
             target_height=screen_height or 960,
+            adb_device=device_address,
         )
 
         # 2. Vision Perception (YOLO / Templates / OCR)

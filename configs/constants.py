@@ -34,10 +34,10 @@ ARENA_BOX: Tuple[float, float, float, float] = (0.040, 0.100, 0.960, 0.780)
 
 # The 4 playable cards in hand (slots 0..3 from left to right)
 HAND_SLOTS: List[Tuple[float, float, float, float]] = [
-    (0.130, 0.815, 0.315, 0.955),  # Slot 0
-    (0.325, 0.815, 0.510, 0.955),  # Slot 1
-    (0.520, 0.815, 0.705, 0.955),  # Slot 2
-    (0.715, 0.815, 0.900, 0.955),  # Slot 3
+    (0.222, 0.812, 0.398, 0.953),  # Slot 0
+    (0.411, 0.812, 0.583, 0.953),  # Slot 1
+    (0.600, 0.812, 0.772, 0.953),  # Slot 2
+    (0.789, 0.812, 0.961, 0.953),  # Slot 3
 ]
 
 # Next upcoming card slot (small preview on the bottom left)
@@ -196,6 +196,15 @@ CARD_DATABASE: Dict[int, Dict] = {
     111: {"name": "Furnace", "cost": 4, "is_spell": False, "category": "building"},
     112: {"name": "Goblin Cage", "cost": 4, "is_spell": False, "category": "building"},
     113: {"name": "Goblin Drill", "cost": 4, "is_spell": True, "category": "building"},  # Placed anywhere
+    114: {"name": "Tesla", "cost": 4, "is_spell": False, "category": "building"},
+    115: {"name": "Wizard", "cost": 5, "is_spell": False, "category": "ground"},
+    116: {"name": "Goblinstein", "cost": 5, "is_spell": False, "category": "ground"},
+    117: {"name": "Boss Bandit", "cost": 4, "is_spell": False, "category": "ground"},
+    118: {"name": "Berserker", "cost": 2, "is_spell": False, "category": "ground"},
+    119: {"name": "Vines", "cost": 3, "is_spell": True, "category": "spell"},
+    120: {"name": "Rune Giant", "cost": 4, "is_spell": False, "category": "ground"},
+    121: {"name": "Spirit Empress", "cost": 6, "is_spell": False, "category": "ground"},
+    122: {"name": "Ronin", "cost": 5, "is_spell": False, "category": "ground"},
 }
 
 # Total card embedding vocabulary. CARD_DATABASE currently populates 0..113;

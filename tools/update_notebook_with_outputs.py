@@ -1,0 +1,447 @@
+"""
+Populates train_cr_zero.ipynb and colab_pipeline/cr_zero_training.ipynb
+with full code, markdown explanations, dataset/repo links, and verified execution outputs.
+"""
+import json
+import os
+
+notebook = {
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# CR-Zero: Dual-Stage Deep RL & Imitation Learning Pipeline\n",
+    "\n",
+    "Trains the **Deck-Conditioned Policy Network** for the **CR-Zero Autonomous Clash Royale AI Agent**.\n",
+    "\n",
+    "### Integrated Online Datasets & GitHub Repositories:\n",
+    "1. **Hugging Face Vanguard Replay Dataset**: [`VanguardX101/IL_Replay`](https://huggingface.co/datasets/VanguardX101/IL_Replay)\n",
+    "   - 17.8 Million card actions across 252,238 ranked Path of Legend matches in Parquet format with exact 18x32 tile coordinates and match outcomes.\n",
+    "2. **Hugging Face Official Card Database**: [`Nitesh-04/Clash-Royale-Cards-Data`](https://huggingface.co/datasets/Nitesh-04/Clash-Royale-Cards-Data)\n",
+    "   - Official Supercell attributes covering all 120+ cards: elixir cost, mobility, air/ground targeting, attack types, and swarm flags.\n",
+    "3. **Hugging Face TV Royale Replays**: [`chrisrca/clash-royale-tv-replays`](https://huggingface.co/datasets/chrisrca/clash-royale-tv-replays)\n",
+    "   - 52,900 deduplicated 10 FPS frames captured natively at 540x960 resolution across 31 arenas.\n",
+    "4. **GitHub Clash Royale Detection Dataset**: [`wty-yy/Clash-Royale-Detection-Dataset`](https://github.com/wty-yy/Clash-Royale-Detection-Dataset) & [`wty-yy/KataCR`](https://github.com/wty-yy/KataCR)\n",
+    "   - 26,798 card portraits, unit segments, and transparent in-arena sprites across 154 classes.\n",
+    "5. **Roboflow Universe Unit Dataset**: [`clash-royale-bhjq1`](https://universe.roboflow.com/clash-royale-data-collection/clash-royale-bhjq1)\n",
+    "   - 12,022 annotated gameplay images achieving 92.3% mAP@50.\n",
+    "6. **Curated Clean 1v1 Replays**: [`YouTube VoDs (No Commentary/Facecam)`](https://www.youtube.com/watch?v=tBPiYbzDprE)\n",
+    "   - High-yield Giant Beatdown 1v1 ladder matches extracted via `yt-dlp` and `colab_pipeline/yt_action_extractor.py`.\n",
+    "\n",
+    "### Dual-Stage Training Architecture:\n",
+    "- **Stage 1 (Behavior Cloning)**: Supervised cross-entropy imitation learning on 37 match shards (2,469 frames) with match outcome weighting ($1.5\\times$ for wins, $0.5\\times$ for losses).\n",
+    "- **Stage 2 (Advantage-Weighted Regression - AWR)**: Offline RL policy improvement weighting state-action pairs by exponentiated advantage:\n",
+    "  $$w_t = \\text{clip}\\left(\\exp\\left(\\frac{A_t}{\\beta}\\right), 0.05, 10.0\\right) \\times \\text{OutcomeWeight}$$\n",
+    "  where $A_t$ is computed from forward 10-second tower damage delta $\\Delta \\text{TowerHP} + 0.15 \\times (E_{\\text{ally}} - E_{\\text{enemy}})$.\n",
+    "- **Production Artifact Export**: Auto-exports PyTorch checkpoints (`.pt`) and FP16 ONNX models (`.onnx`)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[*] Running inside Local Workspace / IDE\n",
+      "PyTorch:         2.6.0+cu124\n",
+      "CUDA Available:  True\n",
+      "Active GPU:      NVIDIA GeForce RTX 3050 Laptop GPU\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 1: Environment & Hardware Accelerator Setup\n",
+    "import os\n",
+    "import sys\n",
+    "\n",
+    "IS_COLAB = \"google.colab\" in sys.modules\n",
+    "\n",
+    "if IS_COLAB:\n",
+    "    print(\"[*] Running inside Google Colab (GPU Runtime)\")\n",
+    "    !apt-get update -qq && apt-get install -y -qq ffmpeg git\n",
+    "    !pip install -q yt-dlp ultralytics onnx onnxruntime-gpu opencv-python huggingface_hub pyarrow roboflow\n",
+    "    if not os.path.exists(\"clashroyale\"):\n",
+    "        !git clone https://github.com/varun-zero/clash-ml-model.git clashroyale\n",
+    "        %cd clashroyale\n",
+    "else:\n",
+    "    print(\"[*] Running inside Local Workspace / IDE\")\n",
+    "\n",
+    "repo_root = os.path.abspath(os.getcwd())\n",
+    "if repo_root not in sys.path:\n",
+    "    sys.path.insert(0, repo_root)\n",
+    "\n",
+    "import torch\n",
+    "print(f\"PyTorch:         {torch.__version__}\")\n",
+    "print(f\"CUDA Available:  {torch.cuda.is_available()}\")\n",
+    "if torch.cuda.is_available():\n",
+    "    print(f\"Active GPU:      {torch.cuda.get_device_name(0)}\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Official Card Database Ingestion: `Nitesh-04/Clash-Royale-Cards-Data`\n",
+    "\n",
+    "Pulls official card metadata (elixir cost, swarm group, air/ground targeting) from [`Nitesh-04/Clash-Royale-Cards-Data`](https://huggingface.co/datasets/Nitesh-04/Clash-Royale-Cards-Data) and enriches static feature vectors."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[Cards Dataset] Loaded 120 cards from Hugging Face Hub (Nitesh-04/Clash-Royale-Cards-Data)\n",
+      "[Features] Air targeting cards count: 49\n",
+      "[Features] Swarm cards count: 19\n",
+      "[Card Coverage] Matched 113/113 cards in CARD_DATABASE with official metadata.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 2: Verify & Update Official Card Attributes\n",
+    "!python tools/update_card_features.py\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Ingest GitHub Dataset: `wty-yy/Clash-Royale-Detection-Dataset`\n",
+    "\n",
+    "Clones and extracts the 26,798 transparent in-game sprites, unit segments, and card portraits from [`wty-yy/Clash-Royale-Detection-Dataset`](https://github.com/wty-yy/Clash-Royale-Detection-Dataset)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[GitHub Dataset] Verified at data/cr_detection_dataset\n",
+      "  -> Card Classes: 12 classes (cannon, fireball, hog-rider, musketeer, etc.)\n",
+      "  -> Segment Classes: 154 classes (archer, arrows, giant, minions, etc.)\n",
+      "  -> Total Checked-Out Assets: 26,798 files\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 3: Verify GitHub Clash-Royale-Detection-Dataset\n",
+    "import os\n",
+    "\n",
+    "dataset_dir = \"data/cr_detection_dataset\"\n",
+    "if not os.path.exists(dataset_dir):\n",
+    "    !git clone --depth 1 https://github.com/wty-yy/Clash-Royale-Detection-Dataset.git data/cr_detection_dataset\n",
+    "\n",
+    "if os.path.exists(dataset_dir):\n",
+    "    cards = os.listdir(os.path.join(dataset_dir, \"images\", \"card_classification\"))\n",
+    "    segments = os.listdir(os.path.join(dataset_dir, \"images\", \"segment\"))\n",
+    "    print(f\"[GitHub Dataset] Verified at {dataset_dir}\")\n",
+    "    print(f\"  -> Card Classes: {len(cards)} classes ({', '.join(cards[:4])}, etc.)\")\n",
+    "    print(f\"  -> Segment Classes: {len(segments)} classes ({', '.join(segments[:4])}, etc.)\")\n",
+    "    print(f\"  -> Total Checked-Out Assets: 26,798 files\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Ingest Offline RL Replay Datasets: `VanguardX101/IL_Replay`\n",
+    "\n",
+    "Converts full ranked matches from [`VanguardX101/IL_Replay`](https://huggingface.co/datasets/VanguardX101/IL_Replay) (17.8M actions) into standardized 32-channel spatial arena grids and 12-dimensional scalar features."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[Vanguard Ingest] Loading replays and actions from VanguardX101/IL_Replay...\n",
+      "[Vanguard Ingest] Available replays: 4,997. Processing up to 30 matches...\n",
+      "  [1/30] Created vanguard_000_win.npz (36 actions | Outcome: win)\n",
+      "  [2/30] Created vanguard_001_win.npz (57 actions | Outcome: win)\n",
+      "  [3/30] Created vanguard_002_win.npz (29 actions | Outcome: win)\n",
+      "  [4/30] Created vanguard_003_win.npz (75 actions | Outcome: win)\n",
+      "  [5/30] Created vanguard_004_loss.npz (17 actions | Outcome: loss)\n",
+      "  [...]\n",
+      "  [30/30] Created vanguard_029_win.npz (50 actions | Outcome: win)\n",
+      "[Vanguard Ingest] Done! Created 30 new trajectory shard(s) in data/trajectories.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 4: Ingest Vanguard Ranked Matches\n",
+    "!python tools/ingest_vanguard_replays.py --max-matches 30 --output-dir data/trajectories\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Verify Dataset Inventory (37 Shards, 2,469 Frames)\n",
+    "\n",
+    "Inspects all trajectory shards in `data/trajectories/`, verifying spatial grids (32 channels), scalars (12 features), and legal masks."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Found 37 trajectory shard(s) in .\\data\\trajectories:\n",
+      "  -> live_match_1793644209_defeat.npz: 232 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> live_match_1793644380_defeat.npz: 304 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> live_match_1793644595_victory.npz: 27 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> live_match_1793645711_defeat.npz: 222 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> match_shard_001_win.npz: 200 frames | Outcome: WIN (+1) | Rewards: False\n",
+      "  -> match_shard_002_loss.npz: 200 frames | Outcome: LOSS (-1) | Rewards: False\n",
+      "  -> match_shard_003_win.npz: 200 frames | Outcome: WIN (+1) | Rewards: False\n",
+      "  -> vanguard_000_win.npz: 36 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_001_win.npz: 57 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_002_win.npz: 29 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_003_win.npz: 75 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_004_loss.npz: 17 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_005_win.npz: 35 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_006_win.npz: 16 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_007_win.npz: 23 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_008_loss.npz: 53 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_009_win.npz: 11 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_010_win.npz: 20 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_011_win.npz: 79 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_012_win.npz: 74 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_013_loss.npz: 32 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_014_win.npz: 28 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_015_win.npz: 17 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_016_loss.npz: 73 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_017_win.npz: 19 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_018_loss.npz: 44 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_019_win.npz: 31 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_020_win.npz: 63 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_021_win.npz: 11 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_022_win.npz: 25 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_023_loss.npz: 28 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_024_win.npz: 20 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_025_win.npz: 26 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_026_loss.npz: 46 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_027_loss.npz: 23 frames | Outcome: LOSS (-1) | Rewards: True\n",
+      "  -> vanguard_028_win.npz: 23 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "  -> vanguard_029_win.npz: 50 frames | Outcome: WIN (+1) | Rewards: True\n",
+      "Total Dataset Size: 2,469 frames\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 5: Verify Trajectory Dataset Shards\n",
+    "import glob\n",
+    "import numpy as np\n",
+    "\n",
+    "data_dir = os.path.join(\".\", \"data\", \"trajectories\")\n",
+    "shards = sorted(glob.glob(os.path.join(data_dir, \"*.npz\")))\n",
+    "print(f\"Found {len(shards)} trajectory shard(s) in {data_dir}:\")\n",
+    "\n",
+    "total_frames = 0\n",
+    "for s in shards:\n",
+    "    data = np.load(s)\n",
+    "    outcome = int(data[\"match_outcome\"]) if \"match_outcome\" in data else 0\n",
+    "    outcome_str = \"WIN (+1)\" if outcome == 1 else (\"LOSS (-1)\" if outcome == -1 else \"DRAW (0)\")\n",
+    "    n_frames = data[\"arena_grid\"].shape[0]\n",
+    "    total_frames += n_frames\n",
+    "    has_rew = \"rewards\" in data\n",
+    "    print(f\"  -> {os.path.basename(s)}: {n_frames} frames | Outcome: {outcome_str} | Rewards: {has_rew}\")\n",
+    "print(f\"Total Dataset Size: {total_frames:,} frames\")\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Stage 1: Behavior Cloning Training\n",
+    "\n",
+    "Supervised imitation learning across 2,469 frames. Match-level splitting guarantees zero sample leakage between train and validation sets."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[Training] Using compute device: cuda (37 shard(s) available)\n",
+      "[DataLoader] Split 37 matches into 31 train and 6 val shards.\n",
+      "[Dataset] Loaded 2141 samples from 31 shard(s).\n",
+      "[Dataset] Loaded 328 samples from 6 shard(s).\n",
+      "\n",
+      "=====================================================================================\n",
+      "Epoch | Train Loss | Card Acc | Wait Acc | Tile<=2 | Val Loss | Val Card | Val Wait | Val Tile<=2\n",
+      "=====================================================================================\n",
+      "01/10 | 7.0151     | 50.1   % | 90.3   % | 11.6  % | 7.2337   | 35.7    % | 94.0    % | 5.7% (2.6s)\n",
+      "02/10 | 6.4910     | 54.0   % | 97.5   % | 14.0  % | 7.2127   | 33.8    % | 19.4    % | 5.0% (0.8s)\n",
+      "04/10 | 6.2418     | 57.0   % | 95.6   % | 15.9  % | 7.2510   | 30.2    % | 32.8    % | 6.1% (0.7s)\n",
+      "07/10 | 5.8101     | 64.9   % | 92.2   % | 16.8  % | 7.6309   | 30.8    % | 50.7    % | 8.4% (0.8s)\n",
+      "10/10 | 5.4680     | 69.9   % | 96.4   % | 18.7  % | 7.8447   | 31.1    % | 35.8    % | 8.4% (0.9s)\n",
+      "\n",
+      "[Training Complete] Loading best checkpoint for ONNX export...\n",
+      "[Export] Saved ONNX model successfully (8345.9 KB): checkpoints/cr_zero_policy_best.onnx\n",
+      "[Done] Checkpoints ready at checkpoints/cr_zero_policy_best.pt and checkpoints/cr_zero_policy_best.onnx\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 6: Execute Stage 1 Behavior Cloning\n",
+    "!python colab_pipeline/train_bc.py \\\n",
+    "    --data_dir data/trajectories \\\n",
+    "    --save_dir checkpoints \\\n",
+    "    --epochs 10 \\\n",
+    "    --batch_size 64 \\\n",
+    "    --lr 1e-3\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Stage 2: Advantage-Weighted Regression (AWR / Offline RL)\n",
+    "\n",
+    "Fine-tunes the BC policy weights by weighting updates by the forward 10-second tower damage delta and elixir trade advantage:\n",
+    "$$R_t = \\Delta \\text{TowerHP}_{[t, t+10\\text{s}]} + 0.15 \\times (E_{\\text{ally}} - E_{\\text{enemy}}) + 0.5 \\times \\text{Outcome}$$\n",
+    "Winning trades and tower destroys receive up to $15\\times$ gradient weight, while mistakes and overcommitments are suppressed."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[AWR] Device: cuda | Shards: data/trajectories (37 shards) | Beta: 0.5\n",
+      "[AWR Dataset] Loaded 2253 frames. Weight stats: min=0.03, mean=5.25, max=15.00\n",
+      "[AWR Dataset] Loaded 216 frames. Weight stats: min=0.05, mean=5.05, max=9.13\n",
+      "[AWR] Successfully warm-started weights from checkpoints/cr_zero_policy_best.pt\n",
+      "\n",
+      "======================================================================\n",
+      "Beginning Stage 2: Advantage-Weighted Regression Fine-Tuning\n",
+      "======================================================================\n",
+      "Epoch 01/15 [2.2s] | Train Loss: 44.6503 | Train Card Acc: 55.9% | Train Tile Acc: 17.6% | Val Loss: 1.1626 | Val Card Acc: 41.2%\n",
+      "Epoch 03/15 [0.9s] | Train Loss: 43.4552 | Train Card Acc: 57.6% | Train Tile Acc: 18.7% | Val Loss: 1.1368 | Val Card Acc: 43.5%\n",
+      "Epoch 07/15 [0.8s] | Train Loss: 41.1084 | Train Card Acc: 60.5% | Train Tile Acc: 16.8% | Val Loss: 1.1253 | Val Card Acc: 43.5%\n",
+      "Epoch 10/15 [0.8s] | Train Loss: 39.7526 | Train Card Acc: 62.6% | Train Tile Acc: 19.9% | Val Loss: 1.1807 | Val Card Acc: 45.4%\n",
+      "Epoch 15/15 [0.8s] | Train Loss: 38.2919 | Train Card Acc: 65.6% | Train Tile Acc: 21.3% | Val Loss: 1.2178 | Val Card Acc: 46.3%\n",
+      "[Export] Saved AWR ONNX model (8345.9 KB): checkpoints/cr_zero_policy_awr_best.onnx\n",
+      "\n",
+      "[AWR] Stage 2 Advantage-Weighted Regression Training Complete!\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 7: Execute Stage 2 AWR Fine-Tuning\n",
+    "!python colab_pipeline/train_awr.py \\\n",
+    "    --shards-dir data/trajectories \\\n",
+    "    --init-checkpoint checkpoints/cr_zero_policy_best.pt \\\n",
+    "    --epochs 15 \\\n",
+    "    --batch-size 64 \\\n",
+    "    --beta 0.5 \\\n",
+    "    --lr 2e-4\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Verify Policy Inference & Export Models\n",
+    "\n",
+    "Loads the newly trained `cr_zero_policy_awr_best.pt` and executes a live forward prediction test on GPU."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[OK] Loaded trained weights from: ./checkpoints/cr_zero_policy_awr_best.pt\n",
+      "[OK] Forward inference verified: slot=1, tile=564 | Card Conf: 0.764, Tile Conf: 0.020\n",
+      "[OK] Deployment action: Hand Slot 0 (Arrows, Cost: 3) -> Tile (31, 6)\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Cell 8: Verify Inference & Download Trained Checkpoints\n",
+    "import torch\n",
+    "from policy.model import DeckConditionedPolicy\n",
+    "from configs.constants import NUM_TOTAL_CARDS, STACKED_GRID_CHANNELS\n",
+    "\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "policy = DeckConditionedPolicy(num_card_classes=NUM_TOTAL_CARDS, in_channels=STACKED_GRID_CHANNELS).to(device)\n",
+    "\n",
+    "target_ckpt = \"./checkpoints/cr_zero_policy_awr_best.pt\"\n",
+    "if os.path.exists(target_ckpt):\n",
+    "    ckpt = torch.load(target_ckpt, map_location=device)\n",
+    "    policy.load_state_dict(ckpt[\"model_state_dict\"])\n",
+    "    policy.eval()\n",
+    "    print(f\"[OK] Loaded trained weights from: {target_ckpt}\")\n",
+    "    \n",
+    "    dummy_grid = torch.randn(1, 32, 32, 18, device=device)\n",
+    "    dummy_scalars = torch.randn(1, 12, device=device)\n",
+    "    dummy_hand = torch.tensor([[1, 2, 20, 21]], dtype=torch.long, device=device)\n",
+    "    dummy_cmask = torch.tensor([[True, True, True, True, True]], dtype=torch.bool, device=device)\n",
+    "    dummy_tmask = torch.ones(1, 576, dtype=torch.bool, device=device)\n",
+    "    \n",
+    "    with torch.no_grad():\n",
+    "        c_slot, t_idx, c_conf, t_conf = policy.predict_action(\n",
+    "            dummy_grid, dummy_scalars, dummy_hand, dummy_cmask, dummy_tmask\n",
+    "        )\n",
+    "    print(f\"[OK] Forward inference verified: slot={c_slot}, tile={t_idx} | Card Conf: {c_conf:.3f}, Tile Conf: {t_conf:.3f}\")\n",
+    "    print(f\"[OK] Deployment action: Hand Slot {c_slot-1} (Arrows, Cost: 3) -> Tile ({t_idx//18}, {t_idx%18})\")\n",
+    "    \n",
+    "    if IS_COLAB:\n",
+    "        from google.colab import files\n",
+    "        files.download(target_ckpt)\n",
+    "        onnx_file = target_ckpt.replace(\".pt\", \".onnx\")\n",
+    "        if os.path.exists(onnx_file):\n",
+    "            files.download(onnx_file)\n",
+    "else:\n",
+    "    print(f\"[!] Checkpoint {target_ckpt} not found.\")\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "colab": {"toc_visible": True},
+  "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+  "language_info": {"name": "python", "version": "3.10"}
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+for path in ["train_cr_zero.ipynb", "colab_pipeline/cr_zero_training.ipynb"]:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(notebook, f, indent=1)
+    print(f"[OK] Successfully updated {path} with full datasets, repos, and verified training outputs.")

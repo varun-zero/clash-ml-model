@@ -74,9 +74,20 @@ class WindowCapture:
         self.window_region: Optional[Tuple[int, int, int, int]] = None  # (left, top, right, bottom)
         self.dxcam_camera = None
         self.mss_instance = None
+        self.adbutils_device = None
         self.adb_bin = r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe" if os.path.exists(r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe") else "adb"
         import tempfile
         self.temp_cap_file = os.path.join(tempfile.gettempdir(), "cr_zero_live_cap.png")
+
+        # Initialize adbutils device connection
+        try:
+            import adbutils
+            client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+            client.connect(self.adb_device)
+            self.adbutils_device = client.device(self.adb_device)
+            print(f"[Capture] adbutils direct emulator capture initialized for {self.adb_device}.")
+        except Exception as e:
+            self.adbutils_device = None
 
         self._find_window()
         self._init_backend()
@@ -183,17 +194,36 @@ class WindowCapture:
         Grabs latest frame from BlueStacks client area.
         Returns BGR numpy array of shape (target_height, target_width, 3).
         """
+        # 1. Direct adbutils emulator screenshot (pure-python, ultra-reliable 540x960, no window occlusion or background issues)
+        if self.adbutils_device is not None:
+            try:
+                pil_img = self.adbutils_device.screenshot()
+                frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                if frame.shape[1] != self.target_width or frame.shape[0] != self.target_height:
+                    frame = cv2.resize(frame, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+                return frame
+            except Exception as e:
+                # Attempt auto-reconnect
+                try:
+                    import adbutils
+                    client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+                    client.connect(self.adb_device)
+                    self.adbutils_device = client.device(self.adb_device)
+                    pil_img = self.adbutils_device.screenshot()
+                    frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    if frame.shape[1] != self.target_width or frame.shape[0] != self.target_height:
+                        frame = cv2.resize(frame, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+                    return frame
+                except Exception:
+                    pass
+
         region = self.update_window_bounds()
 
-        # 1. DXCam capture
-        if self.dxcam_camera is not None:
+        # 2. DXCam capture (only if window region is confirmed)
+        if self.dxcam_camera is not None and region is not None:
             try:
-                if region:
-                    left, top, right, bottom = region
-                    frame = self.dxcam_camera.grab(region=(left, top, right, bottom))
-                else:
-                    frame = self.dxcam_camera.grab()
-
+                left, top, right, bottom = region
+                frame = self.dxcam_camera.grab(region=(left, top, right, bottom))
                 if frame is not None:
                     if frame.shape[1] != self.target_width or frame.shape[0] != self.target_height:
                         frame = cv2.resize(frame, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
@@ -201,7 +231,7 @@ class WindowCapture:
             except Exception:
                 pass
 
-        # 2. MSS capture fallback (only if window region is confirmed)
+        # 3. MSS capture fallback (only if window region is confirmed)
         if self.mss_instance is not None and region is not None:
             left, top, right, bottom = region
             bbox = {"left": left, "top": top, "width": right - left, "height": bottom - top}
@@ -214,12 +244,12 @@ class WindowCapture:
             except Exception:
                 pass
 
-        # 3. Direct ADB screencap pull (pixel-perfect 540x960 directly from BlueStacks emulator)
+        # 4. Direct ADB screencap pull fallback
         adb_frame = self._grab_adb_pull()
         if adb_frame is not None:
             return adb_frame
 
-        # 4. Virtual dummy frame if running completely disconnected
+        # 5. Virtual dummy frame if running completely disconnected
         dummy = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
         cv2.putText(dummy, "Virtual Display (Client Area)", (30, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         return dummy

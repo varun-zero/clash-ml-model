@@ -43,12 +43,12 @@ class ClashRoyaleDataset(Dataset):
                 continue
             with np.load(p) as data:
                 g = data["arena_grid"]
-                s = data["scalars"]
-                h = data["hand_ids"]
-                cm = data["legal_card_mask"]
-                tm = data["legal_tile_mask"]
-                ac = data["action_card"]
-                at = data["action_tile"]
+                s = data["scalars"] if "scalars" in data else data["scalar_features"]
+                h = data["hand_ids"] if "hand_ids" in data else data["hand_cards"]
+                cm = data["legal_card_mask"] if "legal_card_mask" in data else data["card_mask"]
+                tm = data["legal_tile_mask"] if "legal_tile_mask" in data else data["tile_mask"]
+                ac = data["action_card"] if "action_card" in data else data["card_action"]
+                at = data["action_tile"] if "action_tile" in data else data["tile_action"]
 
                 # Outcome weighting: win > draw > loss
                 outcome = int(data["match_outcome"]) if "match_outcome" in data else 0

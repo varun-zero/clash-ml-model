@@ -54,6 +54,7 @@ class ADBHarness:
         self.panic_event = threading.Event()
         self.shell_proc: Optional[subprocess.Popen] = None
         self._pipe_lock = threading.Lock()
+        self.adbutils_stream = None
 
         # Auto-detect BlueStacks ADB port if using default address
         if self.device_address == "127.0.0.1:5555" and os.name == "nt":
@@ -61,6 +62,18 @@ class ADBHarness:
             if detected_port and detected_port != "5555":
                 print(f"[ADB] Detected active BlueStacks ADB port: {detected_port}")
                 self.device_address = f"127.0.0.1:{detected_port}"
+
+        # Initialize adbutils persistent stream
+        if not self.dry_run:
+            try:
+                import adbutils
+                _client = adbutils.AdbClient(host="127.0.0.1", port=5037)
+                _client.connect(self.device_address)
+                _dev = _client.device(self.device_address)
+                self.adbutils_stream = _dev.shell(["sh"], stream=True)
+                print(f"[ADB] adbutils stream connection active on {self.device_address}.")
+            except Exception as e:
+                self.adbutils_stream = None
 
         # Step 1: Resolve ADB executable
         self.adb_binary = self._resolve_adb_binary(adb_path)
@@ -267,10 +280,19 @@ class ADBHarness:
         return self.panic_event.is_set()
 
     def _send_shell_cmd(self, cmd_str: str) -> bool:
-        """Sends command through persistent stdin pipe or direct subprocess."""
+        """Sends command through adbutils stream, persistent stdin pipe, or direct subprocess."""
         if self.dry_run:
             return True
 
+        # Priority 1: adbutils stream (sub-millisecond socket dispatch)
+        if self.adbutils_stream and self.adbutils_stream.conn:
+            try:
+                self.adbutils_stream.conn.sendall(f"{cmd_str}\n".encode("utf-8"))
+                return True
+            except Exception:
+                pass
+
+        # Priority 2: Persistent stdin pipe
         with self._pipe_lock:
             if self.shell_proc and self.shell_proc.poll() is None and self.shell_proc.stdin:
                 try:
@@ -307,6 +329,13 @@ class ADBHarness:
             slot_idx, tile_y, tile_x = task
             self._execute_two_tap(slot_idx, tile_y, tile_x)
             self.action_queue.task_done()
+
+    def tap(self, x: int, y: int) -> bool:
+        """Sends a single tap to screen pixel coordinates (x, y)."""
+        if self.dry_run:
+            print(f"[ADB Dry-Run] Single tap at ({x}, {y})")
+            return True
+        return self._send_shell_cmd(f"input tap {x} {y}")
 
     def _execute_two_tap(self, slot_idx: int, tile_y: int, tile_x: int) -> bool:
         """

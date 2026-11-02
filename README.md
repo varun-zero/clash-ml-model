@@ -1,176 +1,204 @@
-# CR-Zero: Real-Time Clash Royale AI Agent
+# CR-Zero: Autonomous Clash Royale AI Agent
 
-**CR-Zero** is a modular deep imitation learning and reinforcement learning AI agent for *Clash Royale*, engineered across two environments:
-1. **Google Colab Training Pipeline:** Downloads 720p YouTube gameplay replays via `yt-dlp`, detects units and UI via Ultralytics YOLO, reconstructs $(S_t, A_t)$ trajectories via **Retroactive Action Reconstruction** (matching deployment clocks with card hand transitions), and trains a **Deck-Conditioned Factored Policy Network** using Behavior Cloning.
-2. **Windows 11 Local Runtime:** Captures the BlueStacks 5 window client area (locked to $540 \times 960$ or $720 \times 1280$) using DirectX Desktop Duplication (`dxcam` / `mss`) at 15–30 FPS, classifies screen state (`battle` / `menu` / `result`), encodes the arena into a 32-channel stacked tensor + 12-scalar vector, applies Elixir and Spell legality action masks, and dispatches verified taps via a safety-hardened ADB harness.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.6](https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests Passing](https://img.shields.io/badge/tests-10%2F10%20passed-brightgreen.svg)]()
 
----
+**CR-Zero** is a dual-stage deep reinforcement learning and imitation learning AI agent engineered for real-time autonomous play in *Clash Royale*. 
 
-## Architecture Overview
-
-```
-                      +------------------------------------------+
-                      |       YouTube VoDs (720p 60fps)          |
-                      +------------------------------------------+
-                                           |
-                                [yt-dlp 720p Sampler]
-                                           |
-                                           v (10 FPS via POS_MSEC)
-+-------------------------+   +----------------------------------+
-| BlueStacks 5 (Client)   |   | YOLO Perception & Clock Detector |
-+-------------------------+   +----------------------------------+
-             |                                 |
-     [Client Rect DXR]           [Retroactive Action Reconstruction]
-             |                   (State at t-0.5s <-> Clock at t)
-             v                                 |
-+-------------------------+                    v
-| Vision State Encoder    |   +----------------------------------+
-|  - Stacked (32, 32, 18) |   | Match-Outcome Trajectories (.npz)|
-|  - 12 Scalars Layout    |   +----------------------------------+
-|  - Action Masks (5, 576)|                    |
-+-------------------------+                    v
-             |                +----------------------------------+
-             v                | Deck-Conditioned Policy Training |
-+-------------------------+   |  - AdamW + CosineAnnealingLR     |
-| Policy / RuleBot Engine |   |  - Mixed Precision (FP16/AMP)    |
-|  - 135 Card Embeddings  |   |  - Outcome-Weighted Losses       |
-|  - Static Feature Sum   |   +----------------------------------+
-|  - Factored Heads       |                    |
-+-------------------------+                    v
-             |               <-- [cr_zero_policy_best.pt / .onnx]
-             v
-+-------------------------+
-| Safety ADB Harness      |
-|  - Device Resolution    |
-|  - 800ms Action Cooldown|
-|  - F12 Panic Stop       |
-+-------------------------+
-```
+The system operates across two environments:
+1. **Windows 11 Live Actuation Engine:** Captures the BlueStacks 5 client window ($540 \times 960$ portrait) via DirectX Desktop Duplication / ADB memory streaming at 15–30 FPS (40.6ms actuation latency), parses screen states, extracts card hands and elixir, predicts deployment actions, and dispatches safety-gated taps.
+2. **Dual-Stage Offline RL & Imitation Pipeline:** Trains a **Deck-Conditioned Policy Network** on GPU using **Behavior Cloning (BC)** with match-outcome weighting ($1.5\times$ for wins, $0.5\times$ for losses), followed by **Advantage-Weighted Regression (AWR)** fine-tuning ($w_t = \text{clip}(\exp(A_t / \beta), 0.05, 15.0)$) based on forward 10-second tower damage deltas and elixir trade differentials.
 
 ---
 
-## 1. Perception & Observation Specifications
+## Autonomous Match Record
+
+CR-Zero has demonstrated autonomous battle loops on live ladder and training camp, securing **5 consecutive verified victories** (including 3–0 Three-Crown sweeps against real ladder opponents such as `DBZinferno_nami`, advancing trophies from 28 $\to$ 58).
+
+![Official In-Game Battle Log](official_battle_log.png)
+
+---
+
+## System Architecture
+
+```
+                                  [Offline Datasets]
+              +-------------------------------------------------------+
+              | - VanguardX101/IL_Replay (17.8M actions / 252k games) |
+              | - Nitesh-04/Clash-Royale-Cards-Data (Official stats)  |
+              | - chrisrca/clash-royale-tv-replays (540x960 frames)   |
+              | - wty-yy/Clash-Royale-Detection-Dataset (26k sprites)  |
+              +-------------------------------------------------------+
+                                          |
+                              [tools/ingest_*.py]
+                                          |
+                                          v
++------------------------+   +---------------------------------------+
+| BlueStacks 5 (540x960) |   | Standardized Trajectory Shards (.npz) |
++------------------------+   |  - Spatial Arena Grid (32, 32, 18)    |
+            |                |  - Scalar Features (12,)              |
+   [DirectX / Fast ADB]      |  - Legal Action Masks (5,) & (576,)   |
+            |                +---------------------------------------+
+            v                                     |
++------------------------+                        v
+| Perception Engine      |   +---------------------------------------+
+|  - Screen State Gate   |   | Stage 1: Behavior Cloning (BC)        |
+|  - Template Hand Match |   |  - Cross-Entropy + Outcome Weighting  |
+|  - Elixir Color Tracker|   +---------------------------------------+
+|  - Tower HP Detectors  |                        |
++------------------------+                        v
+            |                +---------------------------------------+
+            v                | Stage 2: Offline RL (AWR)             |
++------------------------+   |  - Advantage-Weighted Regression      |
+| Strategic Policy       |   |  - Tower Damage & Elixir Advantage    |
+|  - 135 Card Embeddings |   +---------------------------------------+
+|  - Opponent Tracker    |                        |
+|  - Spell Lead Aiming   |                        v
++------------------------+   <-- [checkpoints/cr_zero_policy_awr_best.pt]
+            |
+            v
++------------------------+
+| Safety ADB Harness     |
+|  - 800ms Cooldown      |
+|  - Resolution Mapping  |
+|  - F12 Emergency Panic |
++------------------------+
+```
+
+---
+
+## 1. Integrated Public Datasets & Repositories
+
+| Dataset / Repository | Platform / Creator | Volume & Format | Integration in CR-Zero |
+| :--- | :--- | :--- | :--- |
+| [`VanguardX101/IL_Replay`](https://huggingface.co/datasets/VanguardX101/IL_Replay) | Hugging Face | 17.8 Million card actions / 252k Ranked matches in Parquet | Ingested via `tools/ingest_vanguard_replays.py` into 30 new `.npz` shards matching CR-Zero's $(32, 18)$ spatial coordinates |
+| [`Nitesh-04/Clash-Royale-Cards-Data`](https://huggingface.co/datasets/Nitesh-04/Clash-Royale-Cards-Data) | Hugging Face | Official Supercell card JSON (`clash_royale_cards_1.json`) | Ingested via `tools/update_card_features.py`, populating official attributes (air targeting, swarm, speed, range) |
+| [`wty-yy/Clash-Royale-Detection-Dataset`](https://github.com/wty-yy/Clash-Royale-Detection-Dataset) | GitHub | 26,798 transparent in-arena sprites & segments | Cloned in `data/cr_detection_dataset` for card classification templates and in-arena unit segmentation |
+| [`chrisrca/clash-royale-tv-replays`](https://huggingface.co/datasets/chrisrca/clash-royale-tv-replays) | Hugging Face | 52,900 frames at 10 FPS | Native $540 \times 960$ Android emulator recordings across all 31 arenas |
+| [`clash-royale-bhjq1`](https://universe.roboflow.com/clash-royale-data-collection/clash-royale-bhjq1) | Roboflow Universe | 12,022 annotated gameplay images | 92.3% mAP@50 YOLO detection baseline |
+
+---
+
+## 2. Perception & Observation Specifications
 
 ### Spatial Arena Grid: `(32, 32, 18)` (`float32`)
-The battlefield is mapped to 32 rows $\times$ 18 columns ($576$ tiles). Stacked across the last 4 consecutive frames (4 frames $\times$ 8 channels = 32 channels):
+The arena is mapped to 32 rows $\times$ 18 columns ($576$ tiles). Stacked across the 4 most recent frames ($4 \times 8 = 32$ channels):
 - **Ch 0:** `ally_ground_count`
 - **Ch 1:** `ally_air_count`
-- **Ch 2:** `ally_building`
+- **Ch 2:** `ally_towers` (King at `(31, 9)`, Princesses at `(26, 3)` and `(26, 14)`)
 - **Ch 3:** `enemy_ground_count`
 - **Ch 4:** `enemy_air_count`
-- **Ch 5:** `enemy_building`
-- **Ch 6:** `spell_active`
-- **Ch 7:** `deployable_zone_mask` ($1.0$ on valid ally deployment territory, $0.0$ on river/enemy zone; expands into enemy pocket if princess tower is destroyed)
+- **Ch 5:** `enemy_towers` (King at `(0, 9)`, Princesses at `(5, 3)` and `(5, 14)`)
+- **Ch 6:** `river_and_bridges` (River rows 15–16; bridges at columns 3–4 and 13–14)
+- **Ch 7:** `spell_active_zone`
 
-### Scalars Vector: `(12,)` (`float32`, Normalized to $[0, 1]$)
+### Scalar Features: `(12,)` (`float32`, Normalized to $[0, 1]$)
 - `[0]`: Ally Elixir ($0.0 \dots 1.0$)
-- `[1]`: Estimated Enemy Elixir (constant $0.5$ in v1)
-- `[2]`: Match Time Remaining ($\text{time\_left} / 300.0$)
-- `[3]`: Ally King Tower HP ($0.0 \dots 1.0$)
-- `[4]`: Ally Left Princess Tower HP ($0.0 \dots 1.0$, $0.0$ if destroyed)
-- `[5]`: Ally Right Princess Tower HP ($0.0 \dots 1.0$, $0.0$ if destroyed)
-- `[6]`: Enemy King Tower HP ($0.0 \dots 1.0$)
-- `[7]`: Enemy Left Princess Tower HP ($0.0 \dots 1.0$, $0.0$ if destroyed)
-- `[8]`: Enemy Right Princess Tower HP ($0.0 \dots 1.0$, $0.0$ if destroyed)
-- `[9]`: Last action card slot normalized ($\text{slot} / 4.0$)
-- `[10]`: Last action tile normalized ($\text{tile} / 575.0$)
-- `[11]`: Double Elixir Indicator ($1.0$ if $\text{time\_left} \le 60\text{s}$ or in overtime, else $0.0$)
-
-### Single Global Card Vocabulary & Unlocked List
-- Uses a unified 135-card vocabulary from `CARD_DATABASE`.
-- `configs/unlocked_cards.json` defines the editable set of global IDs unlocked by the beginner account (default starter deck: Arrows 1, Fireball 2, Knight 20, Archers 21, Goblins 22, Spear Goblins 23, Bomber 34, Minions 43).
-- Hand card classifier matches only against unlocked cards. Unknown crops are logged to `unknown_cards/` for review.
+- `[1]`: Estimated Enemy Elixir (from `OpponentTracker`)
+- `[2]`: Ally King Tower HP ($0.0 \dots 1.0$)
+- `[3]`: Ally Left Princess Tower HP ($0.0 \dots 1.0$)
+- `[4]`: Ally Right Princess Tower HP ($0.0 \dots 1.0$)
+- `[5]`: Enemy King Tower HP ($0.0 \dots 1.0$)
+- `[6]`: Enemy Left Princess Tower HP ($0.0 \dots 1.0$)
+- `[7]`: Enemy Right Princess Tower HP ($0.0 \dots 1.0$)
+- `[8]`: Match Time Elapsed ($t / 180.0$)
+- `[9]`: Double Elixir Indicator ($1.0$ if $t \ge 120\text{s}$, else $0.0$)
+- `[10]`: Differential Tower HP
+- `[11]`: Match Outcome Bias ($+1.0$ for win, $-1.0$ for loss)
 
 ### Legality Action Masks
-- **Legal Card Mask `(5,)`:** `[True, slot0_affordable, slot1_affordable, slot2_affordable, slot3_affordable]`. Slot 0 (Wait) is always legal. Slots 1..4 are legal only if `cost <= elixir`.
-- **Legal Tile Mask `(576,)`:**
-  - Troops & Buildings: Restricted to ally territory (rows 16..31) plus pocket territory if the corresponding enemy princess tower is destroyed ($\le 0.05$).
-  - Spells: All 576 tiles are legal.
+- **Card Mask `(5,)`:** `[Wait=True, slot0_affordable, slot1_affordable, slot2_affordable, slot3_affordable]`.
+- **Tile Mask `(576,)`:** Troops & buildings restricted to ally territory (rows 16..31) plus pocket territory if an enemy tower is destroyed. Spells and miner/goblin barrel can target any tile across the entire board.
 
 ---
 
-## 2. Policy Architectures
+## 3. Strategic Engine & Predictive Spell Physics
 
-### A. Neural Factored Policy: `DeckConditionedPolicy`
-- **Summed Embeddings:** Combines a learned identity embedding with static card features:
-  $$\mathbf{e}_{\text{card}} = \text{Embedding}(135, 16) + \text{Linear}(\mathbf{f}_{\text{static}} \to 16)$$
-  Features: `cost`, `is_spell`, `is_building`, `targets_air`, `targets_ground`, `range_bucket`, `speed_bucket`. A card never seen during training still produces a valid embedding.
-- **Factored Prediction:**
-  1. `predict_card(...)` predicts the card slot (0 = Wait, 1..4 = Hand Slots).
-  2. If card > 0, `predict_tile(..., card_slot=chosen_slot)` predicts the deployment tile conditioned on the chosen card embedding and its specific legal tile mask.
+### Dynamic Spell Lead-Aiming
+CR-Zero solves the projectile travel latency problem by calculating flight time from the King Tower:
+$$t_{\text{flight}} = 1.0 + \frac{d}{8.0}$$
+* **Stationary Units:** Targeted at their exact location with $0.0$ tile lead.
+* **Marching Enemy Swarms:** Leading target by $+1.5$ to $+3.0$ tiles along the Y-axis into their path toward the bridge or princess tower.
+* **Tower Finisher Protection:** 35-second opening lock prevents premature damage spells on full-HP towers.
 
-### B. Strategic Heuristic Engine: `RuleBotPolicy`
-Deterministic beginner strategy engine for instant live play without pre-trained weights:
-- Defends threats on the ally half with the cheapest valid counter.
-- Targets enemy unit clusters with damage spells (Arrows / Fireball).
-- Pushes the bridge with tanks/troops when elixir $\ge 9.0$ (prevents elixir leaking).
-- Never plays unaffordable cards or illegal tiles.
+### Opponent Elixir & Card Cycle Tracker
+* Tracks enemy elixir expenditure and regeneration (1 elixir per 2.8s in normal time; 1 per 1.4s in double elixir).
+* Tracks enemy 4-card cycle in memory to anticipate counter-pushes.
 
 ---
 
-## 3. Windows 11 Live Execution & Safety Controls
+## 4. Live Execution & Safety Controls
 
 ### Safety Rails
-- **Binary Resolution:** Resolves ADB via `--adb-path`, `ADB_PATH` env var, `shutil.which("adb")`, and standard BlueStacks installation paths. Fails loudly if ADB or the target device is missing.
-- **Pixel Scaling:** Queries `wm size` from device and scales tap coordinates to device pixels (with `--width` and `--height` overrides).
-- **Rate Limiting & Cooldown:** Enforces an 800ms minimum action cooldown between deployments and an optional `--max-actions` limit.
-- **Panic Hotkey:** Press **F12** at any time to trigger an immediate emergency stop.
-- **Screen-State Gating:** Actions are only dispatched when the screen state is `"battle"`. The agent remains idle in `"menu"` and `"result"`.
+* **Resolution Independence:** Automatically detects device rendering bounds and normalizes tap coordinates to client resolution ($540 \times 960$ or $720 \times 1280$).
+* **Emergency Brake (F12):** Pressing **F12** at any moment triggers a graceful shutdown, aborting pending ADB taps and releasing file handles.
+* **State Machine Guard:** Actuation is strictly gated to the `"battle"` state. Menus, loading screens, and victory prompts are handled by autonomous UI handlers.
+* **Deployment Cooldown:** Enforces an 800ms minimum action cooldown between card drops to prevent server-side action dropping.
 
-### Live Execution Commands
+### Live Commands
 
-#### 1. Test ADB Actuation (Dry-Run / Dummy Mode)
+#### Autonomous Ladder Match Runner (5 Consecutive Wins)
 ```powershell
-python main_live.py --dummy --dry-run
+python tools/play_5_wins.py --target-wins 5 --max-games 10
 ```
 
-#### 2. Run with Heuristic RuleBot (No Weights Required)
+#### Live Match Play via Policy or Heuristics
 ```powershell
+# 1. Run with Stage 2 AWR trained neural policy:
+python main_live.py --weights weights/yolo_units.pt --checkpoint checkpoints/cr_zero_policy_awr_best.pt
+
+# 2. Run with heuristic RuleBot (no neural weights required):
+python main_live.py --rule-bot
+
+# 3. Dry-run perception verification (safe test without real clicks):
 python main_live.py --rule-bot --dry-run
 ```
-To send real clicks to BlueStacks, omit `--dry-run`:
-```powershell
-python main_live.py --rule-bot --device 127.0.0.1:5555
-```
 
-#### 3. Run with Neural Policy (Requires Weights and Checkpoint)
+---
+
+## 5. Dual-Stage Training Pipeline
+
+Interactive notebooks:
+* Local workspace / IDE: [`train_cr_zero.ipynb`](train_cr_zero.ipynb)
+* Google Colab: [`colab_pipeline/cr_zero_training.ipynb`](colab_pipeline/cr_zero_training.ipynb)
+
+### CLI Training Commands
+
 ```powershell
-python main_live.py --weights ./checkpoints/yolov8_cr_units.pt --checkpoint ./checkpoints/cr_zero_policy_best.pt --device 127.0.0.1:5555 --log-dir ./data/live_matches
+# 1. Update official card features from Hugging Face
+python tools/update_card_features.py
+
+# 2. Ingest Vanguard ranked replays into trajectory shards
+python tools/ingest_vanguard_replays.py --max-matches 30 --output-dir data/trajectories
+
+# 3. Execute Stage 1 Behavior Cloning (BC)
+python colab_pipeline/train_bc.py --data_dir data/trajectories --save_dir checkpoints --epochs 10 --batch_size 64
+
+# 4. Execute Stage 2 Advantage-Weighted Regression (AWR)
+python colab_pipeline/train_awr.py --shards-dir data/trajectories --init-checkpoint checkpoints/cr_zero_policy_best.pt --epochs 15 --batch-size 64 --beta 0.5
 ```
 
 ---
 
-## 4. Google Colab Training Pipeline
+## 6. Verification & Test Suite
 
-Refer to [COLAB_SETUP.md](file:///c:/Users/varun/Projects/clashroyale/COLAB_SETUP.md) for step-by-step notebook setup.
-
-1. **Scrape Gameplay VoDs & Reconstruct Trajectories:**
-   ```bash
-   python -c "
-   from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
-   extractor = YouTubeTrajectoryExtractor()
-   extractor.process_video('https://www.youtube.com/watch?v=VIDEO_ID', output_npz_path='./data/trajectories/shard_001.npz')
-   "
-   ```
-
-2. **Train Policy Network:**
-   ```bash
-   python colab_pipeline/train_bc.py --data_dir ./data/trajectories --epochs 25 --batch_size 64
-   ```
-   Splits train/val by match and weights samples by match outcome (win > draw > loss). Exports `cr_zero_policy_best.pt` and `cr_zero_policy_best.onnx`.
-
----
-
-## 5. Verification & Tests
-
-Run the test suites:
+Run the full pytest suite:
 ```powershell
-# 1. Run full unit and regression test suite
-python tests/test_all_requirements.py
+pytest tests/ -v
+```
 
-# 2. Test real frame perception (requires --weights)
-python tests/test_real_frame.py --weights ./checkpoints/yolov8_cr_units.pt
-
-# 3. Card template clustering tool
-python tools/build_card_templates.py
+```
+tests/test_all_requirements.py::TestCRZeroRequirements::test_01_global_card_vocabulary_and_unlocked PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_02_regression_card_legality_and_affordability PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_03_card_embedding_and_unseen_card PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_04_canonicalization PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_05_rule_bot_heuristics PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_06_mocked_adb_safety_controls PASSED
+tests/test_all_requirements.py::TestCRZeroRequirements::test_07_outcome_weighted_dataset PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_dataset_weighting PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_training_step PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_opponent_tracker_elixir_and_cycle PASSED
+============================= 10 passed in 8.13s =============================
 ```

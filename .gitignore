@@ -7,11 +7,22 @@ __pycache__/
 checkpoints/*.pt
 checkpoints/*.onnx
 !checkpoints/.gitkeep
+weights/*.pt
+*.pt
+*.onnx
 
-# Raw VoD downloads and extracted dataset shards
+# Raw VoD downloads, temporary datasets, and large cloned datasets
 data/raw_vods/*
 data/trajectories/*.npz
 !data/trajectories/.gitkeep
+data/cr_detection_dataset/
+
+# Temporary / debug screenshots and crops
+*.png
+*.jpg
+*.jpeg
+!templates/**/*.png
+!official_battle_log.png
 
 # Environments & logs
 .env
@@ -19,4 +30,4 @@ data/trajectories/*.npz
 .vscode/
 .idea/
 unknown_cards/
-
+.pytest_cache/

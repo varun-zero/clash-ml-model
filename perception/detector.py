@@ -34,7 +34,7 @@ from configs.constants import (
     screen_to_grid,
 )
 from configs.unlocked_cards import load_unlocked_cards
-from perception.state_encoder import StateEncoder, Detection
+from perception.state_encoder import StateEncoder, Detection, OpponentTracker
 
 
 class ClashRoyaleDetector:
@@ -64,6 +64,10 @@ class ClashRoyaleDetector:
         self.unlocked_cards = unlocked_cards or load_unlocked_cards()
         self.templates_dir = templates_dir
         self.card_templates: Dict[int, List[np.ndarray]] = self._load_templates()
+
+        # Opponent Elixir and Card-Cycle Tracker + Track Velocity History
+        self.opponent_tracker = OpponentTracker()
+        self.track_history: Dict[int, Tuple[float, float, float]] = {}
 
         # 2. YOLO Model Loading
         weights_file = weights or model_path
@@ -122,19 +126,35 @@ class ClashRoyaleDetector:
             except Exception as e:
                 raise RuntimeError(f"[Detector] Failed to load Ultralytics YOLO from {model_path}: {e}")
 
+    def reset_match_state(self):
+        """Resets match-specific tracker state and velocity history."""
+        self.opponent_tracker.reset()
+        self.track_history.clear()
+
     def detect_raw(self, frame: np.ndarray) -> List[Detection]:
-        """Runs object detection on the frame and returns Detection objects."""
+        """Runs object detection with ByteTrack tracking on the frame and returns Detection objects."""
         h, w = frame.shape[:2]
         detections: List[Detection] = []
 
         if self.model is not None:
-            results = self.model.predict(
-                frame,
-                conf=self.conf_threshold,
-                device=self.device,
-                half=self.use_fp16,
-                verbose=False
-            )
+            now = time.time()
+            try:
+                results = self.model.track(
+                    frame,
+                    persist=True,
+                    conf=self.conf_threshold,
+                    device=self.device,
+                    half=self.use_fp16,
+                    verbose=False
+                )
+            except Exception:
+                results = self.model.predict(
+                    frame,
+                    conf=self.conf_threshold,
+                    device=self.device,
+                    half=self.use_fp16,
+                    verbose=False
+                )
             for r in results:
                 for box in r.boxes:
                     coords = box.xyxy[0].cpu().numpy()
@@ -158,6 +178,22 @@ class ClashRoyaleDetector:
                         category = "ground"
 
                     is_ally = not name.startswith("enemy_")
+                    track_id = None
+                    vx, vy = 0.0, 0.0
+                    if hasattr(box, "id") and box.id is not None:
+                        try:
+                            track_id = int(box.id[0].cpu().numpy())
+                            cx = float((coords[0] + coords[2]) / 2.0 / w)
+                            cy = float(coords[3] / h)
+                            if track_id in self.track_history:
+                                px, py, pt = self.track_history[track_id]
+                                dt = max(1e-4, now - pt)
+                                vx = float((cx - px) / dt)
+                                vy = float((cy - py) / dt)
+                            self.track_history[track_id] = (cx, cy, now)
+                        except Exception:
+                            pass
+
                     detections.append(
                         Detection(
                             x1=float(coords[0] / w),
@@ -168,6 +204,9 @@ class ClashRoyaleDetector:
                             cls_id=cls_id,
                             is_ally=is_ally,
                             category=category,
+                            track_id=track_id,
+                            vx=vx,
+                            vy=vy,
                         )
                     )
         return detections
@@ -457,6 +496,13 @@ class ClashRoyaleDetector:
             else:
                 filtered_units.append(d)
 
+        if screen_state == "battle":
+            self.opponent_tracker.update(
+                current_time=time.time(),
+                enemy_detections=filtered_units,
+                double_elixir=is_double_elixir
+            )
+
         arena_grid, scalars, legal_card_mask = self.encoder.encode(
             detections=filtered_units,
             elixir=elixir,
@@ -464,6 +510,7 @@ class ClashRoyaleDetector:
             tower_hps=tower_hps,
             time_left=actual_time,
             est_enemy_elixir=est_enemy_elixir,
+            opponent_tracker=self.opponent_tracker if screen_state == "battle" else None,
             last_action=last_action,
         )
 
@@ -481,4 +528,5 @@ class ClashRoyaleDetector:
             "time_left": actual_time,
             "is_double_elixir": is_double_elixir,
             "detections": filtered_units,
+            "opponent_tracker": self.opponent_tracker,
         }

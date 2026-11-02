@@ -8,8 +8,9 @@ vocabulary. Outputs:
 - (5,) bool legal card action mask
 - (576,) bool legal tile masks via ``get_legal_tile_mask``
 """
-from typing import List, Dict, Tuple, Optional, Union
+from typing import List, Dict, Tuple, Optional, Union, Set, Any
 from dataclasses import dataclass
+import time
 import numpy as np
 
 from configs.constants import (
@@ -29,7 +30,7 @@ from configs.constants import (
 
 @dataclass
 class Detection:
-    """Represents one detection from YOLO or template matching."""
+    """Represents one detection from YOLO or template matching with ByteTrack tracking."""
 
     x1: float
     y1: float
@@ -39,6 +40,92 @@ class Detection:
     cls_id: int
     is_ally: bool
     category: str = "ground"  # ground, air, building, spell, clock, selected, emote
+    track_id: Optional[int] = None
+    vx: float = 0.0
+    vy: float = 0.0
+
+
+class OpponentTracker:
+    """
+    Tracks opponent's elixir, card cycle, and active units across match frames.
+    - Elixir: starts at 5.0, regenerates at 1/2.8s (or 1/1.4s during double elixir).
+    - Deduction: when a new enemy unit track ID appears, looks up cost in CARD_ID_TO_COST and deducts it.
+    - Card Cycle: tracks unique enemy cards seen (up to 8 cards) and active rotation.
+    """
+    def __init__(self, initial_elixir: float = 5.0):
+        self.enemy_elixir = float(initial_elixir)
+        self.last_update_time = time.time()
+        self.seen_track_ids: Set[int] = set()
+        self.seen_cards: List[int] = []  # Unique cards identified in opponent deck
+        self.active_tracks: Dict[int, Dict[str, Any]] = {}
+        self.total_elixir_spent: int = 0
+
+    def reset(self, initial_elixir: float = 5.0):
+        """Resets tracker state at the beginning of a match."""
+        self.enemy_elixir = float(initial_elixir)
+        self.last_update_time = time.time()
+        self.seen_track_ids.clear()
+        self.seen_cards.clear()
+        self.active_tracks.clear()
+        self.total_elixir_spent = 0
+
+    def update(
+        self,
+        current_time: float,
+        enemy_detections: List[Detection],
+        double_elixir: bool = False
+    ) -> float:
+        """
+        Updates opponent elixir and registers any newly spawned units.
+        """
+        # 1. Passive regeneration over dt
+        dt = max(0.0, current_time - self.last_update_time)
+        self.last_update_time = current_time
+        regen_rate = 1.0 / 1.4 if double_elixir else 1.0 / 2.8
+        self.enemy_elixir = min(10.0, self.enemy_elixir + dt * regen_rate)
+
+        # 2. Check for newly spawned enemy tracks
+        for d in enemy_detections:
+            if d.is_ally:
+                continue
+            tid = d.track_id
+            cid = d.cls_id
+
+            if tid is not None:
+                if tid not in self.seen_track_ids:
+                    self.seen_track_ids.add(tid)
+                    cost = CARD_ID_TO_COST.get(cid, 3)
+                    self.enemy_elixir = max(0.0, self.enemy_elixir - cost)
+                    self.total_elixir_spent += cost
+
+                    if cid not in self.seen_cards and len(self.seen_cards) < 8:
+                        self.seen_cards.append(cid)
+
+                    self.active_tracks[tid] = {
+                        "cls_id": cid,
+                        "spawn_time": current_time,
+                        "cost": cost,
+                    }
+
+        return float(np.clip(self.enemy_elixir, 0.0, 10.0))
+
+    def get_elixir(self) -> float:
+        """Returns current estimated enemy elixir [0.0..10.0]."""
+        return float(np.clip(self.enemy_elixir, 0.0, 10.0))
+
+    def get_normalized_elixir(self) -> float:
+        """Returns normalized enemy elixir [0.0..1.0] for model scalars[1]."""
+        return float(np.clip(self.enemy_elixir / 10.0, 0.0, 1.0))
+
+    def get_cycle_summary(self) -> Dict[str, Any]:
+        """Returns summary of opponent tracked deck and elixir."""
+        return {
+            "estimated_elixir": round(self.enemy_elixir, 1),
+            "seen_cards_count": len(self.seen_cards),
+            "seen_card_ids": list(self.seen_cards),
+            "total_elixir_spent": self.total_elixir_spent,
+            "active_tracks_count": len(self.active_tracks),
+        }
 
 
 def canonicalize_perspective(
@@ -144,17 +231,18 @@ class StateEncoder:
         tower_hps: Optional[List[float]] = None,
         time_left: float = 180.0,
         est_enemy_elixir: float = 0.5,
+        opponent_tracker: Optional[OpponentTracker] = None,
         last_action: Tuple[int, int] = (0, 0),
         frame_width: Optional[int] = None,
         frame_height: Optional[int] = None,
         double_elixir: Optional[bool] = None,
         overtime: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Encode one frame.
+        """Encode one frame into spatial grid (8, 32, 18), scalars (12,), and legal_card_mask (5,).
 
         Scalars (12):
             0 ally elixir / 10
-            1 estimated enemy elixir (constant 0.5 in v1)
+            1 estimated enemy elixir (from OpponentTracker or fallback)
             2 time remaining / 180
             3 ally king HP
             4 ally left princess HP
@@ -170,6 +258,11 @@ class StateEncoder:
             tower_hps = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
         parsed_dets = self.parse_detection_array(detections, frame_width, frame_height)
+
+        if opponent_tracker is not None:
+            enemy_elixir_norm = opponent_tracker.get_normalized_elixir()
+        else:
+            enemy_elixir_norm = float(np.clip(est_enemy_elixir, 0.0, 1.0))
 
         arena_grid = np.zeros((8, self.arena_rows, self.arena_cols), dtype=np.float32)
         enemy_left_down = tower_hps[4] <= 0.05
@@ -205,7 +298,6 @@ class StateEncoder:
                     arena_grid[6, gy, gx] = 1.0
 
         ally_elixir_norm = float(np.clip(elixir / 10.0, 0.0, 1.0))
-        enemy_elixir_norm = float(np.clip(est_enemy_elixir, 0.0, 1.0))
         time_norm = float(np.clip(time_left / 180.0, 0.0, 1.0))
 
         ak_hp = float(np.clip(tower_hps[0], 0.0, 1.0))
