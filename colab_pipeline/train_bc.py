@@ -1,18 +1,19 @@
 """
 Behavior Cloning (Offline Imitation Learning) Training Script for CR-Zero.
-Trains DeckConditionedPolicy on extracted YouTube gameplay shards.
+Trains DeckConditionedPolicy on extracted gameplay shards (.npz).
 Features:
-- AdamW + CosineAnnealingLR
-- Mixed Precision (torch.cuda.amp.autocast + GradScaler)
-- Factored Loss: Card Loss + Conditional Spatial Tile Loss
-- Evaluation metrics: Card Acc, Tile Acc, Tile Distance Error
-- Automatic Checkpoint Export to .pt and .onnx
+- Global 135-card vocabulary with static feature projection.
+- Outcome-weighted loss: winning match trajectories weighted higher than losing ones.
+- Match-level train/validation splitting with zero intra-match sample leakage.
+- AdamW + CosineAnnealingLR + Mixed Precision.
+- Evaluation metrics: Top-1 Card Acc, Wait Acc, Tile-within-2-tiles.
+- Checkpoint export to .pt and .onnx (model.eval() with teacher_card_action=None).
+- Hard failure when real trajectory shards are missing (synthetic fallback moved to tests/).
 """
 from typing import Dict, Tuple, Optional
 import os
 import sys
 
-# Ensure repository root is on sys.path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -28,7 +29,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from configs.constants import (
     NUM_TOTAL_CARDS,
-    NUM_CARD_CLASSES_V1,
     STACKED_GRID_CHANNELS,
     TOTAL_TILES,
     ARENA_ROWS,
@@ -36,19 +36,6 @@ from configs.constants import (
 )
 from policy.model import DeckConditionedPolicy
 from colab_pipeline.dataset import ClashRoyaleDataset, create_dataloaders
-
-
-def compute_tile_distance_error(pred_tiles: torch.Tensor, target_tiles: torch.Tensor) -> float:
-    """
-    Computes mean Euclidean distance in grid tiles between predictions and targets.
-    """
-    pred_y = pred_tiles // ARENA_COLS
-    pred_x = pred_tiles % ARENA_COLS
-    targ_y = target_tiles // ARENA_COLS
-    targ_x = target_tiles % ARENA_COLS
-
-    dist = torch.sqrt((pred_y.float() - targ_y.float()) ** 2 + (pred_x.float() - targ_x.float()) ** 2)
-    return float(dist.mean().item())
 
 
 def export_to_onnx(
@@ -66,18 +53,16 @@ def export_to_onnx(
         print(f"[Export] Notice: 'onnx' Python package is not installed. Skipping ONNX export. Install with 'pip install onnx'.")
         return
 
-    model.eval()  # Mandatory eval before ONNX export
+    model.eval()
     dummy_grid = torch.randn(1, 32, 32, 18, device=device)
     dummy_scalar = torch.randn(1, 12, device=device)
-    dummy_hand = torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=device)
+    dummy_hand = torch.tensor([[1, 2, 20, 21]], dtype=torch.long, device=device)
     dummy_cmask = torch.ones(1, 5, dtype=torch.bool, device=device)
     dummy_tmask = torch.ones(1, 576, dtype=torch.bool, device=device)
 
     os.makedirs(os.path.dirname(os.path.abspath(export_path)), exist_ok=True)
-
     print(f"[Export] Exporting ONNX model to {export_path} (teacher_card_action=None)...")
     try:
-        # Explicitly pass teacher_card_action=None
         torch.onnx.export(
             model,
             (dummy_grid, dummy_scalar, dummy_hand, dummy_cmask, dummy_tmask, None),
@@ -99,7 +84,7 @@ def export_to_onnx(
         )
         print(f"[Export] Saved ONNX model successfully ({os.path.getsize(export_path) / 1024:.1f} KB).")
     except Exception as e:
-        print(f"[Export] Warning: Failed to export ONNX ({e}). PyTorch .pt checkpoint is intact.")
+        print(f"[Export] Failed to export ONNX model: {e}")
 
 
 def train_one_epoch(
@@ -111,10 +96,12 @@ def train_one_epoch(
     tile_loss_weight: float = 1.0,
 ) -> Dict[str, float]:
     model.train()
+    card_criterion_none = nn.CrossEntropyLoss(reduction="none")
+    tile_criterion_none = nn.CrossEntropyLoss(reduction="none")
+
     total_loss_accum = 0.0
     card_loss_accum = 0.0
     tile_loss_accum = 0.0
-
     card_correct = 0
     wait_correct = 0
     total_waits = 0
@@ -122,23 +109,21 @@ def train_one_epoch(
     total_samples = 0
     total_card_plays = 0
 
-    card_criterion = nn.CrossEntropyLoss()
-    tile_criterion = nn.CrossEntropyLoss()
-
     for batch in loader:
-        grid, scalar, hand, cmask, tmask, target_card, target_tile = [b.to(device) for b in batch]
+        grid, scalar, hand, cmask, tmask, target_card, target_tile, sample_weights = [
+            t.to(device) for t in batch
+        ]
         B = grid.size(0)
 
         # Force target tile to be legal in mask
         played_mask = target_card > 0
         if played_mask.any():
-            b_indices = torch.arange(B, device=device)[played_mask]
-            tmask[b_indices, target_tile[played_mask]] = True
+            for idx in torch.where(played_mask)[0]:
+                tmask[idx, target_tile[idx]] = True
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-            # Teacher forcing for tile head conditioning
             card_logits, tile_logits = model(
                 arena_grid=grid,
                 scalars=scalar,
@@ -148,12 +133,15 @@ def train_one_epoch(
                 teacher_card_action=target_card,
             )
 
-            # 1. Card loss (all samples)
-            loss_card = card_criterion(card_logits, target_card)
+            # 1. Outcome-weighted Card Loss
+            loss_card_per_sample = card_criterion_none(card_logits, target_card)
+            loss_card = (loss_card_per_sample * sample_weights).mean()
 
-            # 2. Tile loss (only on frames where card was actually played: target_card > 0)
+            # 2. Outcome-weighted Tile Loss
             if played_mask.any():
-                loss_tile = tile_criterion(tile_logits[played_mask], target_tile[played_mask])
+                loss_tile_per_sample = tile_criterion_none(tile_logits[played_mask], target_tile[played_mask])
+                weights_played = sample_weights[played_mask]
+                loss_tile = (loss_tile_per_sample * weights_played).mean()
             else:
                 loss_tile = torch.tensor(0.0, device=device)
 
@@ -174,13 +162,11 @@ def train_one_epoch(
         pred_cards = torch.argmax(card_logits, dim=-1)
         card_correct += (pred_cards == target_card).sum().item()
 
-        # Wait accuracy (target_card == 0)
         wait_mask = target_card == 0
         if wait_mask.any():
             wait_correct += (pred_cards[wait_mask] == 0).sum().item()
             total_waits += wait_mask.sum().item()
 
-        # Tile-within-2-tiles metric
         if played_mask.any():
             pred_tiles = torch.argmax(tile_logits[played_mask], dim=-1)
             targ_tiles = target_tile[played_mask]
@@ -225,17 +211,17 @@ def evaluate(
     tile_within_2_count = 0
     total_samples = 0
     total_card_plays = 0
-    tile_dist_errors = []
 
     for batch in loader:
-        grid, scalar, hand, cmask, tmask, target_card, target_tile = [b.to(device) for b in batch]
+        grid, scalar, hand, cmask, tmask, target_card, target_tile, _ = [
+            t.to(device) for t in batch
+        ]
         B = grid.size(0)
 
-        # Force target tile legal in mask
         played_mask = target_card > 0
         if played_mask.any():
-            b_indices = torch.arange(B, device=device)[played_mask]
-            tmask[b_indices, target_tile[played_mask]] = True
+            for idx in torch.where(played_mask)[0]:
+                tmask[idx, target_tile[idx]] = True
 
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
             card_logits, tile_logits = model(
@@ -246,8 +232,8 @@ def evaluate(
                 legal_tile_mask=tmask,
                 teacher_card_action=target_card,
             )
-            loss_card = card_criterion(card_logits, target_card)
 
+            loss_card = card_criterion(card_logits, target_card)
             if played_mask.any():
                 loss_tile = tile_criterion(tile_logits[played_mask], target_tile[played_mask])
             else:
@@ -280,7 +266,6 @@ def evaluate(
             dist = torch.sqrt((pred_y.float() - targ_y.float()) ** 2 + (pred_x.float() - targ_x.float()) ** 2)
             tile_within_2_count += (dist <= 2.0).sum().item()
             total_card_plays += played_mask.sum().item()
-            tile_dist_errors.append(float(dist.mean().item()))
 
         total_samples += B
 
@@ -291,45 +276,7 @@ def evaluate(
         "val_card_acc": card_correct / max(1, total_samples),
         "val_wait_acc": wait_correct / max(1, total_waits),
         "val_tile_within_2": tile_within_2_count / max(1, total_card_plays),
-        "val_tile_dist_err": float(np.mean(tile_dist_errors)) if tile_dist_errors else 0.0,
     }
-
-
-def generate_synthetic_shard(output_path: str, num_samples: int = 500):
-    """Generates synthetic dataset shard for instant pipeline testing."""
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    # Stacked 4 frames = 32 channels
-    grids = np.random.randn(num_samples, 32, 32, 18).astype(np.float32)
-    scalars = np.random.rand(num_samples, 12).astype(np.float32)
-    scalars[:, 1] = 0.5  # Constant in v1
-    # 2.6 Hog card IDs: 1..8
-    hands = np.random.randint(1, 9, size=(num_samples, 4), dtype=np.int64)
-    cmasks = np.ones((num_samples, 5), dtype=bool)
-    tmasks = np.ones((num_samples, 576), dtype=bool)
-
-    # 1 wait per 2 card plays
-    cards = []
-    tiles = []
-    for i in range(num_samples):
-        if i % 3 == 0:
-            cards.append(0)
-            tiles.append(0)
-        else:
-            cards.append(np.random.randint(1, 5))
-            tiles.append(np.random.randint(16 * 18, 32 * 18))  # ally half
-
-    np.savez_compressed(
-        output_path,
-        arena_grid=grids,
-        scalars=scalars,
-        hand_ids=hands,
-        legal_card_mask=cmasks,
-        legal_tile_mask=tmasks,
-        action_card=np.array(cards, dtype=np.int64),
-        action_tile=np.array(tiles, dtype=np.int64),
-        timestamps=np.linspace(0, 180, num_samples, dtype=np.float32),
-    )
-    print(f"[Synthetic] Created test shard with {num_samples} samples at {output_path}")
 
 
 def main():
@@ -342,22 +289,25 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--tile_loss_weight", type=float, default=1.0, help="Weight for tile head CE loss")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--synthetic", action="store_true", help="Generate synthetic test data if missing")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.data_dir, exist_ok=True)
+    if not os.path.exists(args.data_dir):
+        raise FileNotFoundError(f"Data directory '{args.data_dir}' does not exist.")
 
-    # Auto-generate synthetic data if data_dir is empty or requested
+    # Strict check: fail loudly if no real trajectory shards exist
     npz_files = [f for f in os.listdir(args.data_dir) if f.endswith(".npz")]
-    if not npz_files or args.synthetic:
-        synth_file = os.path.join(args.data_dir, "synthetic_sample.npz")
-        generate_synthetic_shard(synth_file, num_samples=300)
+    if not npz_files:
+        raise FileNotFoundError(
+            f"No trajectory shards (.npz) found in {args.data_dir}.\n"
+            f"Please extract real YouTube match VoDs using colab_pipeline/yt_action_extractor.py or "
+            f"record live matches using python main_live.py --log-dir {args.data_dir}."
+        )
 
     device = torch.device(args.device)
-    print(f"[Training] Using compute device: {device}")
+    print(f"[Training] Using compute device: {device} ({len(npz_files)} shard(s) available)")
 
-    # DataLoaders
+    # DataLoaders with match-level splitting
     train_loader, val_loader = create_dataloaders(
         data_dir_or_files=args.data_dir,
         batch_size=args.batch_size,
@@ -365,15 +315,16 @@ def main():
         num_workers=0 if os.name == "nt" else 2,
     )
 
-    # Model, Optimizer, Scheduler, Mixed Precision Scaler
+    # Policy Model with 135 Global Card Vocabulary
     model = DeckConditionedPolicy(
-        num_card_classes=NUM_CARD_CLASSES_V1,
+        num_card_classes=NUM_TOTAL_CARDS,
         card_emb_dim=16,
         num_scalars=12,
-        in_channels=32,
+        in_channels=STACKED_GRID_CHANNELS,
     ).to(device)
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.05)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda" if device.type == "cuda" else "cpu", enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
@@ -381,12 +332,12 @@ def main():
     best_onnx_path = os.path.join(args.save_dir, "cr_zero_policy_best.onnx")
 
     print("\n" + "=" * 85)
-    print("Epoch | Train Loss | Card Acc | Wait Acc | Tile<=2 | Val Loss | Val Card | Val Wait | Val Tile<=2")
+    print(f"{'Epoch':<5} | {'Train Loss':<10} | {'Card Acc':<8} | {'Wait Acc':<8} | {'Tile<=2':<7} | {'Val Loss':<8} | {'Val Card':<8} | {'Val Wait':<8} | {'Val Tile<=2'}")
     print("=" * 85)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_stats = train_one_epoch(
+        train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -394,39 +345,42 @@ def main():
             device=device,
             tile_loss_weight=args.tile_loss_weight,
         )
-        val_stats = evaluate(model=model, loader=val_loader, device=device)
+        val_metrics = evaluate(model=model, loader=val_loader, device=device)
         scheduler.step()
-        dt = time.time() - t0
+        elapsed = time.time() - t0
 
         print(
             f"{epoch:02d}/{args.epochs:02d} | "
-            f"{train_stats['loss']:.4f}     | "
-            f"{train_stats['card_acc'] * 100:.1f}%    | "
-            f"{train_stats['wait_acc'] * 100:.1f}%    | "
-            f"{train_stats['tile_within_2'] * 100:.1f}%   | "
-            f"{val_stats['val_loss']:.4f}   | "
-            f"{val_stats['val_card_acc'] * 100:.1f}%     | "
-            f"{val_stats['val_wait_acc'] * 100:.1f}%     | "
-            f"{val_stats['val_tile_within_2'] * 100:.1f}% ({dt:.1f}s)"
+            f"{train_metrics['loss']:<10.4f} | "
+            f"{train_metrics['card_acc']*100:<7.1f}% | "
+            f"{train_metrics['wait_acc']*100:<7.1f}% | "
+            f"{train_metrics['tile_within_2']*100:<6.1f}% | "
+            f"{val_metrics['val_loss']:<8.4f} | "
+            f"{val_metrics['val_card_acc']*100:<8.1f}% | "
+            f"{val_metrics['val_wait_acc']*100:<8.1f}% | "
+            f"{val_metrics['val_tile_within_2']*100:.1f}% ({elapsed:.1f}s)"
         )
 
-        # Save checkpoint if best
-        if val_stats["val_loss"] < best_val_loss:
-            best_val_loss = val_stats["val_loss"]
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": best_val_loss,
-                "val_stats": val_stats,
-            }, best_pt_path)
+        if val_metrics["val_loss"] < best_val_loss:
+            best_val_loss = val_metrics["val_loss"]
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": best_val_loss,
+                    "num_card_classes": NUM_TOTAL_CARDS,
+                },
+                best_pt_path
+            )
             print(f"  -> Saved new best PyTorch checkpoint to {best_pt_path}")
 
-    # Export best model to ONNX
     print("\n[Training Complete] Loading best checkpoint for ONNX export...")
-    checkpoint = torch.load(best_pt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    export_to_onnx(model, best_onnx_path, device)
+    if os.path.exists(best_pt_path):
+        ckpt = torch.load(best_pt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        export_to_onnx(model, best_onnx_path, device=device)
+
     print(f"[Done] Checkpoints ready at {best_pt_path} and {best_onnx_path}\n")
 
 

@@ -191,7 +191,7 @@ class YouTubeTrajectoryExtractor:
                 states_hand.append(np.array(past_obs["hand_ids"], dtype=np.int64))
                 legal_card_masks.append(past_obs["legal_card_mask"])
 
-                tile_mask = self.encoder.get_legal_tile_mask(card_id)
+                tile_mask = self.encoder.get_legal_tile_mask(card_id, tower_hps=past_obs.get("tower_hps"))
                 legal_tile_masks.append(tile_mask)
 
                 chosen_card = slot_idx + 1

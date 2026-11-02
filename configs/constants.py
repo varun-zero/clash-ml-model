@@ -60,33 +60,26 @@ TOWER_BOXES: Dict[str, Tuple[float, float, float, float]] = {
     "ally_princess_right": (0.680, 0.600, 0.840, 0.680),
 }
 
+# Narrow HP-bar strips. The tower body boxes are too large for an HP ratio.
+TOWER_HP_BOXES: Dict[str, Tuple[float, float, float, float]] = {
+    "enemy_king": (0.440, 0.158, 0.560, 0.176),
+    "enemy_princess_left": (0.180, 0.248, 0.300, 0.266),
+    "enemy_princess_right": (0.700, 0.248, 0.820, 0.266),
+    "ally_king": (0.440, 0.738, 0.560, 0.756),
+    "ally_princess_left": (0.180, 0.648, 0.300, 0.666),
+    "ally_princess_right": (0.700, 0.648, 0.820, 0.666),
+}
+
 # ==============================================================================
-# 3. Card Database: Metadata, Elixir Cost & Spell Classification
-# ID 0 is strictly reserved for "Wait / No-Op / Empty"
+# 3. Card Database: the single global card vocabulary.
+# ID 0 is strictly reserved for "Wait / No-Op / Empty".
+#
+# IMPORTANT: every hand card, action, tile mask, template directory, and model
+# embedding uses these global IDs. Do not introduce a second local deck-ID map.
 # ==============================================================================
 
-# v1 Default Deck: 2.6 Hog Cycle (10 classes: 0=Wait, 1..8=2.6 Hog Cards, 9=Unknown)
-# Compatible with KataCR card_classification dataset
-DEFAULT_DECK_CLASSES: List[Dict] = [
-    {"id": 0, "name": "Wait", "cost": 0, "is_spell": False, "category": "none"},
-    {"id": 1, "name": "Hog Rider", "cost": 4, "is_spell": False, "category": "ground"},
-    {"id": 2, "name": "Cannon", "cost": 3, "is_spell": False, "category": "building"},
-    {"id": 3, "name": "Musketeer", "cost": 4, "is_spell": False, "category": "ground"},
-    {"id": 4, "name": "Ice Golem", "cost": 2, "is_spell": False, "category": "ground"},
-    {"id": 5, "name": "Ice Spirit", "cost": 1, "is_spell": False, "category": "ground"},
-    {"id": 6, "name": "Skeletons", "cost": 1, "is_spell": False, "category": "ground"},
-    {"id": 7, "name": "Fireball", "cost": 4, "is_spell": True, "category": "spell"},
-    {"id": 8, "name": "The Log", "cost": 2, "is_spell": True, "category": "spell"},
-    {"id": 9, "name": "Unknown", "cost": 0, "is_spell": False, "category": "none"},
-]
-
-NUM_CARD_CLASSES_V1: int = len(DEFAULT_DECK_CLASSES)  # 10
 STACKED_GRID_CHANNELS: int = 32  # 4 frames * 8 channels = 32
 NUM_SCALARS: int = 12
-
-DECK_ID_TO_COST: Dict[int, int] = {c["id"]: c["cost"] for c in DEFAULT_DECK_CLASSES}
-DECK_ID_TO_IS_SPELL: Dict[int, bool] = {c["id"]: c["is_spell"] for c in DEFAULT_DECK_CLASSES}
-DECK_NAME_TO_ID: Dict[str, int] = {c["name"].lower(): c["id"] for c in DEFAULT_DECK_CLASSES}
 
 CARD_DATABASE: Dict[int, Dict] = {
     0: {"name": "Wait", "cost": 0, "is_spell": False, "category": "none"},
@@ -205,10 +198,12 @@ CARD_DATABASE: Dict[int, Dict] = {
     113: {"name": "Goblin Drill", "cost": 4, "is_spell": True, "category": "building"},  # Placed anywhere
 }
 
-# Total card vocabulary size for embedding layers
+# Total card embedding vocabulary. CARD_DATABASE currently populates 0..113;
+# IDs 114..134 are reserved for future cards and get zero static features.
 NUM_TOTAL_CARDS: int = 135
+WAIT_CARD_ID: int = 0
 
-# Fast lookup dictionaries
+# Fast lookup dictionaries (global IDs only)
 CARD_ID_TO_COST: Dict[int, int] = {
     cid: meta["cost"] for cid, meta in CARD_DATABASE.items()
 }
@@ -218,9 +213,18 @@ CARD_ID_TO_IS_SPELL: Dict[int, bool] = {
 CARD_ID_TO_CATEGORY: Dict[int, str] = {
     cid: meta["category"] for cid, meta in CARD_DATABASE.items()
 }
+CARD_ID_TO_NAME: Dict[int, str] = {
+    cid: meta["name"] for cid, meta in CARD_DATABASE.items()
+}
 CARD_NAME_TO_ID: Dict[str, int] = {
     meta["name"].lower(): cid for cid, meta in CARD_DATABASE.items()
 }
+
+# Starter-account friendly cards. This is the fallback if
+# configs/unlocked_cards.json is absent; the JSON file is the editable source.
+# 1 Arrows, 2 Fireball, 20 Knight, 21 Archers, 22 Goblins, 23 Spear Goblins,
+# 34 Bomber, 43 Minions.
+DEFAULT_UNLOCKED_CARD_IDS: List[int] = [1, 2, 20, 21, 22, 23, 34, 43]
 
 # ==============================================================================
 # 4. Coordinate Conversion Functions (Normalized, Grid & Pixel)

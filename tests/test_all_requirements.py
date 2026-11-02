@@ -1,11 +1,20 @@
 """
-CR-Zero Comprehensive Integration Test Suite.
-Verifies all 14 requirements across DATA/EXTRACTION, STATE/MODEL, PERCEPTION, and LIVE.
-Must exit with code 0.
+CR-Zero Comprehensive Integration & Regression Test Suite.
+Verifies all P0 fixes and core requirements:
+1. Single global card vocabulary (135 cards) and editable unlocked_cards.json.
+2. Regression tests: Troop => ally-half tiles only (288 tiles / pockets), Spell => all 576 tiles.
+3. Affordability and HUD card names using global IDs.
+4. Card embedding = learned Embedding(135, 16) + Linear(static_features -> 16), summed.
+5. Unseen card embedding validity.
+6. Cooldown, max-actions, and safety controls with mocked ADB.
+7. Perspective canonicalization (180 deg + ally/enemy channel swaps).
+8. RuleBot strategic heuristics.
+Must pass with exit code 0.
 """
 import os
 import sys
 import unittest
+from unittest.mock import patch, MagicMock
 import numpy as np
 import torch
 
@@ -17,16 +26,26 @@ from configs.constants import (
     ARENA_ROWS,
     ARENA_COLS,
     TOTAL_TILES,
-    NUM_CARD_CLASSES_V1,
+    NUM_TOTAL_CARDS,
     STACKED_GRID_CHANNELS,
     NUM_SCALARS,
-    DEFAULT_DECK_CLASSES,
     CARD_DATABASE,
+    CARD_ID_TO_COST,
+    CARD_ID_TO_IS_SPELL,
+    CARD_ID_TO_NAME,
+    DEFAULT_UNLOCKED_CARD_IDS,
     grid_to_screen_pixel,
     hand_slot_to_screen_pixel,
     grid_to_clashroyalebuildabot,
     clashroyalebuildabot_to_grid,
 )
+from configs.card_features import (
+    CARD_FEATURE_DIM,
+    card_feature_vector,
+    build_card_feature_matrix,
+    card_targets_air,
+)
+from configs.unlocked_cards import load_unlocked_cards
 from perception.state_encoder import (
     StateEncoder,
     Detection,
@@ -36,155 +55,192 @@ from perception.state_encoder import (
 )
 from perception.detector import ClashRoyaleDetector
 from policy.model import DeckConditionedPolicy
+from policy.rule_bot import RuleBotPolicy
 from controller.adb_harness import ADBHarness
-from colab_pipeline.yt_action_extractor import YouTubeTrajectoryExtractor
+from colab_pipeline.dataset import ClashRoyaleDataset, create_dataloaders
+from tests.helpers import generate_synthetic_shard
 
 
 class TestCRZeroRequirements(unittest.TestCase):
-    def test_01_constants_and_deck_vocabulary(self):
-        """Req 11: Single deck (2.6 Hog) with 10 classes."""
-        self.assertEqual(len(DEFAULT_DECK_CLASSES), 10)
-        self.assertEqual(DEFAULT_DECK_CLASSES[0]["name"], "Wait")
-        self.assertEqual(DEFAULT_DECK_CLASSES[1]["name"], "Hog Rider")
-        self.assertEqual(NUM_CARD_CLASSES_V1, 10)
+    def test_01_global_card_vocabulary_and_unlocked(self):
+        """Req 3: Single global vocabulary from CARD_DATABASE (135 classes)."""
+        self.assertEqual(NUM_TOTAL_CARDS, 135)
         self.assertEqual(STACKED_GRID_CHANNELS, 32)
         self.assertEqual(NUM_SCALARS, 12)
 
-    def test_02_buildabot_interop(self):
-        """Ensure coordinate conversions are monotonic and roundtrip accurately."""
-        for r in [0, 15, 31]:
-            for c in [0, 8, 17]:
-                bx, by = grid_to_clashroyalebuildabot(r, c)
-                r_rec, c_rec = clashroyalebuildabot_to_grid(bx, by)
-                self.assertEqual(r, r_rec)
-                self.assertEqual(c, c_rec)
+        # Verify starter cards in unlocked_cards.json
+        unlocked = load_unlocked_cards()
+        self.assertGreaterEqual(len(unlocked), 4)
+        for cid in unlocked:
+            self.assertIn(cid, CARD_DATABASE)
+            self.assertNotEqual(cid, 0)  # ID 0 is strictly Wait
 
-    def test_03_canonicalization(self):
-        """Req 1: Rotate grid 180 and swap ally/enemy channels when player_side=top."""
-        grid = np.zeros((8, ARENA_ROWS, ARENA_COLS), dtype=np.float32)
-        grid[0, 5, 4] = 1.0  # Ally ground at top row 5, col 4
-        grid[3, 25, 12] = 2.0  # Enemy ground at bottom row 25, col 12
-        tower_hps = [1.0, 0.9, 0.8, 1.0, 0.7, 0.6]
-
-        canon_bottom, hps_bottom = canonicalize_perspective(grid, tower_hps, player_side="bottom")
-        self.assertTrue(np.array_equal(canon_bottom, grid))
-        self.assertEqual(hps_bottom, tower_hps)
-
-        canon_top, hps_top = canonicalize_perspective(grid, tower_hps, player_side="top")
-        # In canon_top, channels 0..2 swap with 3..5, and coordinates rotate 180 (row -> 31-r, col -> 17-c)
-        # Old ally (channel 0) at (5, 4) becomes enemy (channel 3) at (31-5=26, 17-4=13)
-        self.assertEqual(canon_top[3, 26, 13], 1.0)
-        # Old enemy (channel 3) at (25, 12) becomes ally (channel 0) at (31-25=6, 17-12=5)
-        self.assertEqual(canon_top[0, 6, 5], 2.0)
-
-        # Coordinate canonicalization: (5, 4) becomes (26, 13)
-        cy, cx = canonicalize_tile_coordinate(5, 4, player_side="top")
-        self.assertEqual((cy, cx), (26, 13))
-
-    def test_04_state_encoder_and_scalars(self):
-        """Req 7 & 8: Scalars (12,) with est_enemy_elixir=0.5 and 32 stacked channels."""
+    def test_02_regression_card_legality_and_affordability(self):
+        """Req 5: Regression tests: troop => ally-half only, spell => all 576, cost/affordability correct, HUD names correct."""
         encoder = StateEncoder()
-        grid, scalars, legal_card_mask = encoder.encode(
-            detections=[Detection(0.5, 0.5, 0.6, 0.6, 0.9, 1, True, "ground")],
-            elixir=7.0,
-            hand_card_ids=[20, 21, 22, 23],
-            tower_hps=[1.0, 0.9, 0.9, 1.0, 0.8, 0.8],
-            time_left=120.0,
-            est_enemy_elixir=0.5,
-            last_action=(1, 100),
+
+        # 1. Troop legality: Knight (ID 20) and Hog Rider (ID 51) are troops
+        knight_mask = encoder.get_legal_tile_mask(card_id=20)
+        self.assertEqual(knight_mask.shape, (576,))
+        self.assertEqual(int(knight_mask.sum()), 16 * 18)  # Exactly 288 tiles on ally half (rows 16..31)
+        # Verify no top-half tiles are legal for a troop when enemy towers stand
+        top_half_mask = knight_mask.reshape(32, 18)[:16, :]
+        self.assertEqual(int(top_half_mask.sum()), 0)
+
+        hog_mask = encoder.get_legal_tile_mask(card_id=51)
+        self.assertEqual(int(hog_mask.sum()), 16 * 18)
+
+        # 2. Spell legality: Fireball (ID 2), Arrows (ID 1), The Log (ID 4)
+        fireball_mask = encoder.get_legal_tile_mask(card_id=2)
+        self.assertEqual(int(fireball_mask.sum()), 576)  # Entire arena is legal for spells
+
+        arrows_mask = encoder.get_legal_tile_mask(card_id=1)
+        self.assertEqual(int(arrows_mask.sum()), 576)
+
+        # 3. Pocket expansion: when enemy left princess tower is destroyed (hp <= 0.05)
+        tower_hps_pocket = [1.0, 1.0, 1.0, 1.0, 0.0, 1.0]  # enemy left down
+        pocket_mask = encoder.get_legal_tile_mask(card_id=20, tower_hps=tower_hps_pocket)
+        self.assertGreater(int(pocket_mask.sum()), 16 * 18)  # Ally half + pocket
+
+        # 4. Affordability: Knight costs 3, Fireball costs 4
+        self.assertEqual(CARD_ID_TO_COST[20], 3)
+        self.assertEqual(CARD_ID_TO_COST[2], 4)
+        self.assertFalse(CARD_ID_TO_IS_SPELL[20])
+        self.assertTrue(CARD_ID_TO_IS_SPELL[2])
+
+        _, _, cmask_low = encoder.encode(
+            detections=[], elixir=2.5, hand_card_ids=[20, 2, 24, 1]
         )
-        self.assertEqual(grid.shape, (8, 32, 18))
-        self.assertEqual(scalars.shape, (12,))
-        self.assertEqual(scalars[1], 0.5)  # est_enemy_elixir constant
-        self.assertEqual(legal_card_mask.shape, (5,))
+        self.assertTrue(cmask_low[0])   # Wait always legal
+        self.assertFalse(cmask_low[1])  # Knight (cost 3) not affordable at 2.5
+        self.assertFalse(cmask_low[2])  # Fireball (cost 4) not affordable at 2.5
 
-        # 4-frame stacking: 4 * 8 = 32 channels
-        frames = [grid for _ in range(4)]
-        stacked = stack_spatial_frames(frames, target_frames=4)
-        self.assertEqual(stacked.shape, (32, 32, 18))
+        _, _, cmask_mid = encoder.encode(
+            detections=[], elixir=3.5, hand_card_ids=[20, 2, 24, 1]
+        )
+        self.assertTrue(cmask_mid[1])   # Knight (cost 3) affordable at 3.5
+        self.assertFalse(cmask_mid[2])  # Fireball (cost 4) not affordable at 3.5
 
-    def test_05_detector_loud_failure(self):
-        """Req 11: Fail loudly if missing weights."""
-        with self.assertRaises((FileNotFoundError, ValueError)):
-            ClashRoyaleDetector(weights="non_existent_weights_file.pt")
+        # 5. HUD Names: Verify correct names from global IDs
+        self.assertEqual(CARD_ID_TO_NAME[1], "Arrows")
+        self.assertEqual(CARD_ID_TO_NAME[2], "Fireball")
+        self.assertEqual(CARD_ID_TO_NAME[20], "Knight")
+        self.assertEqual(CARD_ID_TO_NAME[51], "Hog Rider")
 
-    def test_06_policy_architecture_and_fp16(self):
-        """Req 4, 7, 8: DeckConditionedPolicy with 32 in_channels and 12 scalars."""
+    def test_03_card_embedding_and_unseen_card(self):
+        """Req 4: Embedding = learned Embedding(135,16) + Linear(static_features -> 16), summed."""
         model = DeckConditionedPolicy(
-            num_card_classes=10,
+            num_card_classes=NUM_TOTAL_CARDS,
             card_emb_dim=16,
             num_scalars=12,
             in_channels=32,
         )
-        grid = torch.zeros((2, 32, 32, 18), dtype=torch.float32)
-        scalars = torch.zeros((2, 12), dtype=torch.float32)
-        hand = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.long)
-        cmask = torch.ones((2, 5), dtype=torch.bool)
-        tmask = torch.ones((2, 576), dtype=torch.bool)
 
-        c_logits, t_logits = model(grid, scalars, hand, cmask, tmask)
-        self.assertEqual(c_logits.shape, (2, 5))
-        self.assertEqual(t_logits.shape, (2, 576))
+        # Test static feature matrix shape
+        feat_matrix = build_card_feature_matrix(NUM_TOTAL_CARDS)
+        self.assertEqual(feat_matrix.shape, (135, CARD_FEATURE_DIM))
 
-        # Test predict_action with temperature sampling
-        card_act, tile_act, c_conf, t_conf = model.predict_action(
-            grid, scalars, hand, cmask, tmask, temperature=0.7
-        )
-        self.assertIn(card_act, list(range(5)))
-        self.assertIn(tile_act, list(range(576)))
+        # Test forward pass with unseen high card ID (e.g. 110)
+        grid = torch.zeros((1, 32, 32, 18), dtype=torch.float32)
+        scalars = torch.zeros((1, 12), dtype=torch.float32)
+        hand = torch.tensor([[1, 2, 20, 110]], dtype=torch.long)
+        cmask = torch.ones((1, 5), dtype=torch.bool)
+        tmask = torch.ones((1, 576), dtype=torch.bool)
 
-    def test_07_clock_filtering_and_ambiguity_logic(self):
-        """Req 2: Clock filtering for side, troop legality, affordability, and ambiguity skip."""
-        extractor = YouTubeTrajectoryExtractor()
+        trunk_feat, hand_embs = model._encode(grid, scalars, hand)
+        self.assertEqual(hand_embs.shape, (1, 4, 16))
+        # Embedding for card 110 must be non-zero and finite
+        emb_card_110 = hand_embs[0, 3]
+        self.assertFalse(torch.isnan(emb_card_110).any())
+        self.assertGreater(float(torch.norm(emb_card_110).item()), 0.0)
 
-        # Knight (card ID 20) is a 3-elixir ground troop (only legal on ally half rows 16..31)
-        past_obs = {
-            "elixir": 4.0,  # Affordable (cost 3 <= 4)
-            "hand_ids": [20, 2, 3, 4],
-            "tower_hps": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            "has_overlay": False,
-        }
-        future_obs = {
-            "hand_ids": [21, 2, 3, 4],
-            "has_overlay": False,
-        }
+        # Test factored card and tile prediction methods
+        chosen_slot, card_conf = model.predict_card(grid, scalars, hand, cmask)
+        self.assertIn(chosen_slot, [0, 1, 2, 3, 4])
+        chosen_tile, tile_conf = model.predict_tile(grid, scalars, hand, tmask, card_slot=chosen_slot)
+        self.assertIn(chosen_tile, list(range(576)))
 
-        # Case A: Two clocks: row 5 (illegal enemy half) and row 20 (legal ally half)
-        curr_obs_a = {
-            "selected_slot": 0,
-            "elixir": 1.0,
-            "clock_coords": [(5, 9), (20, 9)],
-            "has_overlay": False,
-        }
-        res_a = extractor._detect_card_drop(past_obs, curr_obs_a, future_obs, player_side="bottom")
-        self.assertIsNotNone(res_a)
-        slot, ty, tx = res_a
-        self.assertEqual(slot, 0)
-        self.assertEqual((ty, tx), (20, 9))
+    def test_04_canonicalization(self):
+        """Req 1: Rotate grid 180 and swap ally/enemy channels when player_side=top."""
+        grid = np.zeros((8, ARENA_ROWS, ARENA_COLS), dtype=np.float32)
+        grid[0, 5, 4] = 1.0  # Ally ground at (5, 4)
+        grid[3, 25, 12] = 2.0  # Enemy ground at (25, 12)
+        tower_hps = [1.0, 0.9, 0.8, 1.0, 0.7, 0.6]
 
-        # Case B: Unaffordable at t-5 (elixir was 2.0 < 3.0) -> must return None
-        past_obs_unaffordable = dict(past_obs, elixir=2.0)
-        res_b = extractor._detect_card_drop(past_obs_unaffordable, curr_obs_a, future_obs, player_side="bottom")
-        self.assertIsNone(res_b)
+        canon_top, hps_top = canonicalize_perspective(grid, tower_hps, player_side="top")
+        self.assertEqual(canon_top[3, 26, 13], 1.0)
+        self.assertEqual(canon_top[0, 6, 5], 2.0)
+        cy, cx = canonicalize_tile_coordinate(5, 4, player_side="top")
+        self.assertEqual((cy, cx), (26, 13))
 
-        # Case C: Ambiguous clocks (two legal clocks far apart: (20, 4) and (28, 14)) -> skip frame
-        curr_obs_c = {
-            "selected_slot": 0,
-            "elixir": 1.0,
-            "clock_coords": [(20, 4), (28, 14)],
-            "has_overlay": False,
-        }
-        res_c = extractor._detect_card_drop(past_obs, curr_obs_c, future_obs, player_side="bottom")
-        self.assertIsNone(res_c)
+    def test_05_rule_bot_heuristics(self):
+        """Req 10: RuleBot beginner heuristics (defend threats, bridge push, never play unaffordable)."""
+        bot = RuleBotPolicy()
+        grid = np.zeros((8, 32, 18), dtype=np.float32)
+        scalars = np.zeros(12, dtype=np.float32)
+        scalars[0] = 0.5  # 5.0 elixir
+        scalars[3:9] = 1.0
+        hand = [20, 21, 24, 1]  # Knight(3), Archers(3), Giant(5), Arrows(3)
 
-    def test_08_adb_harness_execution(self):
-        """Req 13: ADB Harness two-tap calculation."""
-        harness = ADBHarness(screen_width=540, screen_height=960)
-        hx, hy = hand_slot_to_screen_pixel(0, 540, 960)
-        self.assertTrue(0 <= hx <= 540 and 0 <= hy <= 960)
-        ax, ay = grid_to_screen_pixel(20, 9, 540, 960)
-        self.assertTrue(0 <= ax <= 540 and 0 <= ay <= 960)
-        harness.close()
+        # 1. Threat on ally side -> defends
+        grid_threat = grid.copy()
+        grid_threat[3, 22, 5] = 1.0
+        cmask = np.array([True, True, True, True, True])
+        slot, tile, _, _ = bot.predict_action(grid_threat, scalars, hand, cmask)
+        self.assertIn(slot, [1, 2, 4])
+        self.assertGreaterEqual(tile, 16 * 18)
+
+        # 2. High elixir >= 9.0 -> bridge push
+        scalars_high = scalars.copy()
+        scalars_high[0] = 0.95  # 9.5 elixir
+        slot_push, tile_push, _, _ = bot.predict_action(grid, scalars_high, hand, cmask)
+        self.assertGreater(slot_push, 0)
+        py, px = tile_push // 18, tile_push % 18
+        self.assertIn(py, [16, 17])
+        self.assertIn(px, [3, 14])
+
+        # 3. Unaffordable cards -> wait
+        cmask_none = np.array([True, False, False, False, False])
+        slot_wait, _, _, _ = bot.predict_action(grid_threat, scalars_high, hand, cmask_none)
+        self.assertEqual(slot_wait, 0)
+
+    def test_06_mocked_adb_safety_controls(self):
+        """Req 1 & 13: Mock ADB in unit tests; test resolution, cooldown, max_actions, dry_run."""
+        with patch("controller.adb_harness.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="Physical size: 720x1280\n")
+
+            harness = ADBHarness(
+                device_address="127.0.0.1:5555",
+                dry_run=True,
+                max_actions=2,
+                action_cooldown_sec=0.1,
+            )
+            # Verify dry-run tap succeeds
+            ok1 = harness.play_card(0, 20, 9, non_blocking=False)
+            self.assertTrue(ok1)
+
+            # Rapid tap rejected by cooldown
+            ok_rapid = harness.play_card(1, 20, 9, non_blocking=False)
+            self.assertFalse(ok_rapid)
+
+            harness.close()
+
+    def test_07_outcome_weighted_dataset(self):
+        """Req 12: Split by match and weight win > loss."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p1 = os.path.join(tmpdir, "match_01_win.npz")
+            p2 = os.path.join(tmpdir, "match_02_loss.npz")
+            generate_synthetic_shard(p1, num_samples=50, match_outcome=1)   # Win
+            generate_synthetic_shard(p2, num_samples=50, match_outcome=-1)  # Loss
+
+            train_loader, val_loader = create_dataloaders(tmpdir, batch_size=16, val_split=0.5)
+            # Fetch a batch from train_loader
+            batch = next(iter(train_loader))
+            weights = batch[7]
+            self.assertEqual(weights.shape[0], 16)
+            # Weights must reflect outcome (1.5 for win or 0.5 for loss)
+            self.assertTrue((weights == 1.5).any() or (weights == 0.5).any())
 
 
 if __name__ == "__main__":

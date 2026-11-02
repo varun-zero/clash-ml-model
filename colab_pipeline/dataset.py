@@ -1,8 +1,12 @@
 """
 PyTorch Dataset and DataLoader for Clash Royale Trajectory Shards (.npz).
-Supports multi-shard loading, train/val splitting, and arena horizontal flip augmentation.
+Supports:
+- Multi-match shard loading with match-level train/val splitting (no sample-level leakage).
+- Temporal intra-match splitting when only a single match shard is available.
+- Match outcome weighting: win (1.5) > draw (1.0) > loss (0.5).
+- Arena horizontal flip data augmentation.
 """
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 import os
 import glob
 import numpy as np
@@ -15,37 +19,74 @@ from configs.constants import ARENA_COLS, ARENA_ROWS, TOTAL_TILES
 class ClashRoyaleDataset(Dataset):
     """
     Loads one or more .npz shards containing:
-      arena_grid: (N, 8, 32, 18) float32
+      arena_grid: (N, 32, 32, 18) float32
       scalars: (N, 12) float32
       hand_ids: (N, 4) int64
       legal_card_mask: (N, 5) bool
       legal_tile_mask: (N, 576) bool
       action_card: (N,) int64
       action_tile: (N,) int64
+      match_outcome: Optional int (+1 win, 0 draw, -1 loss)
     """
     def __init__(
         self,
         shard_paths: List[str],
         augment_horizontal_flip: bool = True,
+        sample_range: Optional[Tuple[float, float]] = None,
     ):
         self.augment = augment_horizontal_flip
 
-        grids, scalars, hands, cmasks, tmasks, acards, atiles = [], [], [], [], [], [], []
+        grids, scalars, hands, cmasks, tmasks, acards, atiles, weights = [], [], [], [], [], [], [], []
 
         for p in shard_paths:
             if not os.path.exists(p):
                 continue
             with np.load(p) as data:
-                grids.append(data["arena_grid"])
-                scalars.append(data["scalars"])
-                hands.append(data["hand_ids"])
-                cmasks.append(data["legal_card_mask"])
-                tmasks.append(data["legal_tile_mask"])
-                acards.append(data["action_card"])
-                atiles.append(data["action_tile"])
+                g = data["arena_grid"]
+                s = data["scalars"]
+                h = data["hand_ids"]
+                cm = data["legal_card_mask"]
+                tm = data["legal_tile_mask"]
+                ac = data["action_card"]
+                at = data["action_tile"]
+
+                # Outcome weighting: win > draw > loss
+                outcome = int(data["match_outcome"]) if "match_outcome" in data else 0
+                if outcome > 0:
+                    outcome_w = 1.5
+                elif outcome < 0:
+                    outcome_w = 0.5
+                else:
+                    outcome_w = 1.0
+
+                w_arr = np.full(len(ac), fill_value=outcome_w, dtype=np.float32)
+
+                # Temporal intra-match slice if specified
+                if sample_range is not None:
+                    start_frac, end_frac = sample_range
+                    start_idx = int(round(len(ac) * start_frac))
+                    end_idx = int(round(len(ac) * end_frac))
+                    g = g[start_idx:end_idx]
+                    s = s[start_idx:end_idx]
+                    h = h[start_idx:end_idx]
+                    cm = cm[start_idx:end_idx]
+                    tm = tm[start_idx:end_idx]
+                    ac = ac[start_idx:end_idx]
+                    at = at[start_idx:end_idx]
+                    w_arr = w_arr[start_idx:end_idx]
+
+                if len(ac) > 0:
+                    grids.append(g)
+                    scalars.append(s)
+                    hands.append(h)
+                    cmasks.append(cm)
+                    tmasks.append(tm)
+                    acards.append(ac)
+                    atiles.append(at)
+                    weights.append(w_arr)
 
         if len(grids) == 0:
-            raise ValueError(f"No valid shards loaded from {shard_paths}")
+            raise ValueError(f"No valid samples loaded from {shard_paths}")
 
         self.arena_grid = np.concatenate(grids, axis=0)
         self.scalars = np.concatenate(scalars, axis=0)
@@ -54,9 +95,10 @@ class ClashRoyaleDataset(Dataset):
         self.legal_tile_mask = np.concatenate(tmasks, axis=0)
         self.action_card = np.concatenate(acards, axis=0)
         self.action_tile = np.concatenate(atiles, axis=0)
+        self.weights = np.concatenate(weights, axis=0)
 
         self.length = len(self.action_card)
-        print(f"[Dataset] Loaded {self.length} samples from {len(shard_paths)} shards.")
+        print(f"[Dataset] Loaded {self.length} samples from {len(shard_paths)} shard(s).")
 
     def __len__(self) -> int:
         return self.length
@@ -69,6 +111,7 @@ class ClashRoyaleDataset(Dataset):
         tmask = self.legal_tile_mask[idx].copy()
         acard = int(self.action_card[idx])
         atile = int(self.action_tile[idx])
+        weight = float(self.weights[idx])
 
         # Data augmentation: 50% chance horizontal flip
         if self.augment and np.random.rand() > 0.5:
@@ -76,9 +119,7 @@ class ClashRoyaleDataset(Dataset):
             grid = np.flip(grid, axis=2).copy()
 
             # 2. Swap left and right princess tower HPs in scalars
-            # Scalars indices:
-            # 4: ally_left, 5: ally_right
-            # 7: enemy_left, 8: enemy_right
+            # 4: ally_left, 5: ally_right; 7: enemy_left, 8: enemy_right
             scalar[4], scalar[5] = scalar[5], scalar[4]
             scalar[7], scalar[8] = scalar[8], scalar[7]
 
@@ -95,7 +136,7 @@ class ClashRoyaleDataset(Dataset):
             flipped_tile_x = (ARENA_COLS - 1) - tile_x
             atile = tile_y * ARENA_COLS + flipped_tile_x
 
-            # 4. Flip legal tile mask (576 -> 32, 18 -> flip horizontal -> 576)
+            # 4. Flip legal tile mask
             tmask_2d = tmask.reshape(ARENA_ROWS, ARENA_COLS)
             tmask = np.flip(tmask_2d, axis=1).flatten().copy()
 
@@ -107,42 +148,55 @@ class ClashRoyaleDataset(Dataset):
             torch.from_numpy(tmask).bool(),
             torch.tensor(acard, dtype=torch.long),
             torch.tensor(atile, dtype=torch.long),
+            torch.tensor(weight, dtype=torch.float32),
         )
 
 
 def create_dataloaders(
-    data_dir_or_files: str,
+    data_dir_or_files: Union[str, List[str]],
     batch_size: int = 64,
     val_split: float = 0.15,
     num_workers: int = 2,
     augment: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Creates train and validation DataLoaders from .npz files in directory.
+    Creates train and validation DataLoaders split by match (not by individual sample).
+    Prevents leakage across consecutive frames of the same match.
     """
-    if os.path.isdir(data_dir_or_files):
+    if isinstance(data_dir_or_files, list):
+        shard_paths = data_dir_or_files
+    elif os.path.isdir(data_dir_or_files):
         shard_paths = sorted(glob.glob(os.path.join(data_dir_or_files, "*.npz")))
     else:
         shard_paths = [data_dir_or_files]
 
     if not shard_paths:
-        raise FileNotFoundError(f"No .npz files found in {data_dir_or_files}")
+        raise FileNotFoundError(f"No .npz trajectory files found in {data_dir_or_files}")
 
     np.random.seed(42)
-    np.random.shuffle(shard_paths)
+    shuffled_shards = list(shard_paths)
+    np.random.shuffle(shuffled_shards)
 
-    num_val = max(1, int(round(len(shard_paths) * val_split))) if len(shard_paths) > 1 else 0
-    val_shards = shard_paths[:num_val] if num_val > 0 else shard_paths
-    train_shards = shard_paths[num_val:] if num_val > 0 else shard_paths
+    if len(shuffled_shards) > 1:
+        # Split by match / shard
+        num_val = max(1, int(round(len(shuffled_shards) * val_split)))
+        val_shards = shuffled_shards[:num_val]
+        train_shards = shuffled_shards[num_val:]
+        print(f"[DataLoader] Split {len(shuffled_shards)} matches into {len(train_shards)} train and {len(val_shards)} val shards.")
+        train_dataset = ClashRoyaleDataset(train_shards, augment_horizontal_flip=augment)
+        val_dataset = ClashRoyaleDataset(val_shards, augment_horizontal_flip=False)
+    else:
+        # Single match: temporal intra-match split (first 85% train, last 15% val)
+        print(f"[DataLoader] Single match shard detected. Splitting temporally (train: 0..{1.0-val_split:.2f}, val: {1.0-val_split:.2f}..1.0).")
+        train_dataset = ClashRoyaleDataset(shuffled_shards, augment_horizontal_flip=augment, sample_range=(0.0, 1.0 - val_split))
+        val_dataset = ClashRoyaleDataset(shuffled_shards, augment_horizontal_flip=False, sample_range=(1.0 - val_split, 1.0))
 
-    train_dataset = ClashRoyaleDataset(train_shards, augment_horizontal_flip=augment)
-    val_dataset = ClashRoyaleDataset(val_shards, augment_horizontal_flip=False)
-
+    effective_workers = 0 if os.name == "nt" else num_workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
         drop_last=len(train_dataset) > batch_size,
     )
@@ -150,10 +204,9 @@ def create_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=effective_workers,
         pin_memory=True,
         drop_last=False,
     )
 
     return train_loader, val_loader
-
