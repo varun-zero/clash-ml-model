@@ -22,10 +22,12 @@ from configs.constants import (
     CARD_ID_TO_COST,
     CARD_ID_TO_IS_SPELL,
     CARD_ID_TO_CATEGORY,
+    CARD_ID_TO_NAME,
     WAIT_CARD_ID,
     screen_to_grid,
     get_default_deployable_mask,
 )
+from configs.meta_decks import identify_meta_deck
 
 
 @dataclass
@@ -47,10 +49,16 @@ class Detection:
 
 class OpponentTracker:
     """
-    Tracks opponent's elixir, card cycle, and active units across match frames.
-    - Elixir: starts at 5.0, regenerates at 1/2.8s (or 1/1.4s during double elixir).
-    - Deduction: when a new enemy unit track ID appears, looks up cost in CARD_ID_TO_COST and deducts it.
-    - Card Cycle: tracks unique enemy cards seen (up to 8 cards) and active rotation.
+    Advanced real-time tracker for opponent:
+    1. Elixir tracking: dynamic rate (single/double/triple), tracking elixir leaked at 10.0.
+    2. Card cycle tracking: tracks exact rotation history.
+       - Each played card enters position 4 (needs 4 other cards before returning).
+       - Tracks which 4 cards are currently estimated to be IN HAND.
+    3. Next-card prediction: ranks affordable cards in hand by threat level / cycle efficiency.
+    4. Meta Deck Identification: matches revealed cards against competitive archetype signatures
+       (2.6 Hog, Log Bait, Golem Beatdown, Pekka Bridge Spam, Lavaloon, X-Bow, etc.),
+       predicts remaining unrevealed cards, and provides tailored counter-strategies.
+    5. Formats live HUD & console intelligence reports.
     """
     def __init__(self, initial_elixir: float = 5.0):
         self.enemy_elixir = float(initial_elixir)
@@ -59,6 +67,11 @@ class OpponentTracker:
         self.seen_cards: List[int] = []  # Unique cards identified in opponent deck
         self.active_tracks: Dict[int, Dict[str, Any]] = {}
         self.total_elixir_spent: int = 0
+        self.elixir_leaked: float = 0.0
+
+        # Card cycle rotation tracking
+        self.play_history: List[int] = []  # Chronological order of opponent card plays
+        self.card_last_play_idx: Dict[int, int] = {}  # cid -> index in play_history
 
     def reset(self, initial_elixir: float = 5.0):
         """Resets tracker state at the beginning of a match."""
@@ -68,12 +81,16 @@ class OpponentTracker:
         self.seen_cards.clear()
         self.active_tracks.clear()
         self.total_elixir_spent = 0
+        self.elixir_leaked = 0.0
+        self.play_history.clear()
+        self.card_last_play_idx.clear()
 
     def update(
         self,
         current_time: float,
         enemy_detections: List[Detection],
-        double_elixir: bool = False
+        double_elixir: bool = False,
+        triple_elixir: bool = False,
     ) -> float:
         """
         Updates opponent elixir and registers any newly spawned units.
@@ -81,8 +98,20 @@ class OpponentTracker:
         # 1. Passive regeneration over dt
         dt = max(0.0, current_time - self.last_update_time)
         self.last_update_time = current_time
-        regen_rate = 1.0 / 1.4 if double_elixir else 1.0 / 2.8
-        self.enemy_elixir = min(10.0, self.enemy_elixir + dt * regen_rate)
+
+        if triple_elixir:
+            regen_rate = 1.0 / 0.93  # Triple elixir (overtime)
+        elif double_elixir:
+            regen_rate = 1.0 / 1.4   # Double elixir (last 60s)
+        else:
+            regen_rate = 1.0 / 2.8   # Normal single elixir
+
+        potential_elixir = self.enemy_elixir + dt * regen_rate
+        if potential_elixir > 10.0:
+            self.elixir_leaked += (potential_elixir - 10.0)
+            self.enemy_elixir = 10.0
+        else:
+            self.enemy_elixir = potential_elixir
 
         # 2. Check for newly spawned enemy tracks
         for d in enemy_detections:
@@ -91,12 +120,17 @@ class OpponentTracker:
             tid = d.track_id
             cid = d.cls_id
 
-            if tid is not None:
+            if tid is not None and cid > 0:
                 if tid not in self.seen_track_ids:
                     self.seen_track_ids.add(tid)
                     cost = CARD_ID_TO_COST.get(cid, 3)
                     self.enemy_elixir = max(0.0, self.enemy_elixir - cost)
                     self.total_elixir_spent += cost
+
+                    # Record play in cycle history
+                    play_idx = len(self.play_history)
+                    self.play_history.append(cid)
+                    self.card_last_play_idx[cid] = play_idx
 
                     if cid not in self.seen_cards and len(self.seen_cards) < 8:
                         self.seen_cards.append(cid)
@@ -117,15 +151,163 @@ class OpponentTracker:
         """Returns normalized enemy elixir [0.0..1.0] for model scalars[1]."""
         return float(np.clip(self.enemy_elixir / 10.0, 0.0, 1.0))
 
+    def get_card_cycle_distance(self, cid: int) -> int:
+        """
+        Returns number of card plays remaining until card returns to hand:
+        0 = In hand right now
+        1 = 1 play away
+        2 = 2 plays away
+        3 = 3 plays away
+        4 = Just played (4 plays away)
+        """
+        if cid not in self.card_last_play_idx:
+            # Never played yet -> in hand or unrevealed draw pile
+            return 0
+        last_idx = self.card_last_play_idx[cid]
+        plays_since = len(self.play_history) - 1 - last_idx
+        return max(0, 4 - plays_since)
+
+    def is_card_in_hand(self, cid: int) -> bool:
+        """True if the card is estimated to be in the opponent's 4-card hand."""
+        return self.get_card_cycle_distance(cid) == 0
+
+    def get_estimated_hand(self) -> List[Dict[str, Any]]:
+        """
+        Returns cards currently estimated to be in the opponent's active hand.
+        """
+        in_hand = []
+        for cid in self.seen_cards:
+            if self.is_card_in_hand(cid):
+                cost = CARD_ID_TO_COST.get(cid, 0)
+                in_hand.append({
+                    "id": cid,
+                    "name": CARD_ID_TO_NAME.get(cid, f"Card_{cid}"),
+                    "cost": cost,
+                    "affordable": bool(cost <= self.enemy_elixir),
+                })
+        return in_hand
+
+    def get_cycle_queue(self) -> List[Dict[str, Any]]:
+        """
+        Returns cards currently cycling back to hand with their cycle distance (1..4).
+        """
+        queue = []
+        for cid in self.seen_cards:
+            dist = self.get_card_cycle_distance(cid)
+            if dist > 0:
+                cost = CARD_ID_TO_COST.get(cid, 0)
+                queue.append({
+                    "id": cid,
+                    "name": CARD_ID_TO_NAME.get(cid, f"Card_{cid}"),
+                    "cost": cost,
+                    "plays_away": dist,
+                })
+        return sorted(queue, key=lambda x: x["plays_away"])
+
+    def predict_next_card(self) -> List[Dict[str, Any]]:
+        """
+        Predicts which cards the opponent is most likely to play next.
+        Ranks by in-hand presence, affordability, and threat weight.
+        """
+        meta = self.get_meta_deck()
+        candidates = []
+
+        # 1. Revealed cards in hand
+        for card_info in self.get_estimated_hand():
+            cid = card_info["id"]
+            cost = card_info["cost"]
+            affordable = card_info["affordable"]
+
+            # Threat score: higher for win conditions & direct damage
+            is_win_con = cid in (24, 51, 12, 37, 25, 46, 110, 109, 108, 93, 113)
+            urgency = 2.0 if is_win_con else (1.5 if cost <= 3 else 1.0)
+            score = (10.0 if affordable else 2.0) * urgency
+
+            candidates.append({
+                "id": cid,
+                "name": card_info["name"],
+                "cost": cost,
+                "affordable": affordable,
+                "in_hand": True,
+                "confidence": round(min(1.0, score / 15.0), 2),
+                "is_revealed": True,
+            })
+
+        # 2. Predicted unrevealed cards from matched meta deck
+        for cid in meta.get("predicted_unrevealed_cards", []):
+            cost = CARD_ID_TO_COST.get(cid, 3)
+            affordable = bool(cost <= self.enemy_elixir)
+            candidates.append({
+                "id": cid,
+                "name": CARD_ID_TO_NAME.get(cid, f"Card_{cid}"),
+                "cost": cost,
+                "affordable": affordable,
+                "in_hand": False,  # candidate unrevealed
+                "confidence": round(meta.get("confidence", 0.5) * 0.7, 2),
+                "is_revealed": False,
+            })
+
+        return sorted(candidates, key=lambda x: (x["affordable"], x["confidence"]), reverse=True)
+
+    def get_meta_deck(self) -> Dict[str, Any]:
+        """Identifies opponent meta deck archetype using revealed cards."""
+        return identify_meta_deck(self.seen_cards)
+
     def get_cycle_summary(self) -> Dict[str, Any]:
         """Returns summary of opponent tracked deck and elixir."""
+        meta = self.get_meta_deck()
         return {
             "estimated_elixir": round(self.enemy_elixir, 1),
+            "elixir_leaked": round(self.elixir_leaked, 1),
             "seen_cards_count": len(self.seen_cards),
             "seen_card_ids": list(self.seen_cards),
+            "seen_card_names": [CARD_ID_TO_NAME.get(cid, f"Card_{cid}") for cid in self.seen_cards],
             "total_elixir_spent": self.total_elixir_spent,
             "active_tracks_count": len(self.active_tracks),
+            "archetype": meta.get("archetype", "Unknown"),
+            "matched_deck": meta.get("matched_deck_name", "Unknown"),
+            "confidence": meta.get("confidence", 0.0),
         }
+
+    def get_intel_report(self) -> Dict[str, Any]:
+        """Full intelligence dossier for opponent in current battle."""
+        meta = self.get_meta_deck()
+        return {
+            "elixir": round(self.enemy_elixir, 1),
+            "elixir_leaked": round(self.elixir_leaked, 1),
+            "revealed_count": f"{len(self.seen_cards)}/8",
+            "seen_cards": [
+                {
+                    "id": cid,
+                    "name": CARD_ID_TO_NAME.get(cid, f"Card_{cid}"),
+                    "cost": CARD_ID_TO_COST.get(cid, 0),
+                    "cycle_distance": self.get_card_cycle_distance(cid),
+                    "in_hand": self.is_card_in_hand(cid),
+                }
+                for cid in self.seen_cards
+            ],
+            "estimated_hand": self.get_estimated_hand(),
+            "cycle_queue": self.get_cycle_queue(),
+            "next_card_predictions": self.predict_next_card()[:4],
+            "meta_deck": meta,
+        }
+
+    def format_console_banner(self) -> str:
+        """Generates formatted multi-line ASCII intelligence report."""
+        meta = self.get_meta_deck()
+        e_hand = [f"{c['name']}({c['cost']})" for c in self.get_estimated_hand()]
+        q_cards = [f"{c['name']} ({c['plays_away']} away)" for c in self.get_cycle_queue()]
+        preds = [f"{p['name']} ({'AFFORDABLE' if p['affordable'] else 'saving'})" for p in self.predict_next_card()[:3]]
+
+        lines = [
+            f"[OPPONENT INTEL] Elixir: {self.enemy_elixir:.1f}/10.0 (Leaked: {self.elixir_leaked:.1f}) | Archetype: {meta['matched_deck_name']} ({int(meta['confidence']*100)}%)",
+            f"  -> Revealed ({len(self.seen_cards)}/8): {', '.join([CARD_ID_TO_NAME.get(c, str(c)) for c in self.seen_cards]) if self.seen_cards else 'None'}",
+            f"  -> Estimated In Hand: {', '.join(e_hand) if e_hand else 'Waiting for rotation'}",
+            f"  -> Cycling Back: {', '.join(q_cards) if q_cards else 'All in rotation'}",
+            f"  -> Next Play Threat: {', '.join(preds) if preds else 'Unknown'}",
+            f"  -> Counter Strategy: {meta.get('counter_strategy', 'None')}",
+        ]
+        return "\n".join(lines)
 
 
 def canonicalize_perspective(

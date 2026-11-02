@@ -46,6 +46,48 @@ class TestAWRAndTracker(unittest.TestCase):
         self.assertAlmostEqual(scalars[0], 0.7, places=2)
         self.assertAlmostEqual(scalars[1], 0.2, places=2)
 
+    def test_opponent_cycle_and_in_hand(self):
+        """Tests that cards accurately cycle back to hand after 4 intermediate plays."""
+        tracker = OpponentTracker(initial_elixir=10.0)
+        t0 = 1000.0
+
+        # Plays: Barrel(12), Princess(49), Knight(20), Gang(64), Rocket(6)
+        tracker.update(t0 + 0, [Detection(0.5, 0.2, 0.6, 0.3, 0.9, 12, False, track_id=1)])
+        tracker.update(t0 + 1, [Detection(0.5, 0.2, 0.6, 0.3, 0.9, 49, False, track_id=2)])
+        tracker.update(t0 + 2, [Detection(0.5, 0.2, 0.6, 0.3, 0.9, 20, False, track_id=3)])
+        tracker.update(t0 + 3, [Detection(0.5, 0.2, 0.6, 0.3, 0.9, 64, False, track_id=4)])
+
+        # Before 5th play: Barrel is 1 play away, not in hand
+        self.assertFalse(tracker.is_card_in_hand(12))
+        self.assertEqual(tracker.get_card_cycle_distance(12), 1)
+
+        # 5th play: Rocket (6) -> Barrel cycles back into hand!
+        tracker.update(t0 + 4, [Detection(0.5, 0.2, 0.6, 0.3, 0.9, 6, False, track_id=5)])
+        self.assertTrue(tracker.is_card_in_hand(12))
+        self.assertEqual(tracker.get_card_cycle_distance(12), 0)
+        self.assertEqual(tracker.get_card_cycle_distance(49), 1)
+        self.assertEqual(tracker.get_card_cycle_distance(6), 4)
+
+    def test_meta_deck_identification_and_prediction(self):
+        """Tests meta archetype recognition and unrevealed card predictions."""
+        from configs.meta_decks import identify_meta_deck, _cid
+
+        # 1. Log Bait detection
+        log_bait_seen = [_cid("Goblin Barrel"), _cid("Princess"), _cid("Knight")]
+        res = identify_meta_deck(log_bait_seen)
+        self.assertEqual(res["matched_deck_name"], "Classic Log Bait")
+        self.assertEqual(res["archetype"], "Spell Bait")
+        self.assertGreaterEqual(res["confidence"], 0.8)
+        self.assertIn("Rocket", res["predicted_unrevealed_names"])
+        self.assertIn("The Log", res["predicted_unrevealed_names"])
+
+        # 2. 2.6 Hog detection
+        hog_seen = [_cid("Hog Rider"), _cid("Musketeer"), _cid("Cannon")]
+        res_hog = identify_meta_deck(hog_seen)
+        self.assertEqual(res_hog["matched_deck_name"], "2.6 Hog Cycle")
+        self.assertEqual(res_hog["archetype"], "Fast Cycle")
+        self.assertGreaterEqual(res_hog["confidence"], 0.8)
+
     def test_awr_dataset_weighting(self):
         """Tests that AWRTrajectoryDataset correctly computes advantage weights."""
         test_shard = "data/trajectories/match_shard_001_win.npz"

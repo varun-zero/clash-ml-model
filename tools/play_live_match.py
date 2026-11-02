@@ -302,6 +302,9 @@ class LiveMatchRunner:
             else:
                 last_action = (0, 0)
                 if int(elapsed_match) % 5 == 0 and round(elapsed_match, 1) % 1.0 < 0.2:
+                    tracker = obs.get("opponent_tracker")
+                    if tracker and tracker.seen_cards:
+                        print("\n" + tracker.format_console_banner(), flush=True)
                     print(
                         f"[{elapsed_match:5.1f}s | Elixir: {current_elixir:4.1f}] WAIT | Hand: {[CARD_ID_TO_NAME.get(c, str(c)) for c in hand_ids]}",
                         flush=True
@@ -338,6 +341,9 @@ class LiveMatchRunner:
         self.stats["end_time"] = time.time()
         self.stats["duration_sec"] = round(self.stats["end_time"] - self.stats["start_time"], 1)
         self.stats["tower_final_hp"] = last_tower_hps
+        if "opponent_tracker" in obs and obs["opponent_tracker"] is not None:
+            self.stats["opponent_intel"] = obs["opponent_tracker"].get_intel_report()
+            print("\n" + obs["opponent_tracker"].format_console_banner() + "\n")
 
         # Dismiss result screen or chest popups
         print("[Runner] Dismissing result screen via OK tap at (270, 850)...")
