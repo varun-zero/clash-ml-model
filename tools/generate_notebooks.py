@@ -1,0 +1,196 @@
+import json
+import os
+
+notebook_data = {
+    "cells": [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "# CR-Zero: Offline Behavior Cloning Training Pipeline\n",
+                "\n",
+                "This notebook trains the **Deck-Conditioned Policy Network** for the **CR-Zero Clash Royale AI Agent** using offline imitation learning (Behavior Cloning).\n",
+                "\n",
+                "### Features:\n",
+                "- **Dual-environment support**: Seamlessly runs locally inside your IDE (VS Code / Antigravity with local GPU) or in Google Colab (free T4 / A100 GPU).\n",
+                "- **Global 135-card vocabulary**: Learned embeddings combined with static attribute projections (cost, range, speed, target).\n",
+                "- **Outcome-weighted loss**: Trajectories from winning matches ($1.5\\times$) are prioritized over losses ($0.5\\times$).\n",
+                "- **Direct model export**: Automatically outputs `checkpoints/cr_zero_policy_best.pt` and `cr_zero_policy_best.onnx`."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Cell 1: Environment & Compute Device Setup\n",
+                "import os\n",
+                "import sys\n",
+                "\n",
+                "IS_COLAB = \"google.colab\" in sys.modules\n",
+                "\n",
+                "if IS_COLAB:\n",
+                "    print(\"[*] Running in Google Colab Environment\")\n",
+                "    !apt-get update -qq && apt-get install -y -qq ffmpeg git\n",
+                "    !pip install -q yt-dlp ultralytics onnx onnxruntime-gpu opencv-python\n",
+                "    if not os.path.exists(\"clash-ml-model\"):\n",
+                "        !git clone https://github.com/varun-zero/clash-ml-model.git\n",
+                "        %cd clash-ml-model\n",
+                "else:\n",
+                "    print(\"[*] Running in Local IDE Environment\")\n",
+                "\n",
+                "# Ensure project root is in sys.path\n",
+                "repo_root = os.path.abspath(os.getcwd())\n",
+                "if repo_root not in sys.path:\n",
+                "    sys.path.insert(0, repo_root)\n",
+                "\n",
+                "import torch\n",
+                "print(f\"PyTorch:         {torch.__version__}\")\n",
+                "print(f\"CUDA Available:  {torch.cuda.is_available()}\")\n",
+                "if torch.cuda.is_available():\n",
+                "    print(f\"Active GPU:      {torch.cuda.get_device_name(0)}\")\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 1. Inspect Trajectory Dataset Shards\n",
+                "\n",
+                "Check that match trajectory shards (`.npz`) exist in `data/trajectories/` and verify their spatial grids, scalars, and legal masks."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Cell 2: Dataset Verification\n",
+                "import glob\n",
+                "import numpy as np\n",
+                "\n",
+                "data_dir = os.path.join(\".\", \"data\", \"trajectories\")\n",
+                "shards = sorted(glob.glob(os.path.join(data_dir, \"*.npz\")))\n",
+                "print(f\"Found {len(shards)} trajectory shard(s) in {data_dir}:\")\n",
+                "\n",
+                "for s in shards:\n",
+                "    data = np.load(s)\n",
+                "    outcome = int(data[\"match_outcome\"]) if \"match_outcome\" in data else 0\n",
+                "    outcome_str = \"WIN (+1)\" if outcome == 1 else (\"LOSS (-1)\" if outcome == -1 else \"DRAW (0)\")\n",
+                "    print(f\"  -> {os.path.basename(s)}: {data['arena_grid'].shape[0]} frames | Outcome: {outcome_str} | Grid: {data['arena_grid'].shape}\")\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 2. Train Behavior Cloning Policy Network\n",
+                "\n",
+                "We train the model using mixed precision, Cosine Annealing learning rate schedule, and AdamW optimizer. Val loss and accuracy metrics are logged each epoch."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Cell 3: Execute Training Loop\n",
+                "!python colab_pipeline/train_bc.py \\\n",
+                "    --data_dir ./data/trajectories \\\n",
+                "    --save_dir ./checkpoints \\\n",
+                "    --epochs 10 \\\n",
+                "    --batch_size 32 \\\n",
+                "    --lr 1e-3\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 3. Verify Saved Checkpoints & Model Inference\n",
+                "\n",
+                "Load the newly trained `cr_zero_policy_best.pt` checkpoint and verify a single inference pass."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Cell 4: Test Model Inference Pass\n",
+                "import torch\n",
+                "from policy.model import DeckConditionedPolicy\n",
+                "from configs.constants import NUM_TOTAL_CARDS, STACKED_GRID_CHANNELS\n",
+                "\n",
+                "checkpoint_path = \"./checkpoints/cr_zero_policy_best.pt\"\n",
+                "if os.path.exists(checkpoint_path):\n",
+                "    device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+                "    policy = DeckConditionedPolicy(num_card_classes=NUM_TOTAL_CARDS, in_channels=STACKED_GRID_CHANNELS).to(device)\n",
+                "    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)\n",
+                "    policy.load_state_dict(ckpt[\"model_state_dict\"])\n",
+                "    policy.eval()\n",
+                "    \n",
+                "    # Run a test forward pass\n",
+                "    dummy_grid = torch.randn(1, 32, 32, 18, device=device)\n",
+                "    dummy_scalars = torch.randn(1, 12, device=device)\n",
+                "    dummy_hand = torch.tensor([[1, 2, 20, 21]], dtype=torch.long, device=device)\n",
+                "    dummy_cmask = torch.tensor([[True, True, True, True, True]], dtype=torch.bool, device=device)\n",
+                "    dummy_tmask = torch.ones(1, 576, dtype=torch.bool, device=device)\n",
+                "    \n",
+                "    with torch.no_grad():\n",
+                "        card_slot, tile_idx, card_p, tile_p = policy.sample_action(\n",
+                "            dummy_grid, dummy_scalars, dummy_hand, dummy_cmask, dummy_tmask, temperature=0.7\n",
+                "        )\n",
+                "    print(f\"[OK] Checkpoint verified! Inference sample -> Card Slot: {card_slot}, Tile Index: {tile_idx}\")\n",
+                "    \n",
+                "    if IS_COLAB:\n",
+                "        from google.colab import files\n",
+                "        files.download(checkpoint_path)\n",
+                "        if os.path.exists(\"./checkpoints/cr_zero_policy_best.onnx\"):\n",
+                "            files.download(\"./checkpoints/cr_zero_policy_best.onnx\")\n",
+                "else:\n",
+                "    print(f\"Checkpoint {checkpoint_path} not found. Run Cell 3 first.\")\n"
+            ]
+        }
+    ],
+    "metadata": {
+        "colab": {
+            "provenance": [],
+            "toc_visible": True
+        },
+        "kernelspec": {
+            "display_name": "Python 3 (ipykernel)",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {
+            "codemirror_mode": {
+                "name": "ipython",
+                "version": 3
+            },
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "name": "python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3",
+            "version": "3.13.5"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5
+}
+
+root_nb = "train_cr_zero.ipynb"
+with open(root_nb, "w", encoding="utf-8") as f:
+    json.dump(notebook_data, f, indent=1)
+
+colab_nb = os.path.join("colab_pipeline", "cr_zero_training.ipynb")
+with open(colab_nb, "w", encoding="utf-8") as f:
+    json.dump(notebook_data, f, indent=1)
+
+print(f"Generated {root_nb} and {colab_nb}")
+
