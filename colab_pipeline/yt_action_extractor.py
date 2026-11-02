@@ -248,6 +248,8 @@ class YouTubeTrajectoryExtractor:
             "action_card": np.array(actions_card, dtype=np.int64),
             "action_tile": np.array(actions_tile, dtype=np.int64),
             "timestamps": np.array(timestamps, dtype=np.float32),
+            "rewards": np.full(len(actions_card), fill_value=1.0, dtype=np.float32),
+            "match_outcome": np.int32(1),
         }
 
         print(f"[Extractor] Complete: {extracted_actions} actions, {target_waits} waits (Total: {len(actions_card)} samples)")
@@ -371,6 +373,8 @@ class YouTubeTrajectoryExtractor:
             action_card=dataset["action_card"],
             action_tile=dataset["action_tile"],
             timestamps=dataset["timestamps"],
+            rewards=dataset.get("rewards", np.ones(len(dataset["action_card"]), dtype=np.float32)),
+            match_outcome=dataset.get("match_outcome", np.int32(1)),
         )
         print(f"[Extractor] Saved shard to {output_path} ({os.path.getsize(output_path) / 1024:.1f} KB)")
 
@@ -390,6 +394,10 @@ def main():
         output_npz_path=args.output,
         max_duration_seconds=args.max_seconds,
     )
+
+
+# Alias for backward compatibility
+YouTubeActionExtractor = YouTubeTrajectoryExtractor
 
 
 if __name__ == "__main__":
