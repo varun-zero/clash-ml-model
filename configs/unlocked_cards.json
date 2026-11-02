@@ -1,4 +1,4 @@
 {
-  "_comment": "Global CARD_DATABASE IDs available on this account. Edit this list as the beginner account unlocks cards. ID 0 (Wait) is implicit and must not be listed.",
-  "unlocked_ids": [1, 2, 20, 21, 22, 23, 34, 43]
+  "_comment": "Global CARD_DATABASE IDs available on this account. Unlocked starter & current deck: [1: Arrows, 2: Fireball, 20: Knight, 21: Archers, 22: Goblins, 23: Spear Goblins, 24: Giant, 26: Mini P.E.K.K.A, 27: Musketeer, 34: Bomber, 43: Minions].",
+  "unlocked_ids": [1, 2, 20, 21, 22, 23, 24, 26, 27, 34, 43]
 }

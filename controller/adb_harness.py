@@ -55,6 +55,13 @@ class ADBHarness:
         self.shell_proc: Optional[subprocess.Popen] = None
         self._pipe_lock = threading.Lock()
 
+        # Auto-detect BlueStacks ADB port if using default address
+        if self.device_address == "127.0.0.1:5555" and os.name == "nt":
+            detected_port = self._detect_bluestacks_port()
+            if detected_port and detected_port != "5555":
+                print(f"[ADB] Detected active BlueStacks ADB port: {detected_port}")
+                self.device_address = f"127.0.0.1:{detected_port}"
+
         # Step 1: Resolve ADB executable
         self.adb_binary = self._resolve_adb_binary(adb_path)
 
@@ -77,6 +84,25 @@ class ADBHarness:
         # Step 6: Start non-blocking execution worker
         self.worker_thread = threading.Thread(target=self._dispatch_loop, daemon=True)
         self.worker_thread.start()
+
+    @staticmethod
+    def _detect_bluestacks_port() -> Optional[str]:
+        """Detects active BlueStacks ADB port from bluestacks.conf on Windows."""
+        conf_paths = [
+            r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf",
+            os.path.expandvars(r"%ALLUSERSPROFILE%\BlueStacks_nxt\bluestacks.conf"),
+        ]
+        for cp in conf_paths:
+            if os.path.exists(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    match = re.search(r'status\.adb_port="(\d+)"', content)
+                    if match:
+                        return match.group(1)
+                except Exception:
+                    pass
+        return None
 
     def _resolve_adb_binary(self, explicit_path: Optional[str] = None) -> str:
         """Resolves ADB executable via explicit arg, ADB_PATH env var, or shutil.which."""
@@ -122,7 +148,7 @@ class ADBHarness:
                 [self.adb_binary, "connect", self.device_address],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
             print(f"[ADB] connect: {conn_res.stdout.strip()}")
         except Exception as e:
@@ -134,7 +160,7 @@ class ADBHarness:
                 [self.adb_binary, "devices"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
         except Exception as e:
             raise ConnectionError(f"Failed to execute 'adb devices': {e}") from e

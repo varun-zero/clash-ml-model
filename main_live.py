@@ -214,7 +214,11 @@ class CRZeroLiveAgent:
                     continue
 
                 if screen_state != "battle":
-                    action_desc = f"[{screen_state.upper()}] Idle / Waiting for Battle..."
+                    # Throttle idle logging to once every 3 seconds
+                    now = time.time()
+                    if not hasattr(self, "_last_idle_log") or now - self._last_idle_log >= 3.0:
+                        self._last_idle_log = now
+                        print(f"[{screen_state.upper()}] Idle: Waiting for active battle in BlueStacks... (F12 to stop)")
                     time.sleep(0.2)
                     continue
 
