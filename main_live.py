@@ -218,7 +218,7 @@ class CRZeroLiveAgent:
                     now = time.time()
                     if not hasattr(self, "_last_idle_log") or now - self._last_idle_log >= 3.0:
                         self._last_idle_log = now
-                        print(f"[{screen_state.upper()}] Idle: Waiting for active battle in BlueStacks... (F12 to stop)")
+                        print(f"[{screen_state.upper()}] Idle: Waiting for active battle in BlueStacks... (F12 to stop)", flush=True)
                     time.sleep(0.2)
                     continue
 
@@ -333,7 +333,8 @@ class CRZeroLiveAgent:
                 total_latency = (time.perf_counter() - loop_start) * 1000.0
                 print(
                     f"[{fps:4.1f} FPS] {action_desc} | "
-                    f"Latency: {total_latency:.1f}ms (Cap: {dt_cap:.1f}ms, Det: {dt_det:.1f}ms, Pol: {dt_pol:.1f}ms)"
+                    f"Latency: {total_latency:.1f}ms (Cap: {dt_cap:.1f}ms, Det: {dt_det:.1f}ms, Pol: {dt_pol:.1f}ms)",
+                    flush=True
                 )
 
                 # Sleep to maintain frequency (5 Hz)
