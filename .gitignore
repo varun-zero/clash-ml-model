@@ -1,0 +1,20 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and model weights
+checkpoints/*.pt
+checkpoints/*.onnx
+!checkpoints/.gitkeep
+
+# Raw VoD downloads and extracted dataset shards
+data/raw_vods/*
+data/trajectories/*.npz
+!data/trajectories/.gitkeep
+
+# Environments & logs
+.env
+*.log
+.vscode/
+.idea/

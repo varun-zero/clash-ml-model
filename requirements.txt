@@ -1,0 +1,22 @@
+# CR-Zero Windows 11 Local Runtime Requirements (RTX 3050 6GB GPU)
+# PyTorch with CUDA 12.x support:
+# Install command: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Numerical & Vision
+numpy>=1.24.0,<2.5.0
+opencv-python>=4.8.0
+ultralytics>=8.1.0
+
+# Windows High-Performance Screen Capture
+dxcam>=0.1.1
+mss>=9.0.1
+
+# YouTube Scraping & Trajectory Reconstruction
+yt-dlp>=2024.4.9
+
+# Inference Engine & Export
+onnx>=1.15.0
+onnxruntime-gpu>=1.17.0
+
