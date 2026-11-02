@@ -45,17 +45,38 @@ class WindowCapture:
         target_height: int = 960,
         preferred_backend: str = "dxcam",  # 'dxcam' or 'mss'
         require_window: bool = False,
+        adb_device: str = "127.0.0.1:5556",
     ):
         self.window_keyword = window_title_keyword
         self.target_width = target_width
         self.target_height = target_height
         self.backend_name = preferred_backend
         self.require_window = require_window
+        self.adb_device = adb_device
+        if self.adb_device == "127.0.0.1:5555" and os.name == "nt":
+            import re
+            conf_paths = [
+                r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf",
+                os.path.expandvars(r"%ALLUSERSPROFILE%\BlueStacks_nxt\bluestacks.conf"),
+            ]
+            for cp in conf_paths:
+                if os.path.exists(cp):
+                    try:
+                        with open(cp, "r", encoding="utf-8", errors="ignore") as f:
+                            m = re.search(r'status\.adb_port="(\d+)"', f.read())
+                            if m and m.group(1) != "5555":
+                                self.adb_device = f"127.0.0.1:{m.group(1)}"
+                                break
+                    except Exception:
+                        pass
 
         self.hwnd: Optional[int] = None
         self.window_region: Optional[Tuple[int, int, int, int]] = None  # (left, top, right, bottom)
         self.dxcam_camera = None
         self.mss_instance = None
+        self.adb_bin = r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe" if os.path.exists(r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe") else "adb"
+        import tempfile
+        self.temp_cap_file = os.path.join(tempfile.gettempdir(), "cr_zero_live_cap.png")
 
         self._find_window()
         self._init_backend()
@@ -180,14 +201,10 @@ class WindowCapture:
             except Exception:
                 pass
 
-        # 2. MSS capture fallback
-        if self.mss_instance is not None:
-            if region:
-                left, top, right, bottom = region
-                bbox = {"left": left, "top": top, "width": right - left, "height": bottom - top}
-            else:
-                bbox = self.mss_instance.monitors[1]
-
+        # 2. MSS capture fallback (only if window region is confirmed)
+        if self.mss_instance is not None and region is not None:
+            left, top, right, bottom = region
+            bbox = {"left": left, "top": top, "width": right - left, "height": bottom - top}
             try:
                 sct_img = self.mss_instance.grab(bbox)
                 frame = np.array(sct_img)[:, :, :3]  # BGRA -> BGR
@@ -197,10 +214,86 @@ class WindowCapture:
             except Exception:
                 pass
 
-        # 3. Virtual dummy frame if running headless or without display
+        # 3. Direct ADB screencap pull (pixel-perfect 540x960 directly from BlueStacks emulator)
+        adb_frame = self._grab_adb_pull()
+        if adb_frame is not None:
+            return adb_frame
+
+        # 4. Virtual dummy frame if running completely disconnected
         dummy = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
         cv2.putText(dummy, "Virtual Display (Client Area)", (30, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         return dummy
+
+    def _grab_adb_pull(self) -> Optional[np.ndarray]:
+        """Captures frame directly from BlueStacks emulator via screencap and file pull."""
+        try:
+            import subprocess
+            cmd_cap = f'"{self.adb_bin}" -s {self.adb_device} shell screencap -p /sdcard/sc_live.png'
+            subprocess.run(cmd_cap, shell=True, capture_output=True, timeout=2.0)
+            pull_cmd = f'"{self.adb_bin}" -s {self.adb_device} pull /sdcard/sc_live.png "{self.temp_cap_file}"'
+            subprocess.run(pull_cmd, shell=True, capture_output=True, timeout=2.0)
+            if os.path.exists(self.temp_cap_file):
+                img = cv2.imread(self.temp_cap_file)
+                if img is not None:
+                    if img.shape[1] != self.target_width or img.shape[0] != self.target_height:
+                        img = cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+                    return img
+        except Exception:
+            return None
+        return None
+
+    def _grab_adb_socket(self) -> Optional[np.ndarray]:
+        """Captures raw uncompressed frame directly from BlueStacks ADB daemon via TCP socket."""
+        try:
+            import socket
+            import struct
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect(("127.0.0.1", 5037))
+
+            def _adb_cmd(cmd: str):
+                msg = f"{len(cmd):04x}{cmd}".encode("ascii")
+                s.sendall(msg)
+                resp = s.recv(4)
+                if resp != b"OKAY":
+                    raise RuntimeError(f"ADB error: {resp}")
+
+            _adb_cmd(f"host:transport:{self.adb_device}")
+            _adb_cmd("exec:screencap")
+
+            header = b""
+            while len(header) < 12:
+                chunk = s.recv(12 - len(header))
+                if not chunk:
+                    break
+                header += chunk
+
+            if len(header) < 12:
+                s.close()
+                return None
+
+            w, h, fmt = struct.unpack("<III", header)
+            total_bytes = w * h * 4
+            raw_data = bytearray(total_bytes)
+            view = memoryview(raw_data)
+            bytes_read = 0
+
+            while bytes_read < total_bytes:
+                n = s.recv_into(view[bytes_read:], total_bytes - bytes_read)
+                if n == 0:
+                    break
+                bytes_read += n
+
+            s.close()
+            if bytes_read == total_bytes:
+                rgba = np.frombuffer(raw_data, dtype=np.uint8).reshape((h, w, 4))
+                bgr = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+                if bgr.shape[1] != self.target_width or bgr.shape[0] != self.target_height:
+                    bgr = cv2.resize(bgr, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+                return bgr
+        except Exception:
+            return None
+        return None
 
     def close(self):
         """Releases capture resources."""

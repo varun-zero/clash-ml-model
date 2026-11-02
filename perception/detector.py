@@ -181,11 +181,29 @@ class ClashRoyaleDetector:
         """
         h, w = frame.shape[:2]
 
-        # 1. Check for Victory / Defeat banner at top center
+        # 1. Check for Bottom Navigation Bar (Shop, Cards, Battle, Clan, Events) -> Strictly 'menu'
+        nav_roi = frame[int(0.91 * h):int(0.99 * h), :]
+        if nav_roi.size > 0:
+            hsv_nav = cv2.cvtColor(nav_roi, cv2.COLOR_BGR2HSV)
+            yellow_nav = cv2.inRange(hsv_nav, np.array([15, 120, 120]), np.array([35, 255, 255]))
+            if np.sum(yellow_nav > 0) > 500:
+                return "menu"
+
+        # 2. Check for Elixir Bar in Battle (pink elixir or dark elixir bar background)
+        bx1, by1, bx2, by2 = ELIXIR_BAR_BOX
+        x1, y1 = int(bx1 * w), int(by1 * h)
+        x2, y2 = int(bx2 * w), int(by2 * h)
+        bar_roi = frame[y1:y2, x1:x2]
+        if bar_roi.size > 0:
+            hsv_bar = cv2.cvtColor(bar_roi, cv2.COLOR_BGR2HSV)
+            pink_mask = cv2.inRange(hsv_bar, np.array([135, 60, 60]), np.array([170, 255, 255]))
+            if np.sum(pink_mask > 0) > 80:
+                return "battle"
+
+        # 3. Check for Victory / Defeat banner at top center
         banner_roi = frame[int(0.08 * h):int(0.25 * h), int(0.20 * w):int(0.80 * w)]
         if banner_roi.size > 0:
             hsv_banner = cv2.cvtColor(banner_roi, cv2.COLOR_BGR2HSV)
-            # Victory gold/blue or defeat dark red
             gold_mask = cv2.inRange(hsv_banner, np.array([15, 120, 120]), np.array([35, 255, 255]))
             red_mask1 = cv2.inRange(hsv_banner, np.array([0, 120, 100]), np.array([10, 255, 255]))
             red_mask2 = cv2.inRange(hsv_banner, np.array([170, 120, 100]), np.array([180, 255, 255]))
@@ -199,16 +217,11 @@ class ClashRoyaleDetector:
                     if np.sum(yellow_mask > 0) > 400:
                         return "result"
 
-        # 2. Check for Elixir Bar in Battle (pink elixir or dark elixir bar background)
-        bx1, by1, bx2, by2 = ELIXIR_BAR_BOX
-        x1, y1 = int(bx1 * w), int(by1 * h)
-        x2, y2 = int(bx2 * w), int(by2 * h)
-        bar_roi = frame[y1:y2, x1:x2]
+        # If dark elixir bar background exists, it is battle
         if bar_roi.size > 0:
             hsv_bar = cv2.cvtColor(bar_roi, cv2.COLOR_BGR2HSV)
-            pink_mask = cv2.inRange(hsv_bar, np.array([135, 60, 60]), np.array([170, 255, 255]))
             dark_mask = cv2.inRange(hsv_bar, np.array([0, 0, 10]), np.array([180, 80, 80]))
-            if np.sum(pink_mask > 0) > 50 or np.sum(dark_mask > 0) > (bar_roi.size * 0.15):
+            if np.sum(dark_mask > 0) > (bar_roi.size * 0.20):
                 return "battle"
 
         return "menu"
@@ -313,19 +326,16 @@ class ClashRoyaleDetector:
                             best_score = score
                             best_card_id = cid
 
-            if best_score >= 0.60:
+            if best_score >= 0.40:
                 hand_ids.append(best_card_id)
             else:
-                # Fallback to unlocked starter cards if templates not yet generated
-                if not self.card_templates:
-                    default_id = self.unlocked_cards[slot_idx % len(self.unlocked_cards)]
-                    hand_ids.append(default_id)
-                else:
-                    hand_ids.append(0)  # Unknown
-                    # Log unknown crop
-                    ts = int(time.time() * 1000)
-                    unknown_path = os.path.join(self.unknown_cards_dir, f"unknown_slot{slot_idx}_{ts}.png")
-                    cv2.imwrite(unknown_path, card_crop)
+                # Log unknown crop for template expansion
+                ts = int(time.time() * 1000)
+                unknown_path = os.path.join(self.unknown_cards_dir, f"unknown_slot{slot_idx}_{ts}.png")
+                cv2.imwrite(unknown_path, card_crop)
+                # Resilient fallback: use best matching card or unlocked deck rotation
+                fallback_id = best_card_id if best_card_id > 0 else self.unlocked_cards[slot_idx % len(self.unlocked_cards)]
+                hand_ids.append(fallback_id)
 
         return hand_ids
 
