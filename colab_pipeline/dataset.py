@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from configs.constants import ARENA_COLS, ARENA_ROWS, TOTAL_TILES
+from configs.observation_schema import Sc, check_schema
 
 
 class ClashRoyaleDataset(Dataset):
@@ -42,6 +43,7 @@ class ClashRoyaleDataset(Dataset):
             if not os.path.exists(p):
                 continue
             with np.load(p) as data:
+                check_schema(data, p)
                 g = data["arena_grid"]
                 s = data["scalars"] if "scalars" in data else data["scalar_features"]
                 h = data["hand_ids"] if "hand_ids" in data else data["hand_cards"]
@@ -120,8 +122,8 @@ class ClashRoyaleDataset(Dataset):
 
             # 2. Swap left and right princess tower HPs in scalars
             # 4: ally_left, 5: ally_right; 7: enemy_left, 8: enemy_right
-            scalar[4], scalar[5] = scalar[5], scalar[4]
-            scalar[7], scalar[8] = scalar[8], scalar[7]
+            scalar[Sc.ALLY_LEFT], scalar[Sc.ALLY_RIGHT] = scalar[Sc.ALLY_RIGHT], scalar[Sc.ALLY_LEFT]
+            scalar[Sc.ENEMY_LEFT], scalar[Sc.ENEMY_RIGHT] = scalar[Sc.ENEMY_RIGHT], scalar[Sc.ENEMY_LEFT]
 
             # Mirror last action tile in scalars (index 10)
             prev_tile = int(round(scalar[10] * 575.0))

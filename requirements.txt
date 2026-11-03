@@ -16,7 +16,18 @@ mss>=9.0.1
 # YouTube Scraping & Trajectory Reconstruction
 yt-dlp>=2024.4.9
 
+# ADB Automation
+adbutils>=2.0
+
+# Replay Ingestion & Shard Management
+pandas
+pyarrow
+huggingface_hub
+
 # Inference Engine & Export
 onnx>=1.15.0
 onnxruntime-gpu>=1.17.0
+
+# Testing & Dev
+pytest
 

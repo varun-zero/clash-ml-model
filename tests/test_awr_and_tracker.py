@@ -1,6 +1,7 @@
 """
 Unit and regression tests for Stage 2 AWR and OpponentTracker enhancements.
 """
+import glob
 import os
 import sys
 import unittest
@@ -10,6 +11,52 @@ import torch
 from perception.state_encoder import Detection, OpponentTracker, StateEncoder
 from colab_pipeline.train_awr import AWRTrajectoryDataset, train_awr_epoch
 from policy.model import DeckConditionedPolicy
+from configs.observation_schema import SCHEMA_VERSION
+
+
+def get_or_create_test_shard() -> str:
+    """Finds an existing valid schema_version=2 shard, or creates a synthetic fixture for CI."""
+    for shard in sorted(glob.glob("data/trajectories/*.npz")):
+        try:
+            with np.load(shard) as d:
+                if int(d.get("schema_version", -1)) == SCHEMA_VERSION and len(d.get("action_card", [])) >= 10:
+                    return shard
+        except Exception:
+            continue
+
+    os.makedirs("data/trajectories", exist_ok=True)
+    fixture_path = "data/trajectories/fixture_test_shard.npz"
+    N = 25
+    grid = np.zeros((N, 32, 32, 18), dtype=np.float32)
+    scalars = np.zeros((N, 12), dtype=np.float32)
+    scalars[:, 0] = 0.7  # ally elixir
+    scalars[:, 1] = 0.5  # enemy elixir
+    scalars[:, 2] = 0.8  # time
+    scalars[:, 3:6] = 1.0  # ally towers
+    scalars[:, 6:9] = 1.0  # enemy towers
+    hand = np.tile(np.array([1, 2, 20, 24], dtype=np.int64), (N, 1))
+    cmask = np.ones((N, 5), dtype=bool)
+    tmask = np.ones((N, 576), dtype=bool)
+    acard = np.ones(N, dtype=np.int64)
+    atile = np.full(N, 100, dtype=np.int64)
+    rewards = np.ones(N, dtype=np.float32) * 1.5
+    timestamps = np.linspace(0, 10, N, dtype=np.float32)
+
+    np.savez_compressed(
+        fixture_path,
+        arena_grid=grid,
+        scalars=scalars,
+        hand_ids=hand,
+        legal_card_mask=cmask,
+        legal_tile_mask=tmask,
+        action_card=acard,
+        action_tile=atile,
+        rewards=rewards,
+        match_outcome=np.int32(1),
+        timestamps=timestamps,
+        schema_version=np.int32(SCHEMA_VERSION),
+    )
+    return fixture_path
 
 
 class TestAWRAndTracker(unittest.TestCase):
@@ -90,26 +137,21 @@ class TestAWRAndTracker(unittest.TestCase):
 
     def test_awr_dataset_weighting(self):
         """Tests that AWRTrajectoryDataset correctly computes advantage weights."""
-        test_shard = "data/trajectories/match_shard_001_win.npz"
-        if not os.path.exists(test_shard):
-            self.skipTest(f"Shard {test_shard} not found")
-
+        test_shard = get_or_create_test_shard()
         dataset = AWRTrajectoryDataset([test_shard], beta=0.5, augment_horizontal_flip=False)
         self.assertGreater(len(dataset), 0)
         sample = dataset[0]
         # (grid, scalar, hand, cmask, tmask, acard, atile, weight)
         self.assertEqual(len(sample), 8)
         weight = float(sample[7])
-        self.assertGreaterEqual(weight, 0.05)
+        self.assertGreaterEqual(weight, 0.01)
         self.assertLessEqual(weight, 15.0)
 
     def test_awr_training_step(self):
         """Tests a single training step of AWR with mixed precision."""
         device = torch.device("cpu")
         model = DeckConditionedPolicy().to(device)
-        test_shard = "data/trajectories/match_shard_001_win.npz"
-        if not os.path.exists(test_shard):
-            self.skipTest(f"Shard {test_shard} not found")
+        test_shard = get_or_create_test_shard()
 
         dataset = AWRTrajectoryDataset([test_shard], beta=0.5, augment_horizontal_flip=False)
         loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=False)
@@ -131,4 +173,3 @@ class TestAWRAndTracker(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

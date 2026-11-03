@@ -28,6 +28,8 @@ from configs.constants import (
     get_default_deployable_mask,
 )
 from configs.meta_decks import identify_meta_deck
+from configs.observation_schema import Ch, Sc
+
 
 
 @dataclass
@@ -449,7 +451,7 @@ class StateEncoder:
         arena_grid = np.zeros((8, self.arena_rows, self.arena_cols), dtype=np.float32)
         enemy_left_down = tower_hps[4] <= 0.05
         enemy_right_down = tower_hps[5] <= 0.05
-        arena_grid[7] = get_default_deployable_mask(enemy_left_down, enemy_right_down).astype(np.float32)
+        arena_grid[Ch.DEPLOYABLE] = get_default_deployable_mask(enemy_left_down, enemy_right_down).astype(np.float32)
 
         for det in parsed_dets:
             foot_x = (det.x1 + det.x2) / 2.0
@@ -462,22 +464,22 @@ class StateEncoder:
 
             if det.is_ally:
                 if cat == "ground":
-                    arena_grid[0, gy, gx] += 1.0
+                    arena_grid[Ch.ALLY_GROUND, gy, gx] += 1.0
                 elif cat == "air":
-                    arena_grid[1, gy, gx] += 1.0
+                    arena_grid[Ch.ALLY_AIR, gy, gx] += 1.0
                 elif cat == "building":
-                    arena_grid[2, gy, gx] = 1.0
+                    arena_grid[Ch.ALLY_BUILDING, gy, gx] = 1.0
                 elif cat == "spell":
-                    arena_grid[6, gy, gx] = 1.0
+                    arena_grid[Ch.SPELL, gy, gx] = 1.0
             else:
                 if cat == "ground":
-                    arena_grid[3, gy, gx] += 1.0
+                    arena_grid[Ch.ENEMY_GROUND, gy, gx] += 1.0
                 elif cat == "air":
-                    arena_grid[4, gy, gx] += 1.0
+                    arena_grid[Ch.ENEMY_AIR, gy, gx] += 1.0
                 elif cat == "building":
-                    arena_grid[5, gy, gx] = 1.0
+                    arena_grid[Ch.ENEMY_BUILDING, gy, gx] = 1.0
                 elif cat == "spell":
-                    arena_grid[6, gy, gx] = 1.0
+                    arena_grid[Ch.SPELL, gy, gx] = 1.0
 
         ally_elixir_norm = float(np.clip(elixir / 10.0, 0.0, 1.0))
         time_norm = float(np.clip(time_left / 180.0, 0.0, 1.0))
@@ -497,23 +499,19 @@ class StateEncoder:
             double_elixir = time_left <= 60.0
         double_elixir_norm = 1.0 if double_elixir else 0.0
 
-        scalars = np.array(
-            [
-                ally_elixir_norm,
-                enemy_elixir_norm,
-                time_norm,
-                ak_hp,
-                al_hp,
-                ar_hp,
-                ek_hp,
-                el_hp,
-                er_hp,
-                last_card_norm,
-                last_tile_norm,
-                double_elixir_norm,
-            ],
-            dtype=np.float32,
-        )
+        scalars = np.zeros(12, dtype=np.float32)
+        scalars[Sc.ALLY_ELIXIR] = ally_elixir_norm
+        scalars[Sc.ENEMY_ELIXIR] = enemy_elixir_norm
+        scalars[Sc.TIME_LEFT] = time_norm
+        scalars[Sc.ALLY_KING] = ak_hp
+        scalars[Sc.ALLY_LEFT] = al_hp
+        scalars[Sc.ALLY_RIGHT] = ar_hp
+        scalars[Sc.ENEMY_KING] = ek_hp
+        scalars[Sc.ENEMY_LEFT] = el_hp
+        scalars[Sc.ENEMY_RIGHT] = er_hp
+        scalars[Sc.LAST_CARD] = last_card_norm
+        scalars[Sc.LAST_TILE] = last_tile_norm
+        scalars[Sc.DOUBLE_ELIXIR] = double_elixir_norm
         if scalars.shape != (12,):
             raise AssertionError(f"Expected scalars shape (12,), got {scalars.shape}")
 

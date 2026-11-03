@@ -39,6 +39,7 @@ from perception.state_encoder import (
     stack_spatial_frames,
 )
 from colab_pipeline.yt_downloader import download_youtube_vod
+from configs.observation_schema import SCHEMA_VERSION
 
 
 class YouTubeTrajectoryExtractor:
@@ -99,6 +100,8 @@ class YouTubeTrajectoryExtractor:
 
         print(f"[Extractor] Processing {video_path} (Side={player_side}, Crop=({crop_x}, {crop_y}, {crop_w}, {crop_h}))")
 
+        self.detector.reset_match_state()
+        self.detector._prev_screen_state = "menu"
         buffer = deque(maxlen=self.window_size)
         grid_history = deque(maxlen=4)
 
@@ -148,6 +151,7 @@ class YouTubeTrajectoryExtractor:
                 time_left=max(0.0, 180.0 - (current_time % 180.0)),
                 est_enemy_elixir=0.5,
                 last_action=last_action,
+                clock=current_time,
             )
 
             # Canonicalize perspective if player is on top
@@ -375,6 +379,7 @@ class YouTubeTrajectoryExtractor:
             timestamps=dataset["timestamps"],
             rewards=dataset.get("rewards", np.ones(len(dataset["action_card"]), dtype=np.float32)),
             match_outcome=dataset.get("match_outcome", np.int32(1)),
+            schema_version=np.int32(SCHEMA_VERSION),
         )
         print(f"[Extractor] Saved shard to {output_path} ({os.path.getsize(output_path) / 1024:.1f} KB)")
 

@@ -568,15 +568,33 @@ def generate_match_report_artifact(stats: Dict[str, Any], artifact_dir: str) -> 
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="CR-Zero Live Match Runner")
+    parser.add_argument("--device", type=str, default="127.0.0.1:5556", help="ADB device IP:port")
+    parser.add_argument("--weights", type=str, default="weights/yolo_units.pt", help="YOLO weights path")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Policy checkpoint path")
+    parser.add_argument("--rule-bot", action="store_true", default=True, help="Use RuleBot heuristics")
+    parser.add_argument("--max-matches", type=int, default=5, help="Number of matches to play")
+    parser.add_argument("--artifact-dir", type=str, default=None, help="Output artifact directory")
+    args = parser.parse_args()
+
+    default_artifact = os.environ.get(
+        "ARTIFACT_DIR",
+        r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3"
+        if os.path.exists(r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3")
+        else os.path.join(REPO_ROOT, "reports")
+    )
+    artifact_dir = args.artifact_dir or default_artifact
+    os.makedirs(artifact_dir, exist_ok=True)
+
     runner = LiveMatchRunner(
-        device_address="127.0.0.1:5556",
-        weights_path="weights/yolo_units.pt",
-        use_rule_bot=True,
+        device_address=args.device,
+        weights_path=args.weights,
+        use_rule_bot=args.rule_bot,
         max_duration_sec=240.0,
     )
-    artifact_dir = r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3"
 
-    max_matches = 5
+    max_matches = args.max_matches
     for match_idx in range(1, max_matches + 1):
         print(f"\n{'='*30} STARTING MATCH #{match_idx} {'='*30}")
         # Step 1: Start battle from menu

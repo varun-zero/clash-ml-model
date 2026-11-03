@@ -40,6 +40,7 @@ from configs.constants import (
     ARENA_COLS,
 )
 from policy.model import DeckConditionedPolicy
+from configs.observation_schema import check_schema
 
 
 class AWRTrajectoryDataset(Dataset):
@@ -72,6 +73,7 @@ class AWRTrajectoryDataset(Dataset):
                 ac = data["action_card"] if "action_card" in data else data["card_action"]
                 at = data["action_tile"] if "action_tile" in data else data["tile_action"]
 
+                check_schema(data, p)
                 outcome = int(data["match_outcome"]) if "match_outcome" in data else 0
                 outcome_w = 1.5 if outcome > 0 else (0.5 if outcome < 0 else 1.0)
 
@@ -133,6 +135,7 @@ class AWRTrajectoryDataset(Dataset):
         # Exponentiated advantage weights: clip(exp(A / beta), 0.05, 10.0) * outcome_weight
         exp_adv = np.exp(np.clip(advantages / max(0.01, self.beta), -4.0, 4.0))
         self.weights = np.clip(exp_adv, 0.05, 10.0) * all_outcomes
+        self.weights = (self.weights / max(1e-6, float(self.weights.mean()))).astype(np.float32)  # mean weight = 1
         self.length = len(self.action_card)
         print(f"[AWR Dataset] Loaded {self.length} frames. Weight stats: min={self.weights.min():.2f}, mean={self.weights.mean():.2f}, max={self.weights.max():.2f}")
 
@@ -243,8 +246,8 @@ def train_awr_epoch(
         # Force target tile to be legal in mask
         played_mask = target_card > 0
         if played_mask.any():
-            for idx in torch.where(played_mask)[0]:
-                tmask[idx, target_tile[idx]] = True
+            _pi = torch.where(played_mask)[0]
+            tmask[_pi, target_tile[_pi]] = True
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -319,8 +322,8 @@ def validate_awr(
             B = grid.size(0)
             played_mask = target_card > 0
             if played_mask.any():
-                for idx in torch.where(played_mask)[0]:
-                    tmask[idx, target_tile[idx]] = True
+                _pi = torch.where(played_mask)[0]
+                tmask[_pi, target_tile[_pi]] = True
 
             card_logits, tile_logits = model(
                 arena_grid=grid,
@@ -376,7 +379,9 @@ def main():
 
     print(f"[AWR] Found {len(shards)} trajectory shards: {[os.path.basename(s) for s in shards]}")
 
-    # Train / Val Split
+    # Train / Val Split (seeded shuffle: sorted-name split puts one data source entirely in val)
+    rng = np.random.RandomState(42)
+    shards = list(rng.permutation(shards))
     if len(shards) > 1:
         val_count = max(1, int(round(len(shards) * args.val_split)))
         train_shards = shards[:-val_count]
@@ -398,7 +403,9 @@ def main():
         try:
             ckpt = torch.load(args.init_checkpoint, map_location=device)
             state_dict = ckpt.get("model_state_dict", ckpt)
-            model.load_state_dict(state_dict, strict=False)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(f'Checkpoint/model mismatch: missing={missing}, unexpected={unexpected}')
             print(f"[AWR] Successfully warm-started weights from {args.init_checkpoint}")
         except Exception as e:
             print(f"[AWR] Could not load init checkpoint ({e}). Training from scratch.")

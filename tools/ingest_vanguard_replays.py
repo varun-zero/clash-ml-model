@@ -141,192 +141,129 @@ def build_legal_tile_mask(card_id: int) -> np.ndarray:
     return mask
 
 
+def infer_initial_queue(deck: List[int], plays: List[int]) -> Optional[List[int]]:
+    """Real CR hand = 4 slots + 4-card queue. The opening order is NOT in the replay,
+    so recover an ordering [h0..h3, q0..q3] consistent with every observed play.
+    Returns None if the deck is not 8 distinct cards or no ordering explains the plays."""
+    from itertools import permutations
+    if len(deck) != 8 or len(set(deck)) != 8:
+        return None
+    for perm in permutations(deck):
+        hand, queue, ok = list(perm[:4]), list(perm[4:]), True
+        for cid in plays:
+            if cid not in hand:
+                ok = False
+                break
+            s_ = hand.index(cid)
+            hand[s_] = queue.pop(0)
+            queue.append(cid)
+        if ok:
+            return list(perm)
+    return None
+
+
 def process_match(
     replay_meta: Dict,
     match_actions: List[Dict],
 ) -> Optional[Dict[str, np.ndarray]]:
-    """
-    Simulates a match from Vanguard actions and constructs full CR-Zero trajectory tensors.
-    """
-    result_str = str(replay_meta.get("result", "")).lower()
-    if result_str == "victory":
-        outcome = 1
-    elif result_str == "defeat":
-        outcome = -1
-    else:
-        outcome = 0
+    """Vanguard actions -> BC samples. Observation is built BEFORE the action is
+    applied; the target action/tile is never written into the input; hand is
+    snapshotted BEFORE the card cycles; scalar/channel layout comes from
+    configs.observation_schema (identical to the live StateEncoder)."""
+    from configs.observation_schema import Ch, Sc, SCHEMA_VERSION
+    from configs.constants import get_default_deployable_mask
 
-    # Extract 8-card player deck
+    result_str = str(replay_meta.get("result", "")).lower()
+    outcome = 1 if result_str == "victory" else (-1 if result_str == "defeat" else 0)
+
     payload_str = replay_meta.get("payload_json", "{}")
     try:
         payload = json.loads(payload_str)
-        team_deck_info = payload.get("battle", {}).get("team", {}).get("players", [{}])[0].get("deck", [])
-        deck_card_ids = [card_key_to_id(c.get("card_key", "")) for c in team_deck_info if card_key_to_id(c.get("card_key", "")) > 0]
+        deck_info = payload.get("battle", {}).get("team", {}).get("players", [{}])[0].get("deck", [])
+        deck_card_ids = [card_key_to_id(c.get("card_key", "")) for c in deck_info]
+        deck_card_ids = [c for c in deck_card_ids if c > 0]
     except Exception:
         deck_card_ids = []
 
-    # If deck parsing failed, collect unique played cards
-    if len(deck_card_ids) < 4:
-        played = []
-        for a in match_actions:
-            if a.get("side") == "team" and a.get("kind") == "play_card":
-                cid = card_key_to_id(a.get("card_key", ""))
-                if cid > 0 and cid not in played:
-                    played.append(cid)
-        deck_card_ids = played[:8]
-
-    if len(deck_card_ids) < 4:
+    plays = []
+    for a in match_actions:
+        if a.get("side") == "team" and a.get("kind") == "play_card":
+            cid = card_key_to_id(a.get("card_key", ""))
+            if cid > 0:
+                plays.append((float(a.get("time_seconds", 0.0)), cid, a))
+    if len(plays) < 5:
         return None
 
-    # Hand simulation
-    hand = deck_card_ids[:4]
-    draw_pile = deck_card_ids[4:] if len(deck_card_ids) > 4 else []
+    order = infer_initial_queue(deck_card_ids, [c for _, c, _ in plays])
+    if order is None:
+        return None  # hand cannot be reconstructed faithfully -> do not train on it
+    hand, queue = order[:4], order[4:]
 
-    # Filter actions by time
-    team_plays = [a for a in match_actions if a.get("side") == "team" and a.get("kind") == "play_card"]
-    if len(team_plays) < 5:
-        return None
+    base = np.zeros((8, ARENA_ROWS, ARENA_COLS), dtype=np.float32)
+    base[Ch.ALLY_BUILDING, 31, 9] = base[Ch.ALLY_BUILDING, 26, 3] = base[Ch.ALLY_BUILDING, 26, 14] = 1.0
+    base[Ch.ENEMY_BUILDING, 0, 9] = base[Ch.ENEMY_BUILDING, 5, 3] = base[Ch.ENEMY_BUILDING, 5, 14] = 1.0
+    base[Ch.DEPLOYABLE] = get_default_deployable_mask(False, False).astype(np.float32)
 
-    frames_grid = []
-    frames_scalar = []
-    frames_hand = []
-    frames_cmask = []
-    frames_tmask = []
-    frames_card_act = []
-    frames_tile_act = []
-    frames_rewards = []
+    G, S, H, CM, TM, AC, AT, TS = [], [], [], [], [], [], [], []
+    history, elixir, last_t = [], 5.0, 0.0
+    last_card_n, last_tile_n = 0.0, 0.0
 
-    current_grid_history = []
-    simulated_elixir = 5.0
-    last_t = 0.0
-
-    # Base arena map with river and towers
-    base_arena = np.zeros((8, ARENA_ROWS, ARENA_COLS), dtype=np.float32)
-    # Channel 2: Friendly towers
-    base_arena[2, 31, 9] = 1.0   # Ally King
-    base_arena[2, 26, 3] = 1.0   # Ally Left Princess
-    base_arena[2, 26, 14] = 1.0  # Ally Right Princess
-    # Channel 5: Enemy towers
-    base_arena[5, 0, 9] = 1.0    # Enemy King
-    base_arena[5, 5, 3] = 1.0    # Enemy Left Princess
-    base_arena[5, 5, 14] = 1.0   # Enemy Right Princess
-    # Channel 6: River and Bridges
-    base_arena[6, 15, :] = 1.0
-    base_arena[6, 16, :] = 1.0
-    for col in list(LEFT_BRIDGE_COLS) + list(RIGHT_BRIDGE_COLS):
-        base_arena[6, 15, col] = 0.5
-        base_arena[6, 16, col] = 0.5
-
-    for act in team_plays:
-        t = float(act.get("time_seconds", 0.0))
-        dt = max(0.0, t - last_t)
-        last_t = t
-
-        # Elixir accumulation (1 elixir per 2.8s, double elixir after 120s)
+    for t, cid, act in plays:
         rate = (1.0 / 1.4) if t >= 120.0 else (1.0 / 2.8)
-        simulated_elixir = min(10.0, simulated_elixir + dt * rate)
-
-        cid = card_key_to_id(act.get("card_key", ""))
-        if cid == 0:
-            continue
-
+        elixir = min(10.0, elixir + max(0.0, t - last_t) * rate)
+        last_t = t
         cost = CARD_ID_TO_COST.get(cid, 3)
+        elixir = max(elixir, float(cost))  # a card was played, so the cost was available: resync
 
-        # Coordinate transformation: RoyaleAPI 0 is ally back line, 31 is enemy
-        # CR-Zero 0 is enemy, 31 is ally -> cr_zero_y = 31 - grid_y
-        raw_gx = int(act.get("grid_x", 9))
-        raw_gy = int(act.get("grid_y", 0))
-        cr_y = np.clip(31 - raw_gy, 0, 31)
-        cr_x = np.clip(raw_gx, 0, 17)
+        cr_y = int(np.clip(31 - int(act.get("grid_y", 0)), 0, 31))
+        cr_x = int(np.clip(int(act.get("grid_x", 9)), 0, 17))
         tile_idx = cr_y * ARENA_COLS + cr_x
+        slot_idx = hand.index(cid)
+        hand_before = list(hand)                      # snapshot BEFORE cycling
 
-        # Identify which slot matches this card
-        slot_idx = -1
-        if cid in hand:
-            slot_idx = hand.index(cid)
-        else:
-            # Shift hand to accommodate card
-            slot_idx = 0
-            hand[0] = cid
+        history.append(base.copy())                   # target is NOT painted into the input
+        stacked = stack_spatial_frames(history, target_frames=4)
 
-        # Update board state
-        current_frame = base_arena.copy()
-        is_spell = CARD_ID_TO_IS_SPELL.get(cid, False)
-        if is_spell:
-            current_frame[7, cr_y, cr_x] = 1.0
-        else:
-            current_frame[0, cr_y, cr_x] = 1.0
+        sc = np.zeros(NUM_SCALARS, dtype=np.float32)
+        sc[Sc.ALLY_ELIXIR] = elixir / 10.0
+        sc[Sc.ENEMY_ELIXIR] = 0.5                     # unknown in replay data
+        sc[Sc.TIME_LEFT] = float(np.clip((180.0 - t) / 180.0, 0.0, 1.0))
+        sc[Sc.ALLY_KING:Sc.ENEMY_RIGHT + 1] = 1.0     # tower HP unknown in replay data
+        sc[Sc.LAST_CARD] = last_card_n
+        sc[Sc.LAST_TILE] = last_tile_n
+        sc[Sc.DOUBLE_ELIXIR] = 1.0 if t >= 120.0 else 0.0
 
-        current_grid_history.append(current_frame)
-        stacked_grid = stack_spatial_frames(current_grid_history, target_frames=4)
-
-        # Scalar features (12)
-        scalar_vec = np.zeros(NUM_SCALARS, dtype=np.float32)
-        scalar_vec[0] = simulated_elixir / 10.0
-        scalar_vec[1] = 0.5  # enemy elixir estimate
-        scalar_vec[2] = 1.0  # ally king hp
-        scalar_vec[3] = 1.0  # ally princess L hp
-        scalar_vec[4] = 1.0  # ally princess R hp
-        scalar_vec[5] = 1.0  # enemy king hp
-        scalar_vec[6] = 1.0  # enemy princess L hp
-        scalar_vec[7] = 1.0  # enemy princess R hp
-        scalar_vec[8] = min(t / 180.0, 1.0)  # normalized match time
-        scalar_vec[9] = 1.0 if t >= 120.0 else 0.0  # double elixir
-        scalar_vec[10] = 0.0  # differential hp
-        scalar_vec[11] = float(outcome)  # outcome bias
-
-        # Card mask: slot 0 (wait=True), slots 1..4 (affordability)
         cmask = np.ones(5, dtype=bool)
-        for s in range(4):
-            card_cost = CARD_ID_TO_COST.get(hand[s], 99)
-            if card_cost > simulated_elixir:
-                cmask[s + 1] = False
-        # The chosen card action must be marked legal in ground truth
+        for s_ in range(4):
+            if CARD_ID_TO_COST.get(hand_before[s_], 99) > elixir:
+                cmask[s_ + 1] = False
         cmask[slot_idx + 1] = True
-
         tmask = build_legal_tile_mask(cid)
         tmask[tile_idx] = True
 
-        # Spend elixir
-        simulated_elixir = max(0.0, simulated_elixir - cost)
+        G.append(stacked); S.append(sc); H.append(np.array(hand_before, dtype=np.int64))
+        CM.append(cmask); TM.append(tmask); AC.append(slot_idx + 1); AT.append(tile_idx); TS.append(t)
 
-        # Cycle hand
-        if draw_pile:
-            next_c = draw_pile.pop(0)
-            draw_pile.append(cid)
-            hand[slot_idx] = next_c
+        elixir = max(0.0, elixir - cost)              # apply action AFTER the sample is stored
+        hand[slot_idx] = queue.pop(0)
+        queue.append(cid)
+        last_card_n, last_tile_n = (slot_idx + 1) / 4.0, tile_idx / float(TOTAL_TILES - 1)
 
-        # Advantage reward
-        adv_reward = outcome * 1.0 + (0.5 if outcome == 1 else -0.5)
-
-        frames_grid.append(stacked_grid)
-        frames_scalar.append(scalar_vec)
-        frames_hand.append(np.array(hand, dtype=np.int64))
-        frames_cmask.append(cmask)
-        frames_tmask.append(tmask)
-        frames_card_act.append(slot_idx + 1)
-        frames_tile_act.append(tile_idx)
-        frames_rewards.append(adv_reward)
-
-    if len(frames_grid) < 5:
+    if len(G) < 5:
         return None
-
     return {
-        "arena_grid": np.array(frames_grid, dtype=np.float32),
-        "scalars": np.array(frames_scalar, dtype=np.float32),
-        "scalar_features": np.array(frames_scalar, dtype=np.float32),
-        "hand_ids": np.array(frames_hand, dtype=np.int64),
-        "hand_cards": np.array(frames_hand, dtype=np.int64),
-        "legal_card_mask": np.array(frames_cmask, dtype=bool),
-        "card_mask": np.array(frames_cmask, dtype=bool),
-        "legal_tile_mask": np.array(frames_tmask, dtype=bool),
-        "tile_mask": np.array(frames_tmask, dtype=bool),
-        "action_card": np.array(frames_card_act, dtype=np.int64),
-        "card_action": np.array(frames_card_act, dtype=np.int64),
-        "action_tile": np.array(frames_tile_act, dtype=np.int64),
-        "tile_action": np.array(frames_tile_act, dtype=np.int64),
-        "rewards": np.array(frames_rewards, dtype=np.float32),
+        "arena_grid": np.array(G, dtype=np.float32),
+        "scalars": np.array(S, dtype=np.float32),
+        "hand_ids": np.array(H, dtype=np.int64),
+        "legal_card_mask": np.array(CM, dtype=bool),
+        "legal_tile_mask": np.array(TM, dtype=bool),
+        "action_card": np.array(AC, dtype=np.int64),
+        "action_tile": np.array(AT, dtype=np.int64),
+        "timestamps": np.array(TS, dtype=np.float32),
         "match_outcome": np.int32(outcome),
+        "schema_version": np.int32(SCHEMA_VERSION),
+        # NOTE: no "rewards" key. Vanguard has no per-action signal; do not feed it to AWR.
+        # NOTE: no Wait samples and no board/enemy info; use for card/tile-prior pretraining only.
     }
 
 
@@ -377,7 +314,7 @@ def ingest_vanguard_replays(
         np.savez_compressed(shard_path, **tensors)
         created_shards.append(shard_path)
         count += 1
-        print(f"  [{count}/{max_matches}] Created {shard_name} ({len(tensors['card_action'])} actions | Outcome: {outcome_label})")
+        print(f"  [{count}/{max_matches}] Created {shard_name} ({len(tensors['action_card'])} actions | Outcome: {outcome_label})")
 
         if count >= max_matches:
             break

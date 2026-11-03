@@ -68,6 +68,8 @@ class ClashRoyaleDetector:
         # Opponent Elixir and Card-Cycle Tracker + Track Velocity History
         self.opponent_tracker = OpponentTracker()
         self.track_history: Dict[int, Tuple[float, float, float]] = {}
+        self._prev_screen_state = "menu"
+        self._battle_t0: Optional[float] = None
 
         # 2. YOLO Model Loading
         weights_file = weights or model_path
@@ -372,9 +374,7 @@ class ClashRoyaleDetector:
                 ts = int(time.time() * 1000)
                 unknown_path = os.path.join(self.unknown_cards_dir, f"unknown_slot{slot_idx}_{ts}.png")
                 cv2.imwrite(unknown_path, card_crop)
-                # Resilient fallback: use best matching card or unlocked deck rotation
-                fallback_id = best_card_id if best_card_id > 0 else self.unlocked_cards[slot_idx % len(self.unlocked_cards)]
-                hand_ids.append(fallback_id)
+                hand_ids.append(0)  # unknown: never guess a card (guesses corrupt cost masks + hand embeddings)
 
         return hand_ids
 
@@ -461,16 +461,29 @@ class ClashRoyaleDetector:
         time_left: Optional[float] = None,
         est_enemy_elixir: float = 0.5,
         last_action: Tuple[int, int] = (0, 0),
+        clock: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Processes frame into full observation dict."""
+        """Processes frame into full observation dict. `clock` = video/stream time in seconds
+        (offline extraction); default is wall time."""
         screen_state = self.classify_screen_state(frame)
+        _now = clock if clock is not None else time.monotonic()
+        if screen_state == "battle" and self._prev_screen_state != "battle":
+            self.reset_match_state()          # new battle: clear tracker / velocity history
+            self._battle_t0 = _now
+        self._prev_screen_state = screen_state
         raw_detections = self.detect_raw(frame) if screen_state == "battle" else []
 
         elixir = self.read_elixir(frame) if screen_state == "battle" else 0.0
         hand_ids = self.read_hand_cards(frame) if screen_state == "battle" else [0, 0, 0, 0]
         tower_hps = self.read_tower_hps(frame) if screen_state == "battle" else [1.0] * 6
 
-        detected_time, is_double_elixir = self.read_timer(frame)
+        detected_time, is_double_elixir = self.read_timer(frame)  # placeholder reader (120/180 only)
+        if time_left is None and screen_state == "battle" and self._battle_t0 is not None:
+            elapsed = _now - self._battle_t0                     # elapsed-time clock since battle start
+            detected_time = max(0.0, 180.0 - elapsed)
+            is_double_elixir = elapsed >= 120.0
+        elif time_left is not None:
+            is_double_elixir = time_left <= 60.0
         actual_time = time_left if time_left is not None else detected_time
 
         selected_slot: Optional[int] = None
@@ -498,7 +511,7 @@ class ClashRoyaleDetector:
 
         if screen_state == "battle":
             self.opponent_tracker.update(
-                current_time=time.time(),
+                current_time=_now,
                 enemy_detections=filtered_units,
                 double_elixir=is_double_elixir
             )

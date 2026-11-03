@@ -31,6 +31,7 @@ from policy.model import DeckConditionedPolicy
 from policy.rule_bot import RuleBotPolicy
 from controller.screen_capture import WindowCapture
 from controller.adb_harness import ADBHarness
+from configs.observation_schema import SCHEMA_VERSION
 
 
 class CRZeroLiveAgent:
@@ -203,7 +204,8 @@ class CRZeroLiveAgent:
                             action_card=np.array(self.match_buffer["action_card"], dtype=np.int64),
                             action_tile=np.array(self.match_buffer["action_tile"], dtype=np.int64),
                             timestamps=np.array(self.match_buffer["timestamps"], dtype=np.float32),
-                            match_outcome=1 if outcome == "victory" else (-1 if outcome == "defeat" else 0),
+                            schema_version=np.int32(SCHEMA_VERSION),
+                match_outcome=1 if outcome == "victory" else (-1 if outcome == "defeat" else 0),
                             ally_crowns=result_meta["ally_crowns"],
                             enemy_crowns=result_meta["enemy_crowns"],
                         )
@@ -211,10 +213,12 @@ class CRZeroLiveAgent:
                         self.match_buffer = {k: [] for k in self.match_buffer}
 
                     action_desc = "[RESULT] Match Concluded. Waiting for Lobby..."
+                    grid_history.clear(); last_action = (0, 0)   # new match must not inherit old state
                     time.sleep(0.5)
                     continue
 
                 if screen_state != "battle":
+                    grid_history.clear(); last_action = (0, 0)
                     # Throttle idle logging to once every 3 seconds
                     now = time.time()
                     if not hasattr(self, "_last_idle_log") or now - self._last_idle_log >= 3.0:
@@ -298,16 +302,22 @@ class CRZeroLiveAgent:
                 tile_y = chosen_tile // ARENA_COLS
                 tile_x = chosen_tile % ARENA_COLS
 
+                played_tile_mask = None
                 if chosen_slot > 0:
                     slot_idx = chosen_slot - 1
                     played_card_id = hand_ids[slot_idx]
                     card_meta = CARD_DATABASE.get(played_card_id, {"name": f"Card #{played_card_id}"})
-                    self.adb.play_card(slot_idx, tile_y, tile_x, non_blocking=True)
-                    action_desc = f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) [Conf: {card_conf*100:.1f}%]"
-                    last_action = (chosen_slot, chosen_tile)
+                    sent = self.adb.play_card(slot_idx, tile_y, tile_x, non_blocking=True)
+                    if sent:
+                        played_tile_mask = self.encoder.get_legal_tile_mask(played_card_id, tower_hps=obs.get("tower_hps"))
+                        action_desc = f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) [Conf: {card_conf*100:.1f}%]"
+                        last_action = (chosen_slot, chosen_tile)   # persists until the next accepted play
+                    else:
+                        # harness rejected it (cooldown / limit / panic): record a Wait, never a phantom play
+                        chosen_slot, chosen_tile = 0, 0
+                        action_desc = "REJECTED by ADB harness -> logged as WAIT"
                 else:
                     action_desc = f"WAIT (Elixir: {elixir:.1f}/10) [Conf: {card_conf*100:.1f}%]"
-                    last_action = (0, 0)
 
                 dt_act = (time.perf_counter() - t_act0) * 1000.0
 
@@ -318,7 +328,7 @@ class CRZeroLiveAgent:
                     self.match_buffer["hand_ids"].append(np.array(hand_ids, dtype=np.int64))
                     self.match_buffer["legal_card_mask"].append(legal_card_mask)
                     self.match_buffer["legal_tile_mask"].append(
-                        self.encoder.get_legal_tile_mask(hand_ids[chosen_slot - 1] if chosen_slot > 0 else 0)
+                        played_tile_mask if played_tile_mask is not None else self.encoder.get_legal_tile_mask(0)
                     )
                     self.match_buffer["action_card"].append(chosen_slot)
                     self.match_buffer["action_tile"].append(chosen_tile)

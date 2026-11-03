@@ -118,8 +118,8 @@ def train_one_epoch(
         # Force target tile to be legal in mask
         played_mask = target_card > 0
         if played_mask.any():
-            for idx in torch.where(played_mask)[0]:
-                tmask[idx, target_tile[idx]] = True
+            _pi = torch.where(played_mask)[0]
+            tmask[_pi, target_tile[_pi]] = True
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -220,8 +220,8 @@ def evaluate(
 
         played_mask = target_card > 0
         if played_mask.any():
-            for idx in torch.where(played_mask)[0]:
-                tmask[idx, target_tile[idx]] = True
+            _pi = torch.where(played_mask)[0]
+            tmask[_pi, target_tile[_pi]] = True
 
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
             card_logits, tile_logits = model(

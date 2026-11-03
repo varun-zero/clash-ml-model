@@ -2,20 +2,20 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.6](https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests Passing](https://img.shields.io/badge/tests-10%2F10%20passed-brightgreen.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests Passing](https://img.shields.io/badge/tests-15%2F15%20passed-brightgreen.svg)]()
 
-**CR-Zero** is a dual-stage deep reinforcement learning and imitation learning AI agent engineered for real-time autonomous play in *Clash Royale*. 
+**CR-Zero** is an end-to-end autonomous AI agent for *Clash Royale*, combining real-time computer vision, opponent cycle/elixir tracking, heuristic decision engines, and a dual-stage deep policy (Behavior Cloning + Advantage-Weighted Regression).
 
-The system operates across two environments:
-1. **Windows 11 Live Actuation Engine:** Captures the BlueStacks 5 client window ($540 \times 960$ portrait) via DirectX Desktop Duplication / ADB memory streaming at 15–30 FPS (40.6ms actuation latency), parses screen states, extracts card hands and elixir, predicts deployment actions, and dispatches safety-gated taps.
-2. **Dual-Stage Offline RL & Imitation Pipeline:** Trains a **Deck-Conditioned Policy Network** on GPU using **Behavior Cloning (BC)** with match-outcome weighting ($1.5\times$ for wins, $0.5\times$ for losses), followed by **Advantage-Weighted Regression (AWR)** fine-tuning ($w_t = \text{clip}(\exp(A_t / \beta), 0.05, 15.0)$) based on forward 10-second tower damage deltas and elixir trade differentials.
+The system operates across two coordinated subsystems:
+1. **Windows 11 Live Actuation Engine:** Captures the BlueStacks 5 client window ($540 \times 960$ portrait) via DirectX Desktop Duplication / ADB memory streaming at 15–30 FPS with ~40ms inter-tap latency, parses arena states at 5 Hz, tracks card hands and elixir, evaluates actions, and dispatches safety-gated taps.
+2. **Dual-Stage Offline RL & Imitation Pipeline:** Trains a **Deck-Conditioned Policy Network** on GPU using **Behavior Cloning (BC)** with match-outcome weighting ($1.5\times$ for wins, $0.5\times$ for losses), followed by **Advantage-Weighted Regression (AWR)** fine-tuning ($w_t = \text{clip}(\exp(A_t / \beta), 0.05, 10.0)$ normalized to mean $1.0$) based on forward 10-second tower damage deltas and elixir trade differentials.
 
 ---
 
 ## Autonomous Match Record
 
-CR-Zero has demonstrated autonomous battle loops on live ladder and training camp, securing **5 consecutive verified victories** (including 3–0 Three-Crown sweeps against real ladder opponents such as `DBZinferno_nami`, advancing trophies from 28 $\to$ 58).
+CR-Zero has demonstrated continuous autonomous battle loops on live ladder and training camp, securing **5 consecutive verified victories** using its tactical RuleBot heuristic engine (including 3–0 Three-Crown sweeps against ladder opponents, advancing trophies from 28 $\to$ 58). In parallel, the dual-stage neural policy achieves 43.2% card accuracy and 16.2% tile placement accuracy within 2 tiles on clean trajectory shards.
 
 ![Official In-Game Battle Log](official_battle_log.png)
 
@@ -73,7 +73,7 @@ CR-Zero has demonstrated autonomous battle loops on live ladder and training cam
 
 | Dataset / Repository | Platform / Creator | Volume & Format | Integration in CR-Zero |
 | :--- | :--- | :--- | :--- |
-| [`VanguardX101/IL_Replay`](https://huggingface.co/datasets/VanguardX101/IL_Replay) | Hugging Face | 17.8 Million card actions / 252k Ranked matches in Parquet | Ingested via `tools/ingest_vanguard_replays.py` into 30 new `.npz` shards matching CR-Zero's $(32, 18)$ spatial coordinates |
+| [`VanguardX101/IL_Replay`](https://huggingface.co/datasets/VanguardX101/IL_Replay) | Hugging Face | 17.8 Million card actions / 252k Ranked matches in Parquet | Ingested via `tools/ingest_vanguard_replays.py` into 30 canonical `schema_version=2` `.npz` shards matching $(32, 18)$ spatial coordinates |
 | [`Nitesh-04/Clash-Royale-Cards-Data`](https://huggingface.co/datasets/Nitesh-04/Clash-Royale-Cards-Data) | Hugging Face | Official Supercell card JSON (`clash_royale_cards_1.json`) | Ingested via `tools/update_card_features.py`, populating official attributes (air targeting, swarm, speed, range) |
 | [`wty-yy/Clash-Royale-Detection-Dataset`](https://github.com/wty-yy/Clash-Royale-Detection-Dataset) | GitHub | 26,798 transparent in-arena sprites & segments | Cloned in `data/cr_detection_dataset` for card classification templates and in-arena unit segmentation |
 | [`chrisrca/clash-royale-tv-replays`](https://huggingface.co/datasets/chrisrca/clash-royale-tv-replays) | Hugging Face | 52,900 frames at 10 FPS | Native $540 \times 960$ Android emulator recordings across all 31 arenas |
@@ -83,30 +83,35 @@ CR-Zero has demonstrated autonomous battle loops on live ladder and training cam
 
 ## 2. Perception & Observation Specifications
 
+Canonical schema is strictly defined in [`configs/observation_schema.py`](configs/observation_schema.py) (`SCHEMA_VERSION = 2`).
+
 ### Spatial Arena Grid: `(32, 32, 18)` (`float32`)
 The arena is mapped to 32 rows $\times$ 18 columns ($576$ tiles). Stacked across the 4 most recent frames ($4 \times 8 = 32$ channels):
-- **Ch 0:** `ally_ground_count`
-- **Ch 1:** `ally_air_count`
-- **Ch 2:** `ally_towers` (King at `(31, 9)`, Princesses at `(26, 3)` and `(26, 14)`)
-- **Ch 3:** `enemy_ground_count`
-- **Ch 4:** `enemy_air_count`
-- **Ch 5:** `enemy_towers` (King at `(0, 9)`, Princesses at `(5, 3)` and `(5, 14)`)
-- **Ch 6:** `river_and_bridges` (River rows 15–16; bridges at columns 3–4 and 13–14)
-- **Ch 7:** `spell_active_zone`
+- **Ch 0 (`Ch.ALLY_GROUND`):** Ally ground troops count
+- **Ch 1 (`Ch.ALLY_AIR`):** Ally air troops count
+- **Ch 2 (`Ch.ALLY_BUILDING`):** Ally buildings & towers (King at `(31, 9)`, Princesses at `(26, 3)` and `(26, 14)`)
+- **Ch 3 (`Ch.ENEMY_GROUND`):** Enemy ground troops count
+- **Ch 4 (`Ch.ENEMY_AIR`):** Enemy air troops count
+- **Ch 5 (`Ch.ENEMY_BUILDING`):** Enemy buildings & towers (King at `(0, 9)`, Princesses at `(5, 3)` and `(5, 14)`)
+- **Ch 6 (`Ch.SPELL`):** Active spells zone
+- **Ch 7 (`Ch.DEPLOYABLE`):** Legal deployable mask (including river rows 15–16 bridges at cols 3–4 and 13–14, and enemy pocket territory when a tower falls)
 
 ### Scalar Features: `(12,)` (`float32`, Normalized to $[0, 1]$)
-- `[0]`: Ally Elixir ($0.0 \dots 1.0$)
-- `[1]`: Estimated Enemy Elixir (from `OpponentTracker`)
-- `[2]`: Ally King Tower HP ($0.0 \dots 1.0$)
-- `[3]`: Ally Left Princess Tower HP ($0.0 \dots 1.0$)
-- `[4]`: Ally Right Princess Tower HP ($0.0 \dots 1.0$)
-- `[5]`: Enemy King Tower HP ($0.0 \dots 1.0$)
-- `[6]`: Enemy Left Princess Tower HP ($0.0 \dots 1.0$)
-- `[7]`: Enemy Right Princess Tower HP ($0.0 \dots 1.0$)
-- `[8]`: Match Time Elapsed ($t / 180.0$)
-- `[9]`: Double Elixir Indicator ($1.0$ if $t \ge 120\text{s}$, else $0.0$)
-- `[10]`: Differential Tower HP
-- `[11]`: Match Outcome Bias ($+1.0$ for win, $-1.0$ for loss)
+- `[0]` (`Sc.ALLY_ELIXIR`): Ally Elixir ($0.0 \dots 1.0$)
+- `[1]` (`Sc.ENEMY_ELIXIR`): Estimated Enemy Elixir (from `OpponentTracker`, $0.0 \dots 1.0$)
+- `[2]` (`Sc.TIME_LEFT`): Time Remaining ($t_{\text{left}} / 180.0$)
+- `[3]` (`Sc.ALLY_KING`): Ally King Tower HP ($0.0 \dots 1.0$)
+- `[4]` (`Sc.ALLY_LEFT`): Ally Left Princess Tower HP ($0.0 \dots 1.0$)
+- `[5]` (`Sc.ALLY_RIGHT`): Ally Right Princess Tower HP ($0.0 \dots 1.0$)
+- `[6]` (`Sc.ENEMY_KING`): Enemy King Tower HP ($0.0 \dots 1.0$)
+- `[7]` (`Sc.ENEMY_LEFT`): Enemy Left Princess Tower HP ($0.0 \dots 1.0$)
+- `[8]` (`Sc.ENEMY_RIGHT`): Enemy Right Princess Tower HP ($0.0 \dots 1.0$)
+- `[9]` (`Sc.LAST_CARD`): Last Played Card Slot ($s / 4.0$, persists until next play)
+- `[10]` (`Sc.LAST_TILE`): Last Played Tile Index ($\text{idx} / 575.0$, persists until next play)
+- `[11]` (`Sc.DOUBLE_ELIXIR`): Double Elixir Indicator ($1.0$ if $t_{\text{left}} \le 60\text{s}$, else $0.0$)
+
+> [!IMPORTANT]
+> **Zero Label Leakage**: Match outcome is sequestered exclusively in the `match_outcome` metadata ($+1$ for victory, $-1$ for defeat) for offline loss weighting. Scalar `[11]` strictly represents the double elixir game phase, preventing post-match label leakage into the policy input.
 
 ### Legality Action Masks
 - **Card Mask `(5,)`:** `[Wait=True, slot0_affordable, slot1_affordable, slot2_affordable, slot3_affordable]`.
@@ -126,6 +131,7 @@ $$t_{\text{flight}} = 1.0 + \frac{d}{8.0}$$
 ### Opponent Elixir & Card Cycle Tracker
 * Tracks enemy elixir expenditure and regeneration (1 elixir per 2.8s in normal time; 1 per 1.4s in double elixir).
 * Tracks enemy 4-card cycle in memory to anticipate counter-pushes.
+* Identifies meta archetypes (Log Bait, 2.6 Hog, Golem Beatdown) and predicts unrevealed deck cards.
 
 ---
 
@@ -199,6 +205,18 @@ tests/test_all_requirements.py::TestCRZeroRequirements::test_06_mocked_adb_safet
 tests/test_all_requirements.py::TestCRZeroRequirements::test_07_outcome_weighted_dataset PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_dataset_weighting PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_training_step PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_meta_deck_identification_and_prediction PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_opponent_cycle_and_in_hand PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_opponent_tracker_elixir_and_cycle PASSED
-============================= 10 passed in 8.13s =============================
+tests/test_schema_parity.py::test_no_target_leakage_and_hand_alignment PASSED
+tests/test_schema_parity.py::test_vanguard_scalars_follow_live_encoder_layout PASSED
+tests/test_schema_parity.py::test_unreconstructable_hand_is_rejected_not_guessed PASSED
+============================= 15 passed in 5.07s =============================
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+Clash Royale is a registered trademark of Supercell Oy. This project is an independent open-source research initiative not affiliated with, endorsed, or sponsored by Supercell.

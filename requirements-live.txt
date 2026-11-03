@@ -1,0 +1,10 @@
+# Live runtime (Windows 11 + BlueStacks). Install torch separately for CUDA:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.6
+numpy>=1.24,<2.5
+opencv-python>=4.8
+ultralytics>=8.1
+onnxruntime-gpu>=1.17
+dxcam>=0.1.1
+mss>=9.0.1
+adbutils>=2.0

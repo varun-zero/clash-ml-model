@@ -27,7 +27,13 @@ from configs.constants import (
 )
 from tools.play_live_match import LiveMatchRunner
 
-ARTIFACT_DIR = r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3"
+DEFAULT_ARTIFACT_DIR = os.environ.get(
+    "ARTIFACT_DIR",
+    r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3"
+    if os.path.exists(r"C:\Users\varun\.gemini\antigravity\brain\04d16640-56bb-4ee5-ab63-f10fa6a871b3")
+    else os.path.join(REPO_ROOT, "reports")
+)
+ARTIFACT_DIR = DEFAULT_ARTIFACT_DIR
 
 
 def clear_popups_and_enter_battle(runner: LiveMatchRunner, timeout_sec: float = 45.0) -> bool:
@@ -187,17 +193,31 @@ def generate_goal_report(
     return report_path
 
 
-def run_5_wins_campaign(target_wins: int = 5, max_attempts: int = 15):
+def run_5_wins_campaign(
+    target_wins: int = 5,
+    max_attempts: int = 15,
+    device_address: str = "127.0.0.1:5556",
+    weights_path: str = "weights/yolo_units.pt",
+    checkpoint_path: Optional[str] = None,
+    use_rule_bot: bool = True,
+    artifact_dir: Optional[str] = None,
+):
+    global ARTIFACT_DIR
+    if artifact_dir:
+        ARTIFACT_DIR = artifact_dir
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
     print("\n" + "=" * 70)
     print(f"CR-Zero: Starting Campaign to Achieve {target_wins} Victories")
-    print(f"Target Wins: {target_wins} | Maximum Match Attempts: {max_attempts}")
+    print(f"Target Wins: {target_wins} - Maximum Match Attempts: {max_attempts}")
+    print(f"Device: {device_address} - RuleBot: {use_rule_bot} - Checkpoint: {checkpoint_path}")
     print("Safety: Press F12 or Ctrl+C at any time to emergency stop.")
     print("=" * 70 + "\n")
 
     runner = LiveMatchRunner(
-        device_address="127.0.0.1:5556",
-        weights_path="weights/yolo_units.pt",
-        use_rule_bot=True,
+        device_address=device_address,
+        weights_path=weights_path,
+        use_rule_bot=use_rule_bot,
         max_duration_sec=240.0,
     )
 
@@ -260,4 +280,23 @@ def run_5_wins_campaign(target_wins: int = 5, max_attempts: int = 15):
 
 
 if __name__ == "__main__":
-    run_5_wins_campaign(target_wins=5, max_attempts=15)
+    import argparse
+    parser = argparse.ArgumentParser(description="CR-Zero Multi-Victory Campaign Runner")
+    parser.add_argument("--target-wins", type=int, default=5, help="Target number of victories")
+    parser.add_argument("--max-games", "--max-attempts", dest="max_attempts", type=int, default=15, help="Maximum match attempts")
+    parser.add_argument("--device", type=str, default="127.0.0.1:5556", help="ADB device IP:port")
+    parser.add_argument("--weights", type=str, default="weights/yolo_units.pt", help="YOLO weights path")
+    parser.add_argument("--checkpoint", type=str, default=None, help="PyTorch policy checkpoint")
+    parser.add_argument("--rule-bot", action="store_true", default=True, help="Use heuristic RuleBot")
+    parser.add_argument("--artifact-dir", type=str, default=DEFAULT_ARTIFACT_DIR, help="Output artifact directory")
+    args = parser.parse_args()
+
+    run_5_wins_campaign(
+        target_wins=args.target_wins,
+        max_attempts=args.max_attempts,
+        device_address=args.device,
+        weights_path=args.weights,
+        checkpoint_path=args.checkpoint,
+        use_rule_bot=args.rule_bot,
+        artifact_dir=args.artifact_dir,
+    )
