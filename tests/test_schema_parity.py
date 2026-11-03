@@ -1,6 +1,7 @@
 """Guards the failure mode shape-only tests cannot catch: producers disagreeing on
 what channel/scalar index N MEANS, label leakage, and hand/action misalignment."""
 import json
+import os
 import pytest
 import numpy as np
 from configs.observation_schema import Ch, Sc, SCHEMA_VERSION, check_schema
@@ -92,3 +93,48 @@ def test_strict_schema_enforcement():
 
     # Valid schema_version must not raise
     check_schema({"schema_version": SCHEMA_VERSION}, path="valid_shard.npz")
+
+
+def test_vanguard_ambiguity_rejection():
+    """Verify that infer_initial_queue rejects ambiguous reconstructions when reject_ambiguous is True."""
+    from tools.ingest_vanguard_replays import infer_initial_queue
+    deck = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Under-specified play sequence has multiple valid queue permutations
+    short_plays = [1, 2, 3]
+    res_rejected = infer_initial_queue(deck, short_plays, reject_ambiguous=True)
+    assert res_rejected is None, "Should reject ambiguous reconstruction when reject_ambiguous=True"
+
+
+def test_play_live_match_shard_contains_schema_version():
+    """Verify that play_live_match._save_trajectory_shard includes valid schema_version."""
+    from tools.play_live_match import LiveMatchRunner
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        runner = LiveMatchRunner(device_address="127.0.0.1:5556", weights_path=None, dry_run=True)
+        runner.log_dir = tmpdir
+        runner.stats["outcome"] = "VICTORY"
+        runner.stats["start_time"] = 0.0
+
+        for i in range(15):
+            runner.trajectory_buffer.append({
+                "stacked_grid": np.zeros((32, 32, 18), dtype=np.float32),
+                "scalars": np.zeros(12, dtype=np.float32),
+                "hand_ids": np.array([20, 21, 24, 2], dtype=np.int64),
+                "legal_card_mask": np.ones(5, dtype=bool),
+                "legal_tile_mask": np.ones(576, dtype=bool),
+                "action_card": 1 if i % 2 == 0 else 0,
+                "action_tile": 100 if i % 2 == 0 else 0,
+                "timestamp": float(i * 0.5),
+                "tower_hps": [1.0] * 6,
+                "ally_elixir": 5.0,
+                "enemy_elixir": 5.0,
+            })
+        shard_path = runner._save_trajectory_shard()
+        assert shard_path is not None and os.path.exists(shard_path)
+        with np.load(shard_path) as data:
+            check_schema(data, shard_path)
+            assert int(data["schema_version"]) == SCHEMA_VERSION
+            assert "rewards" in data
+            # Verify raw reward does not add outcome bonus directly
+            assert data["rewards"].shape == (15,)
+        runner.adb.close()

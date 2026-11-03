@@ -3,7 +3,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.6](https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests Passing](https://img.shields.io/badge/tests-15%2F15%20passed-brightgreen.svg)]()
+[![Tests Passing](https://img.shields.io/badge/tests-25%2F25%20passed-brightgreen.svg)]()
 
 **CR-Zero** is an end-to-end autonomous AI agent for *Clash Royale*, combining real-time computer vision, opponent cycle/elixir tracking, heuristic decision engines, and a dual-stage deep policy (Behavior Cloning + Advantage-Weighted Regression).
 
@@ -176,13 +176,14 @@ Interactive notebooks:
 # 1. Update official card features from Hugging Face
 python tools/update_card_features.py
 
-# 2. Ingest Vanguard ranked replays into trajectory shards
-python tools/ingest_vanguard_replays.py --max-matches 30 --output-dir data/trajectories
+# 2. Ingest Vanguard ranked replays for Stage 1 Prior Pretraining
+python tools/ingest_vanguard_replays.py --max-matches 30 --output-dir data/pretraining/vanguard
 
-# 3. Execute Stage 1 Behavior Cloning (BC)
-python colab_pipeline/train_bc.py --data_dir data/trajectories --save_dir checkpoints --epochs 10 --batch_size 64
+# 3. Execute Stage 1 Behavior Cloning (BC) Prior Pretraining
+python colab_pipeline/train_bc.py --data_dir data/pretraining/vanguard --save_dir checkpoints --epochs 10 --batch_size 64
 
-# 4. Execute Stage 2 Advantage-Weighted Regression (AWR)
+# 4. Execute Stage 2 Heuristic Reward-Weighted BC (AWR-style advantage weighting on live/VoD trajectories)
+# NOTE: train_awr.py strictly requires genuine battlefield states and rejects Vanguard replays
 python colab_pipeline/train_awr.py --shards-dir data/trajectories --init-checkpoint checkpoints/cr_zero_policy_best.pt --epochs 15 --batch-size 64 --beta 0.5
 ```
 
@@ -203,15 +204,25 @@ tests/test_all_requirements.py::TestCRZeroRequirements::test_04_canonicalization
 tests/test_all_requirements.py::TestCRZeroRequirements::test_05_rule_bot_heuristics PASSED
 tests/test_all_requirements.py::TestCRZeroRequirements::test_06_mocked_adb_safety_controls PASSED
 tests/test_all_requirements.py::TestCRZeroRequirements::test_07_outcome_weighted_dataset PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_adb_action_lifecycle_and_acknowledgement PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_dataset_weighting PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_rejects_vanguard_data PASSED
+tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_strict_timestamp_validation PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_awr_training_step PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_meta_deck_identification_and_prediction PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_opponent_cycle_and_in_hand PASSED
 tests/test_awr_and_tracker.py::TestAWRAndTracker::test_opponent_tracker_elixir_and_cycle PASSED
+tests/test_golden_hand.py::test_golden_frame_known_hand_detection PASSED
+tests/test_golden_hand.py::test_golden_frame_blank_and_unknown_slots_return_zero PASSED
+tests/test_golden_hand.py::test_no_synthetic_sprite_templates_present PASSED
 tests/test_schema_parity.py::test_no_target_leakage_and_hand_alignment PASSED
 tests/test_schema_parity.py::test_vanguard_scalars_follow_live_encoder_layout PASSED
 tests/test_schema_parity.py::test_unreconstructable_hand_is_rejected_not_guessed PASSED
-============================= 15 passed in 5.07s =============================
+tests/test_schema_parity.py::test_card_key_normalization_xbow_and_minipekka PASSED
+tests/test_schema_parity.py::test_strict_schema_enforcement PASSED
+tests/test_schema_parity.py::test_vanguard_ambiguity_rejection PASSED
+tests/test_schema_parity.py::test_play_live_match_shard_contains_schema_version PASSED
+============================= 25 passed in 10.88s =============================
 ```
 
 ---

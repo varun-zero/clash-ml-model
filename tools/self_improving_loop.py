@@ -62,7 +62,7 @@ def run_single_match(
 
 def retrain_policy_awr(
     shards_dir: str = "data/trajectories",
-    init_checkpoint: str = "checkpoints/cr_zero_policy_awr_best.pt",
+    init_checkpoint: str = "checkpoints/cr_zero_policy_best.pt",
     epochs: int = 10,
     batch_size: int = 64,
     beta: float = 0.5,
@@ -160,7 +160,7 @@ def main():
     parser.add_argument("--target-wins", type=int, default=5, help="Stop after reaching target victories")
     parser.add_argument("--retrain-every", type=int, default=3, help="Trigger AWR fine-tuning after N matches")
     parser.add_argument("--max-matches", type=int, default=20, help="Maximum matches to attempt")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/cr_zero_policy_awr_best.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/cr_zero_policy_best.pt")
     parser.add_argument("--device", type=str, default="127.0.0.1:5556")
     parser.add_argument("--shards-dir", type=str, default="data/trajectories")
     parser.add_argument("--epochs", type=int, default=10)

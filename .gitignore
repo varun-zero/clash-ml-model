@@ -15,6 +15,8 @@ weights/*.pt
 data/raw_vods/*
 data/trajectories/*.npz
 !data/trajectories/.gitkeep
+data/pretraining/**/*.npz
+!data/pretraining/**/.gitkeep
 data/cr_detection_dataset/
 
 # Temporary / debug screenshots and crops

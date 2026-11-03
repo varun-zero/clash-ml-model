@@ -74,25 +74,62 @@ class AWRTrajectoryDataset(Dataset):
                 at = data["action_tile"] if "action_tile" in data else data["tile_action"]
 
                 check_schema(data, p)
+
+                # P0 Guard: Vanguard replay data is strictly ineligible for AWR / Advantage weighting.
+                # Vanguard has no battlefield units, constant tower HP (1.0), fixed enemy elixir (0.5),
+                # and no per-action state transitions or rewards.
+                dataset_type = str(data.get("dataset_type", ""))
+                has_board = bool(data.get("has_ground_truth_board", True)) if "has_ground_truth_board" in data else True
+                is_vanguard_heuristic = (
+                    "rewards" not in data
+                    and s.ndim == 2
+                    and s.shape[0] > 0
+                    and np.all(s[:, Sc.ALLY_KING : Sc.ENEMY_RIGHT + 1] == 1.0)
+                    and np.all(s[:, Sc.ENEMY_ELIXIR] == 0.5)
+                )
+                if dataset_type == "pretraining_vanguard" or not has_board or is_vanguard_heuristic:
+                    raise ValueError(
+                        f"{p}: Ineligible dataset source for AWR. Vanguard replay data lacks battlefield unit positions, "
+                        "has constant tower HP, and has no per-action advantage rewards. "
+                        "Vanguard shards are restricted to BC prior pretraining (data/pretraining/vanguard/)."
+                    )
+
                 outcome = int(data["match_outcome"]) if "match_outcome" in data else 0
                 outcome_w = 1.5 if outcome > 0 else (0.5 if outcome < 0 else 1.0)
 
                 # Compute or retrieve rewards
                 if "rewards" in data:
                     r = data["rewards"].astype(np.float32)
+                    if not np.all(np.isfinite(r)):
+                        raise ValueError(f"{p}: Shard contains non-finite (NaN or Inf) values in 'rewards'.")
                 else:
-                    # Estimate reward: 10s tower HP delta + elixir trade (outcome is applied via outcome_w)
                     n_samples = len(ac)
+                    if "timestamps" not in data or len(data["timestamps"]) != n_samples:
+                        raise ValueError(
+                            f"{p}: Missing valid 'timestamps' array matching sample length ({n_samples}). "
+                            "Cannot compute forward advantage horizon without timestamps (unsafe fixed-step fallbacks are disabled)."
+                        )
+                    timestamps = data["timestamps"].astype(np.float32)
+                    if not np.all(np.isfinite(timestamps)):
+                        raise ValueError(f"{p}: Shard contains non-finite (NaN or Inf) timestamps.")
+                    if len(timestamps) > 1 and np.any(np.diff(timestamps) < 0):
+                        raise ValueError(f"{p}: Timestamps in shard must be strictly non-decreasing.")
+
                     r = np.zeros(n_samples, dtype=np.float32)
-                    has_timestamps = "timestamps" in data and len(data["timestamps"]) == n_samples
-                    timestamps = data["timestamps"].astype(np.float32) if has_timestamps else None
+                    match_end_t = float(timestamps[-1])
                     for idx in range(n_samples):
-                        if has_timestamps:
-                            target_t = float(timestamps[idx]) + 10.0
-                            fut_idx = int(np.searchsorted(timestamps, target_t, side="left"))
-                            fut_idx = min(n_samples - 1, fut_idx)
+                        t_curr = float(timestamps[idx])
+                        target_t = t_curr + 10.0
+                        fut_idx = int(np.searchsorted(timestamps, target_t, side="left"))
+
+                        # Handle incomplete horizon at match end
+                        if target_t > match_end_t:
+                            fut_idx = n_samples - 1
+                            elapsed_window = max(0.001, match_end_t - t_curr)
+                            horizon_scale = min(1.0, elapsed_window / 10.0)
                         else:
-                            fut_idx = min(n_samples - 1, idx + 50)
+                            fut_idx = min(n_samples - 1, fut_idx)
+                            horizon_scale = 1.0
 
                         # Ally king/princess HP vs Enemy king/princess HP
                         ally_hp_curr = s[idx, ALLY_TOWER_SLICE].sum()
@@ -100,7 +137,7 @@ class AWRTrajectoryDataset(Dataset):
                         enemy_hp_curr = s[idx, ENEMY_TOWER_SLICE].sum()
                         enemy_hp_fut = s[fut_idx, ENEMY_TOWER_SLICE].sum()
 
-                        delta_tower = (enemy_hp_curr - enemy_hp_fut) - (ally_hp_curr - ally_hp_fut)
+                        delta_tower = ((enemy_hp_curr - enemy_hp_fut) - (ally_hp_curr - ally_hp_fut)) * horizon_scale
                         elixir_diff = (s[idx, Sc.ALLY_ELIXIR] - s[idx, Sc.ENEMY_ELIXIR])
                         r[idx] = float(delta_tower + 0.15 * elixir_diff)
 

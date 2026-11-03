@@ -25,6 +25,7 @@ from configs.constants import (
     CARD_ID_TO_COST,
     CARD_DATABASE,
 )
+from configs.observation_schema import SCHEMA_VERSION
 from perception.detector import ClashRoyaleDetector
 from perception.state_encoder import StateEncoder, stack_spatial_frames
 
@@ -136,6 +137,7 @@ def ingest_parquet_file(
                     action_card=np.array(buffer_cards, dtype=np.int64),
                     action_tile=np.array(buffer_tiles, dtype=np.int64),
                     timestamps=np.array(buffer_timestamps, dtype=np.float32),
+                    schema_version=np.int32(SCHEMA_VERSION),
                     match_outcome=np.int64(1),
                     ally_crowns=np.int64(2),
                     enemy_crowns=np.int64(1),

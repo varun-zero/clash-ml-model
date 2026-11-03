@@ -76,13 +76,19 @@ def build_legal_tile_mask(card_id: int) -> np.ndarray:
     return mask
 
 
-def infer_initial_queue(deck: List[int], plays: List[int]) -> Optional[List[int]]:
+def infer_initial_queue(
+    deck: List[int],
+    plays: List[int],
+    reject_ambiguous: bool = False,
+) -> Optional[List[int]]:
     """Real CR hand = 4 slots + 4-card queue. The opening order is NOT in the replay,
     so recover an ordering [h0..h3, q0..q3] consistent with every observed play.
-    Returns None if the deck is not 8 distinct cards or no ordering explains the plays."""
+    Returns None if the deck is not 8 distinct cards or no ordering explains the plays.
+    If reject_ambiguous is True, rejects matches where multiple valid permutations exist."""
     from itertools import permutations
     if len(deck) != 8 or len(set(deck)) != 8:
         return None
+    valid_perms = []
     for perm in permutations(deck):
         hand, queue, ok = list(perm[:4]), list(perm[4:]), True
         for cid in plays:
@@ -93,13 +99,20 @@ def infer_initial_queue(deck: List[int], plays: List[int]) -> Optional[List[int]
             hand[s_] = queue.pop(0)
             queue.append(cid)
         if ok:
-            return list(perm)
-    return None
+            valid_perms.append(list(perm))
+            if not reject_ambiguous:
+                return valid_perms[0]
+            if len(valid_perms) > 1:
+                return None
+    if reject_ambiguous:
+        return valid_perms[0] if len(valid_perms) == 1 else None
+    return valid_perms[0] if valid_perms else None
 
 
 def process_match(
     replay_meta: Dict,
     match_actions: List[Dict],
+    reject_ambiguous: bool = False,
 ) -> Optional[Dict[str, np.ndarray]]:
     """Vanguard actions -> BC samples. Observation is built BEFORE the action is
     applied; the target action/tile is never written into the input; hand is
@@ -129,7 +142,7 @@ def process_match(
     if len(plays) < 5:
         return None
 
-    order = infer_initial_queue(deck_card_ids, [c for _, c, _ in plays])
+    order = infer_initial_queue(deck_card_ids, [c for _, c, _ in plays], reject_ambiguous=reject_ambiguous)
     if order is None:
         return None  # hand cannot be reconstructed faithfully -> do not train on it
     hand, queue = order[:4], order[4:]
@@ -197,6 +210,8 @@ def process_match(
         "timestamps": np.array(TS, dtype=np.float32),
         "match_outcome": np.int32(outcome),
         "schema_version": np.int32(SCHEMA_VERSION),
+        "dataset_type": np.str_("pretraining_vanguard"),
+        "has_ground_truth_board": np.bool_(False),
         # NOTE: no "rewards" key. Vanguard has no per-action signal; do not feed it to AWR.
         # NOTE: no Wait samples and no board/enemy info; use for card/tile-prior pretraining only.
     }
@@ -205,8 +220,9 @@ def process_match(
 def ingest_vanguard_replays(
     actions_path: str,
     replays_path: str,
-    output_dir: str = "data/trajectories",
+    output_dir: str = "data/pretraining/vanguard",
     max_matches: int = 50,
+    reject_ambiguous: bool = False,
 ) -> List[str]:
     """Ingests Vanguard parquet files and outputs .npz shards."""
     print(f"[Vanguard Ingest] Loading replays from {replays_path}...")
@@ -238,7 +254,7 @@ def ingest_vanguard_replays(
 
         meta_dict = replay_meta.to_dict() if hasattr(replay_meta, "to_dict") else dict(replay_meta)
         match_actions = group.sort_values("time_seconds").to_dict(orient="records")
-        tensors = process_match(meta_dict, match_actions)
+        tensors = process_match(meta_dict, match_actions, reject_ambiguous=reject_ambiguous)
         if tensors is None:
             continue
 
@@ -263,7 +279,8 @@ def main():
     parser.add_argument("--actions-file", type=str, default=None)
     parser.add_argument("--replays-file", type=str, default=None)
     parser.add_argument("--max-matches", type=int, default=30)
-    parser.add_argument("--output-dir", type=str, default="data/trajectories")
+    parser.add_argument("--output-dir", type=str, default="data/pretraining/vanguard")
+    parser.add_argument("--reject-ambiguous", action="store_true", help="Reject matches with ambiguous initial hand reconstructions.")
     args = parser.parse_args()
 
     # Find cached files if not passed
@@ -284,7 +301,7 @@ def main():
         print("[Vanguard Ingest] Error: Could not locate Vanguard parquet files in cache.")
         sys.exit(1)
 
-    ingest_vanguard_replays(actions_path, replays_path, args.output_dir, args.max_matches)
+    ingest_vanguard_replays(actions_path, replays_path, args.output_dir, args.max_matches, reject_ambiguous=args.reject_ambiguous)
 
 
 if __name__ == "__main__":

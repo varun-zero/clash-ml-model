@@ -30,6 +30,12 @@ from configs.constants import (
     CARD_ID_TO_IS_SPELL,
     HAND_SLOTS,
 )
+from configs.observation_schema import (
+    SCHEMA_VERSION,
+    Sc,
+    ALLY_TOWER_SLICE,
+    ENEMY_TOWER_SLICE,
+)
 from controller.screen_capture import WindowCapture
 from controller.adb_harness import ADBHarness
 from perception.detector import ClashRoyaleDetector
@@ -44,25 +50,28 @@ class LiveMatchRunner:
         weights_path: Optional[str] = "weights/yolo_units.pt",
         use_rule_bot: bool = True,
         max_duration_sec: float = 240.0,
+        dry_run: bool = False,
     ):
         self.device_address = device_address
         self.max_duration = max_duration_sec
         self.use_rule_bot = use_rule_bot
+        self.dry_run = dry_run
 
-        print(f"[Runner] Initializing ADB Harness for {device_address}...")
+        print(f"[Runner] Initializing ADB Harness for {device_address} (dry_run={dry_run})...")
         self.adb = ADBHarness(
             device_address=device_address,
             screen_width=540,
             screen_height=960,
             tap_delay_ms=40,
             action_cooldown_sec=0.8,
-            dry_run=False,
+            dry_run=dry_run,
         )
 
-        # Keep emulator display awake indefinitely
-        self.adb._send_shell_cmd("settings put system screen_off_timeout 2147483647")
-        self.adb._send_shell_cmd("settings put global stay_on_while_plugged_in 7")
-        self.adb._send_shell_cmd("input keyevent KEYCODE_WAKEUP")
+        if not dry_run:
+            # Keep emulator display awake indefinitely
+            self.adb._send_shell_cmd("settings put system screen_off_timeout 2147483647")
+            self.adb._send_shell_cmd("settings put global stay_on_while_plugged_in 7")
+            self.adb._send_shell_cmd("input keyevent KEYCODE_WAKEUP")
 
         print("[Runner] Initializing WindowCapture...")
         self.capture = WindowCapture(
@@ -300,7 +309,7 @@ class LiveMatchRunner:
                         flush=True
                     )
             else:
-                last_action = (0, 0)
+                # WAIT: do not reset last_action; persists until next accepted play
                 if int(elapsed_match) % 5 == 0 and round(elapsed_match, 1) % 1.0 < 0.2:
                     tracker = obs.get("opponent_tracker")
                     if tracker and tracker.seen_cards:
@@ -377,17 +386,22 @@ class LiveMatchRunner:
 
         outcome_val = 1 if self.stats["outcome"] == "VICTORY" else (-1 if self.stats["outcome"] == "DEFEAT" else 0)
 
-        # Calculate forward 10-second advantage reward R_t for each frame
+        # Calculate forward 10-second advantage reward R_t for each frame using searchsorted
         rewards = np.zeros(n, dtype=np.float32)
         timestamps = np.array([f["timestamp"] for f in self.trajectory_buffer], dtype=np.float32)
+        match_end_t = float(timestamps[-1]) if n > 0 else 0.0
 
         for i in range(n):
-            t_curr = timestamps[i]
-            future_indices = np.where((timestamps >= t_curr + 5.0) & (timestamps <= t_curr + 15.0))[0]
-            if len(future_indices) > 0:
-                j = int(future_indices[len(future_indices) // 2])
+            t_curr = float(timestamps[i])
+            target_t = t_curr + 10.0
+            j = int(np.searchsorted(timestamps, target_t, side="left"))
+            if target_t > match_end_t:
+                j = n - 1
+                elapsed_window = max(0.001, match_end_t - t_curr)
+                horizon_scale = min(1.0, elapsed_window / 10.0)
             else:
-                j = min(n - 1, i + int(10.0 / 0.20))
+                j = min(n - 1, j)
+                horizon_scale = 1.0
 
             f_curr = self.trajectory_buffer[i]
             f_fut = self.trajectory_buffer[j]
@@ -400,13 +414,13 @@ class LiveMatchRunner:
 
             ally_damage = max(0.0, ally_hp_curr - ally_hp_fut)
             enemy_damage = max(0.0, enemy_hp_curr - enemy_hp_fut)
-            delta_tower = float(enemy_damage - ally_damage)
+            delta_tower = float(enemy_damage - ally_damage) * horizon_scale
 
             # Elixir trade advantage
             elixir_diff = float((f_curr["ally_elixir"] - f_curr["enemy_elixir"]) / 10.0)
 
-            # Combined advantage
-            r_t = float(delta_tower + 0.15 * elixir_diff + 0.5 * outcome_val)
+            # Raw advantage reward without double-counting match_outcome (applied via sample weight in AWR)
+            r_t = float(delta_tower + 0.15 * elixir_diff)
             rewards[i] = r_t
 
         grids = np.array([f["stacked_grid"] for f in self.trajectory_buffer], dtype=np.float32)
@@ -433,6 +447,7 @@ class LiveMatchRunner:
             action_tile=tiles,
             timestamps=timestamps,
             rewards=rewards,
+            schema_version=np.int32(SCHEMA_VERSION),
             match_outcome=np.int64(outcome_val),
             ally_crowns=np.int64(self.stats["ally_crowns"]),
             enemy_crowns=np.int64(self.stats["enemy_crowns"]),

@@ -7,7 +7,7 @@ Enforces:
 4. Real execution success reporting (never reports "Deployed" on failure).
 5. Safety controls: --dry-run mode, max-actions limit, 800ms action cooldown, and F12 panic stop.
 """
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List, Any
 import os
 import sys
 import time
@@ -55,6 +55,13 @@ class ADBHarness:
         self.shell_proc: Optional[subprocess.Popen] = None
         self._pipe_lock = threading.Lock()
         self.adbutils_stream = None
+
+        # Asynchronous Action Lifecycle Tracking & Acknowledgement
+        self._action_id_counter: int = 0
+        self._action_lock = threading.Lock()
+        self.ack_queue: queue.Queue = queue.Queue()
+        self._completed_actions: Dict[int, Dict[str, Any]] = {}
+        self.last_action_id: int = 0
 
         # Auto-detect BlueStacks ADB port if using default address
         if self.device_address == "127.0.0.1:5555" and os.name == "nt":
@@ -326,8 +333,24 @@ class ADBHarness:
             if task is None:
                 break
 
-            slot_idx, tile_y, tile_x = task
-            self._execute_two_tap(slot_idx, tile_y, tile_x)
+            if len(task) == 4:
+                aid, slot_idx, tile_y, tile_x = task
+            else:
+                slot_idx, tile_y, tile_x = task
+                aid = 0
+
+            ok = self._execute_two_tap(slot_idx, tile_y, tile_x)
+            ack = {
+                "action_id": aid,
+                "slot_idx": slot_idx,
+                "tile_y": tile_y,
+                "tile_x": tile_x,
+                "success": bool(ok),
+                "timestamp": time.time(),
+            }
+            self.ack_queue.put(ack)
+            with self._action_lock:
+                self._completed_actions[aid] = ack
             self.action_queue.task_done()
 
     def tap(self, x: int, y: int) -> bool:
@@ -414,17 +437,78 @@ class ADBHarness:
             print(f"[ADB Cooldown] Ignored play ({elapsed*1000:.0f}ms < {self.action_cooldown_sec*1000:.0f}ms).")
             return False
 
+        with self._action_lock:
+            self._action_id_counter += 1
+            aid = self._action_id_counter
+            self.last_action_id = aid
+
         if non_blocking:
             # Drop older pending tap if a newer action is generated
             if self.action_queue.full():
                 try:
-                    self.action_queue.get_nowait()
+                    dropped = self.action_queue.get_nowait()
+                    if dropped and len(dropped) == 4:
+                        d_aid = dropped[0]
+                        d_ack = {
+                            "action_id": d_aid,
+                            "slot_idx": dropped[1],
+                            "tile_y": dropped[2],
+                            "tile_x": dropped[3],
+                            "success": False,
+                            "dropped": True,
+                            "timestamp": time.time(),
+                        }
+                        self.ack_queue.put(d_ack)
+                        with self._action_lock:
+                            self._completed_actions[d_aid] = d_ack
                 except queue.Empty:
                     pass
-            self.action_queue.put((slot_idx, tile_y, tile_x))
+            self.action_queue.put((aid, slot_idx, tile_y, tile_x))
             return True
         else:
-            return self._execute_two_tap(slot_idx, tile_y, tile_x)
+            ok = self._execute_two_tap(slot_idx, tile_y, tile_x)
+            ack = {
+                "action_id": aid,
+                "slot_idx": slot_idx,
+                "tile_y": tile_y,
+                "tile_x": tile_x,
+                "success": bool(ok),
+                "timestamp": time.time(),
+            }
+            self.ack_queue.put(ack)
+            with self._action_lock:
+                self._completed_actions[aid] = ack
+            return ok
+
+    def get_last_action_id(self) -> int:
+        """Returns the sequential integer ID of the most recently initiated play_card action."""
+        return self.last_action_id
+
+    def get_completed_actions(self) -> List[Dict[str, Any]]:
+        """Drains and returns all action acknowledgement records completed by the worker thread."""
+        completed = []
+        while True:
+            try:
+                ack = self.ack_queue.get_nowait()
+                completed.append(ack)
+            except queue.Empty:
+                break
+        return completed
+
+    def wait_for_action(self, action_id: int, timeout: float = 1.0) -> bool:
+        """Blocks until the specified action_id completes or times out. Returns action success boolean."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._action_lock:
+                if action_id in self._completed_actions:
+                    return bool(self._completed_actions[action_id].get("success", False))
+            time.sleep(0.01)
+        return False
+
+    def is_action_completed(self, action_id: int) -> bool:
+        """Checks if the specified action_id has completed."""
+        with self._action_lock:
+            return action_id in self._completed_actions
 
     def play_card_buildabot_coords(self, slot_idx: int, bot_x: int, bot_y: int) -> bool:
         """Dispatches card using ClashRoyaleBuildABot coordinate conventions."""

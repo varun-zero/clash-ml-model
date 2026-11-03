@@ -19,7 +19,11 @@ def get_or_create_test_shard() -> str:
     for shard in sorted(glob.glob("data/trajectories/*.npz")):
         try:
             with np.load(shard) as d:
-                if int(d.get("schema_version", -1)) == SCHEMA_VERSION and len(d.get("action_card", [])) >= 10:
+                if (
+                    int(d.get("schema_version", -1)) == SCHEMA_VERSION
+                    and len(d.get("action_card", [])) >= 10
+                    and "rewards" in d
+                ):
                     return shard
         except Exception:
             continue
@@ -169,6 +173,96 @@ class TestAWRAndTracker(unittest.TestCase):
         self.assertIn("loss", metrics)
         self.assertIn("card_acc", metrics)
         self.assertGreater(metrics["loss"], 0.0)
+
+    def test_awr_rejects_vanguard_data(self):
+        """P0 Guard: AWR must strictly refuse Vanguard pretraining shards lacking real board/rewards."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_vanguard = os.path.join(tmpdir, "vanguard_sample.npz")
+            N = 20
+            np.savez_compressed(
+                p_vanguard,
+                arena_grid=np.zeros((N, 32, 32, 18), dtype=np.float32),
+                scalars=np.zeros((N, 12), dtype=np.float32),
+                hand_ids=np.ones((N, 4), dtype=np.int64),
+                legal_card_mask=np.ones((N, 5), dtype=bool),
+                legal_tile_mask=np.ones((N, 576), dtype=bool),
+                action_card=np.ones(N, dtype=np.int64),
+                action_tile=np.zeros(N, dtype=np.int64),
+                timestamps=np.linspace(0, 10, N, dtype=np.float32),
+                match_outcome=np.int32(1),
+                schema_version=np.int32(SCHEMA_VERSION),
+                dataset_type=np.str_("pretraining_vanguard"),
+                has_ground_truth_board=np.bool_(False),
+            )
+            with self.assertRaises(ValueError) as ctx:
+                AWRTrajectoryDataset([p_vanguard], beta=0.5)
+            self.assertIn("Ineligible dataset source for AWR", str(ctx.exception))
+
+    def test_awr_strict_timestamp_validation(self):
+        """P1 Guard: AWR must reject missing, non-monotonic, or NaN timestamps when computing advantages."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            N = 20
+            base_kwargs = dict(
+                arena_grid=np.zeros((N, 32, 32, 18), dtype=np.float32),
+                scalars=np.ones((N, 12), dtype=np.float32),
+                hand_ids=np.ones((N, 4), dtype=np.int64),
+                legal_card_mask=np.ones((N, 5), dtype=bool),
+                legal_tile_mask=np.ones((N, 576), dtype=bool),
+                action_card=np.ones(N, dtype=np.int64),
+                action_tile=np.zeros(N, dtype=np.int64),
+                match_outcome=np.int32(1),
+                schema_version=np.int32(SCHEMA_VERSION),
+            )
+
+            # 1. Missing timestamps without rewards
+            p_missing_ts = os.path.join(tmpdir, "missing_ts.npz")
+            np.savez_compressed(p_missing_ts, **base_kwargs)
+            with self.assertRaises(ValueError) as ctx1:
+                AWRTrajectoryDataset([p_missing_ts], beta=0.5)
+            self.assertIn("Missing valid 'timestamps' array", str(ctx1.exception))
+
+            # 2. Non-monotonic timestamps
+            p_non_mono = os.path.join(tmpdir, "non_monotonic.npz")
+            bad_ts = np.array([0.0, 1.0, 0.5] + [2.0] * (N - 3), dtype=np.float32)
+            np.savez_compressed(p_non_mono, timestamps=bad_ts, **base_kwargs)
+            with self.assertRaises(ValueError) as ctx2:
+                AWRTrajectoryDataset([p_non_mono], beta=0.5)
+            self.assertIn("strictly non-decreasing", str(ctx2.exception))
+
+            # 3. NaN timestamps
+            p_nan = os.path.join(tmpdir, "nan_ts.npz")
+            nan_ts = np.linspace(0, 10, N, dtype=np.float32)
+            nan_ts[5] = np.nan
+            np.savez_compressed(p_nan, timestamps=nan_ts, **base_kwargs)
+            with self.assertRaises(ValueError) as ctx3:
+                AWRTrajectoryDataset([p_nan], beta=0.5)
+            self.assertIn("non-finite", str(ctx3.exception))
+
+    def test_adb_action_lifecycle_and_acknowledgement(self):
+        """P0 Guard: Tests asynchronous ADB action lifecycle, IDs, and tap acknowledgement."""
+        from controller.adb_harness import ADBHarness
+        harness = ADBHarness(dry_run=True, action_cooldown_sec=0.01)
+
+        # 1. Dispatch non-blocking play
+        ok = harness.play_card(0, 18, 5, non_blocking=True)
+        self.assertTrue(ok)
+        aid = harness.get_last_action_id()
+        self.assertGreater(aid, 0)
+
+        # 2. Wait for background thread completion
+        completed = harness.wait_for_action(aid, timeout=0.5)
+        self.assertTrue(completed)
+        self.assertTrue(harness.is_action_completed(aid))
+
+        # 3. Drain acknowledgement queue
+        acks = harness.get_completed_actions()
+        self.assertGreaterEqual(len(acks), 1)
+        self.assertEqual(acks[0]["action_id"], aid)
+        self.assertTrue(acks[0]["success"])
+
+        harness.close()
 
 
 if __name__ == "__main__":

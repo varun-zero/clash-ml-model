@@ -160,6 +160,7 @@ class CRZeroLiveAgent:
 
         grid_history = deque(maxlen=4)
         last_action = (0, 0)
+        pending_plays: Dict[int, Dict[str, Any]] = {}
 
         try:
             while self.running:
@@ -187,6 +188,23 @@ class CRZeroLiveAgent:
 
                 # Handle Result Screen & Match Shard Logging
                 if screen_state == "result":
+                    # Drain any pending plays that finished right as the battle concluded
+                    if self.log_dir:
+                        for ack in self.adb.get_completed_actions():
+                            aid = ack.get("action_id", 0)
+                            if aid in pending_plays:
+                                play = pending_plays.pop(aid)
+                                if ack.get("success", False):
+                                    self.match_buffer["arena_grid"].append(play["grid"])
+                                    self.match_buffer["scalars"].append(play["scalars"])
+                                    self.match_buffer["hand_ids"].append(play["hand_ids"])
+                                    self.match_buffer["legal_card_mask"].append(play["legal_card_mask"])
+                                    self.match_buffer["legal_tile_mask"].append(play["played_tile_mask"])
+                                    self.match_buffer["action_card"].append(play["card_slot"])
+                                    self.match_buffer["action_tile"].append(play["tile"])
+                                    self.match_buffer["timestamps"].append(play["timestamp"])
+                        pending_plays.clear()
+
                     if self.log_dir and len(self.match_buffer["action_card"]) > 10:
                         ts = int(time.time())
                         outcome = result_meta.get("outcome", "unknown")
@@ -213,12 +231,12 @@ class CRZeroLiveAgent:
                         self.match_buffer = {k: [] for k in self.match_buffer}
 
                     action_desc = "[RESULT] Match Concluded. Waiting for Lobby..."
-                    grid_history.clear(); last_action = (0, 0)   # new match must not inherit old state
+                    grid_history.clear(); last_action = (0, 0); pending_plays.clear()   # new match must not inherit old state
                     time.sleep(0.5)
                     continue
 
                 if screen_state != "battle":
-                    grid_history.clear(); last_action = (0, 0)
+                    grid_history.clear(); last_action = (0, 0); pending_plays.clear()
                     # Throttle idle logging to once every 3 seconds
                     now = time.time()
                     if not hasattr(self, "_last_idle_log") or now - self._last_idle_log >= 3.0:
@@ -302,6 +320,23 @@ class CRZeroLiveAgent:
                 tile_y = chosen_tile // ARENA_COLS
                 tile_x = chosen_tile % ARENA_COLS
 
+                # Drain completed ADB tap acknowledgements
+                if self.log_dir:
+                    for ack in self.adb.get_completed_actions():
+                        aid = ack.get("action_id", 0)
+                        if aid in pending_plays:
+                            play = pending_plays.pop(aid)
+                            if ack.get("success", False):
+                                # Tap confirmed physically executed; commit to trajectory
+                                self.match_buffer["arena_grid"].append(play["grid"])
+                                self.match_buffer["scalars"].append(play["scalars"])
+                                self.match_buffer["hand_ids"].append(play["hand_ids"])
+                                self.match_buffer["legal_card_mask"].append(play["legal_card_mask"])
+                                self.match_buffer["legal_tile_mask"].append(play["played_tile_mask"])
+                                self.match_buffer["action_card"].append(play["card_slot"])
+                                self.match_buffer["action_tile"].append(play["tile"])
+                                self.match_buffer["timestamps"].append(play["timestamp"])
+
                 played_tile_mask = None
                 if chosen_slot > 0:
                     slot_idx = chosen_slot - 1
@@ -309,30 +344,47 @@ class CRZeroLiveAgent:
                     card_meta = CARD_DATABASE.get(played_card_id, {"name": f"Card #{played_card_id}"})
                     sent = self.adb.play_card(slot_idx, tile_y, tile_x, non_blocking=True)
                     if sent:
+                        aid = self.adb.get_last_action_id()
                         played_tile_mask = self.encoder.get_legal_tile_mask(played_card_id, tower_hps=obs.get("tower_hps"))
                         action_desc = f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) [Conf: {card_conf*100:.1f}%]"
                         last_action = (chosen_slot, chosen_tile)   # persists until the next accepted play
+                        if self.log_dir:
+                            pending_plays[aid] = {
+                                "card_slot": chosen_slot,
+                                "tile": chosen_tile,
+                                "played_tile_mask": played_tile_mask,
+                                "grid": stacked_grid,
+                                "scalars": scalars,
+                                "hand_ids": np.array(hand_ids, dtype=np.int64),
+                                "legal_card_mask": legal_card_mask,
+                                "timestamp": time.time(),
+                            }
                     else:
                         # harness rejected it (cooldown / limit / panic): record a Wait, never a phantom play
                         chosen_slot, chosen_tile = 0, 0
                         action_desc = "REJECTED by ADB harness -> logged as WAIT"
+                        if self.log_dir:
+                            self.match_buffer["arena_grid"].append(stacked_grid)
+                            self.match_buffer["scalars"].append(scalars)
+                            self.match_buffer["hand_ids"].append(np.array(hand_ids, dtype=np.int64))
+                            self.match_buffer["legal_card_mask"].append(legal_card_mask)
+                            self.match_buffer["legal_tile_mask"].append(self.encoder.get_legal_tile_mask(0))
+                            self.match_buffer["action_card"].append(0)
+                            self.match_buffer["action_tile"].append(0)
+                            self.match_buffer["timestamps"].append(time.time())
                 else:
                     action_desc = f"WAIT (Elixir: {elixir:.1f}/10) [Conf: {card_conf*100:.1f}%]"
+                    if self.log_dir:
+                        self.match_buffer["arena_grid"].append(stacked_grid)
+                        self.match_buffer["scalars"].append(scalars)
+                        self.match_buffer["hand_ids"].append(np.array(hand_ids, dtype=np.int64))
+                        self.match_buffer["legal_card_mask"].append(legal_card_mask)
+                        self.match_buffer["legal_tile_mask"].append(self.encoder.get_legal_tile_mask(0))
+                        self.match_buffer["action_card"].append(0)
+                        self.match_buffer["action_tile"].append(0)
+                        self.match_buffer["timestamps"].append(time.time())
 
                 dt_act = (time.perf_counter() - t_act0) * 1000.0
-
-                # Buffer step for match logger
-                if self.log_dir:
-                    self.match_buffer["arena_grid"].append(stacked_grid)
-                    self.match_buffer["scalars"].append(scalars)
-                    self.match_buffer["hand_ids"].append(np.array(hand_ids, dtype=np.int64))
-                    self.match_buffer["legal_card_mask"].append(legal_card_mask)
-                    self.match_buffer["legal_tile_mask"].append(
-                        played_tile_mask if played_tile_mask is not None else self.encoder.get_legal_tile_mask(0)
-                    )
-                    self.match_buffer["action_card"].append(chosen_slot)
-                    self.match_buffer["action_tile"].append(chosen_tile)
-                    self.match_buffer["timestamps"].append(time.time())
 
                 # FPS and latency tracking
                 frame_counter += 1
