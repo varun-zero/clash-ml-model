@@ -239,10 +239,11 @@ class LiveMatchRunner:
             else:
                 consecutive_result_frames = 0
 
-            # Check if match ended and returned to main menu
-            if in_battle_seen and screen_state == "menu":
+            # Check if match ended and returned to main menu (require >= 20s elapsed and 8 consecutive menu frames)
+            elapsed_so_far = now - self.stats["start_time"]
+            if in_battle_seen and screen_state == "menu" and elapsed_so_far >= 20.0:
                 consecutive_menu_frames += 1
-                if consecutive_menu_frames >= 3:
+                if consecutive_menu_frames >= 8:
                     print("\n[Runner] Battle concluded and returned to main menu!")
                     break
             else:
@@ -253,6 +254,14 @@ class LiveMatchRunner:
             elif not in_battle_seen:
                 time.sleep(0.3)
                 continue
+
+            # Ensure hand slots never freeze at 0 during active battle due to lighting/cooldown shifts
+            if 0 in hand_ids:
+                forced_hand = self.detector.read_hand_cards(frame, force_best_match=True)
+                hand_ids = [
+                    hand_ids[i] if (i < len(hand_ids) and hand_ids[i] > 0) else forced_hand[i]
+                    for i in range(4)
+                ]
 
             # 4. Decision & Action via Human-Like Tactical RuleBot
             arena_grid = obs["arena_grid"]
@@ -476,9 +485,14 @@ class LiveMatchRunner:
         return shard_path
 
     def _verify_from_battle_log(self):
-        """Opens Battle Log to extract official match result."""
+        """Opens Battle Log to extract official match result after confirming return to menu."""
         print("[Runner] Consulting Battle Log for verified match outcome...")
         try:
+            check_frame = self.capture.grab_frame()
+            if self.detector.classify_screen_state(check_frame) == "battle":
+                print("[Runner] Still in active battle; skipping Battle Log modal tap.")
+                return
+
             # Tap hamburger menu at (490, 105)
             self.adb.tap(490, 105)
             time.sleep(1.0)
@@ -508,9 +522,11 @@ class LiveMatchRunner:
                     self.stats["enemy_crowns"] = 3
                 print(f"[Runner] Battle Log confirmed: DEFEAT ({r_count} red pixels)")
 
-            # Close Battle Log via red 'X' at (505, 115)
+            # Close Battle Log via red 'X' at (505, 115) + back key guard
             self.adb.tap(505, 115)
-            time.sleep(1.0)
+            time.sleep(0.8)
+            self.adb._send_shell_cmd("input keyevent KEYCODE_BACK")
+            time.sleep(0.6)
         except Exception as e:
             print(f"[Runner] Battle log check notice: {e}")
 

@@ -374,8 +374,53 @@ class TestCRZeroRequirements(unittest.TestCase):
         self.assertGreater(h_slot, 0)
         self.assertGreaterEqual(h_tile // 18, 16)
 
+    def test_11_bluestacks_shifted_dimmed_hand_and_battle_state_classification(self):
+        """
+        Verifies the exact fixes for the 5-game live telemetry issues:
+        1. Shifted (±4px) and elixir-cooldown dimmed (0.55x brightness) 540x960 hand crops
+           for Giant (24) and Knight/Goblins (20) are 100% locked instead of returning 0.
+        2. Active battle frames with gold card borders in HAND_SLOTS (y=0.91..0.95) + pink elixir
+           bar are classified as 'battle' and never misclassified as 'menu'.
+        """
+        import cv2
+        from perception.detector import ClashRoyaleDetector
+        from configs.constants import HAND_SLOTS, ELIXIR_BAR_BOX
+
+        det = ClashRoyaleDetector(weights=None)
+        h, w = 960, 540
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+
+        target_hand = [24, 20, 27, 2]  # Giant, Goblins/Arrows, Musketeer, Fireball
+        shifts = [(4, -3), (-4, 4), (3, 3), (-3, -4)]
+        dim_factors = [0.55, 0.50, 0.60, 0.58]
+
+        for idx, (cid, box) in enumerate(zip(target_hand, HAND_SLOTS)):
+            tmpl = cv2.imread(f"templates/{cid}/template_01.png")
+            self.assertIsNotNone(tmpl)
+            bx1, by1, bx2, by2 = box
+            x1, y1 = int(bx1 * w), int(by1 * h)
+            x2, y2 = int(bx2 * w), int(by2 * h)
+            crop_w, crop_h = x2 - x1, y2 - y1
+            pad_x, pad_y = int(crop_w * 0.12), int(crop_h * 0.12)
+            inner_w = (x2 - pad_x) - (x1 + pad_x)
+            inner_h = (y2 - pad_y) - (y1 + pad_y)
+            resized = cv2.resize(tmpl, (inner_w, inner_h), interpolation=cv2.INTER_AREA)
+            # Apply elixir-cooldown dimming + translation shift
+            dimmed = np.clip(resized.astype(np.float32) * dim_factors[idx], 0, 255).astype(np.uint8)
+            dx, dy = shifts[idx]
+            M = np.float32([[1, 0, dx], [0, 1, dy]])
+            shifted = cv2.warpAffine(dimmed, M, (inner_w, inner_h), borderMode=cv2.BORDER_REPLICATE)
+            frame[y1 + pad_y : y2 - pad_y, x1 + pad_x : x2 - pad_x] = shifted
+
+        detected_hand = det.read_hand_cards(frame)
+        self.assertEqual(detected_hand, target_hand)
+
+        # Add gold card borders at y=0.91..0.95 AND pink elixir bar at ELIXIR_BAR_BOX
+        frame[int(0.91 * h):int(0.95 * h), int(0.15 * w):int(0.85 * w)] = (0, 215, 255)  # BGR gold
+        ex1, ey1, ex2, ey2 = ELIXIR_BAR_BOX
+        frame[int(ey1 * h):int(ey2 * h), int(ex1 * w):int((ex1 + 0.4 * (ex2 - ex1)) * w)] = (210, 40, 230)  # BGR magenta
+        self.assertEqual(det.classify_screen_state(frame), "battle")
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

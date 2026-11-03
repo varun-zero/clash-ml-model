@@ -73,6 +73,10 @@ class ClashRoyaleDetector:
         self._next_cv_track_id: int = 1000
         self._prev_screen_state = "menu"
         self._battle_t0: Optional[float] = None
+        self._last_known_hand_ids: List[int] = [0, 0, 0, 0]
+        self._last_known_hand_ts: List[float] = [0.0, 0.0, 0.0, 0.0]
+        self._last_unknown_log_ts: List[float] = [0.0, 0.0, 0.0, 0.0]
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
 
         # 2. YOLO Model Loading
         weights_file = weights or model_path
@@ -136,6 +140,52 @@ class ClashRoyaleDetector:
         self.opponent_tracker.reset()
         self.track_history.clear()
         self._next_cv_track_id = 1000
+        self._last_known_hand_ids = [0, 0, 0, 0]
+        self._last_known_hand_ts = [0.0, 0.0, 0.0, 0.0]
+
+    def _resolve_global_card_id(self, raw_cls_id: int, raw_name: str, is_ally: bool, norm_area: float) -> int:
+        """
+        Maps a YOLO class index / class name to a canonical global CARD_DATABASE ID.
+        Prevents 0-indexed YOLO dataset IDs from misidentifying cards or defaulting to 0.
+        """
+        clean = raw_name.lower().strip()
+        for prefix in ("enemy_", "ally_", "red_", "blue_", "unit_"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+        clean_spaced = clean.replace("_", " ").replace("-", " ").strip()
+
+        if clean_spaced in CARD_NAME_TO_ID:
+            return CARD_NAME_TO_ID[clean_spaced]
+        if "mini" in clean_spaced and "pekka" in clean_spaced:
+            return 26
+        if "pekka" in clean_spaced:
+            return 33
+        if "giant" in clean_spaced:
+            return 24
+        if "knight" in clean_spaced:
+            return 1
+        if "archer" in clean_spaced:
+            return 2
+        if "minion" in clean_spaced:
+            return 21
+        if "musketeer" in clean_spaced:
+            return 27
+        if "fireball" in clean_spaced:
+            return 43
+        if "arrow" in clean_spaced:
+            return 20
+
+        for cname, cid in CARD_NAME_TO_ID.items():
+            if len(clean_spaced) >= 4 and (clean_spaced in cname or cname in clean_spaced):
+                return cid
+
+        if raw_cls_id in CARD_DATABASE and raw_cls_id > 0:
+            return raw_cls_id
+
+        # Fallback representative global ID by footprint size
+        if norm_area > 0.0035:
+            return 24  # Giant / heavy tank footprint
+        return 21 if is_ally else 20
 
     def _assign_cv_track_id(self, cx: float, cy: float, is_ally: bool, now: float) -> Tuple[int, float, float]:
         """Assigns a persistent track_id and computes (vx, vy) for CV-detected arena units."""
@@ -314,6 +364,13 @@ class ClashRoyaleDetector:
                         category = "ground"
 
                     is_ally = not name.startswith("enemy_")
+                    norm_x1 = float(coords[0] / w)
+                    norm_y1 = float(coords[1] / h)
+                    norm_x2 = float(coords[2] / w)
+                    norm_y2 = float(coords[3] / h)
+                    norm_area = max(0.0, (norm_x2 - norm_x1) * (norm_y2 - norm_y1))
+                    global_cid = self._resolve_global_card_id(cls_id, name, is_ally, norm_area)
+
                     track_id = None
                     vx, vy = 0.0, 0.0
                     if hasattr(box, "id") and box.id is not None:
@@ -332,12 +389,12 @@ class ClashRoyaleDetector:
 
                     detections.append(
                         Detection(
-                            x1=float(coords[0] / w),
-                            y1=float(coords[1] / h),
-                            x2=float(coords[2] / w),
-                            y2=float(coords[3] / h),
+                            x1=norm_x1,
+                            y1=norm_y1,
+                            x2=norm_x2,
+                            y2=norm_y2,
                             confidence=conf,
-                            cls_id=cls_id,
+                            cls_id=global_cid,
                             is_ally=is_ally,
                             category=category,
                             track_id=track_id,
@@ -345,6 +402,23 @@ class ClashRoyaleDetector:
                             vy=vy,
                         )
                     )
+
+            # Supplement YOLO detections with CV health-bar detections so no active unit is missed
+            cv_supplement = self._detect_units_cv(frame)
+            for cv_det in cv_supplement:
+                cv_cx = (cv_det.x1 + cv_det.x2) / 2.0
+                cv_cy = cv_det.y2
+                already_covered = False
+                for y_det in detections:
+                    if y_det.category not in ("ground", "air", "building"):
+                        continue
+                    y_cx = (y_det.x1 + y_det.x2) / 2.0
+                    y_cy = y_det.y2
+                    if np.hypot(cv_cx - y_cx, cv_cy - y_cy) < 0.065:
+                        already_covered = True
+                        break
+                if not already_covered:
+                    detections.append(cv_det)
         else:
             # Fallback to CV arena troop & health-bar detector when YOLO weights are not provided
             detections = self._detect_units_cv(frame)
@@ -360,26 +434,7 @@ class ClashRoyaleDetector:
         """
         h, w = frame.shape[:2]
 
-        # 1. Check for Bottom Navigation Bar (Shop, Cards, Battle, Clan, Events) -> Strictly 'menu'
-        nav_roi = frame[int(0.91 * h):int(0.99 * h), :]
-        if nav_roi.size > 0:
-            hsv_nav = cv2.cvtColor(nav_roi, cv2.COLOR_BGR2HSV)
-            yellow_nav = cv2.inRange(hsv_nav, np.array([15, 120, 120]), np.array([35, 255, 255]))
-            if np.sum(yellow_nav > 0) > 500:
-                return "menu"
-
-        # 2. Check for Elixir Bar in Battle (pink elixir or dark elixir bar background)
-        bx1, by1, bx2, by2 = ELIXIR_BAR_BOX
-        x1, y1 = int(bx1 * w), int(by1 * h)
-        x2, y2 = int(bx2 * w), int(by2 * h)
-        bar_roi = frame[y1:y2, x1:x2]
-        if bar_roi.size > 0:
-            hsv_bar = cv2.cvtColor(bar_roi, cv2.COLOR_BGR2HSV)
-            pink_mask = cv2.inRange(hsv_bar, np.array([135, 60, 60]), np.array([170, 255, 255]))
-            if np.sum(pink_mask > 0) > 80:
-                return "battle"
-
-        # 3. Check for Victory / Defeat banner at top center
+        # 1. Check for Victory / Defeat result screen banner + OK button FIRST
         banner_roi = frame[int(0.08 * h):int(0.25 * h), int(0.20 * w):int(0.80 * w)]
         if banner_roi.size > 0:
             hsv_banner = cv2.cvtColor(banner_roi, cv2.COLOR_BGR2HSV)
@@ -388,7 +443,6 @@ class ClashRoyaleDetector:
             red_mask2 = cv2.inRange(hsv_banner, np.array([170, 120, 100]), np.array([180, 255, 255]))
             red_mask = red_mask1 | red_mask2
             if np.sum(gold_mask > 0) > 1500 or np.sum(red_mask > 0) > 1500:
-                # Also check for "OK" button at bottom
                 btn_roi = frame[int(0.80 * h):int(0.95 * h), int(0.30 * w):int(0.70 * w)]
                 if btn_roi.size > 0:
                     btn_hsv = cv2.cvtColor(btn_roi, cv2.COLOR_BGR2HSV)
@@ -396,11 +450,35 @@ class ClashRoyaleDetector:
                     if np.sum(yellow_mask > 0) > 400:
                         return "result"
 
-        # If dark elixir bar background exists, it is battle
+        # 2. Check for Elixir Bar in Battle (pink/magenta elixir in ELIXIR_BAR_BOX y=0.95..0.985)
+        # Must run BEFORE bottom-nav menu check so gold card borders in HAND_SLOTS (y=0.81..0.95)
+        # never falsely trigger 'menu' during an active match!
+        bx1, by1, bx2, by2 = ELIXIR_BAR_BOX
+        x1, y1 = int(bx1 * w), int(by1 * h)
+        x2, y2 = int(bx2 * w), int(by2 * h)
+        bar_roi = frame[y1:y2, x1:x2]
+        if bar_roi.size > 0:
+            hsv_bar = cv2.cvtColor(bar_roi, cv2.COLOR_BGR2HSV)
+            pink_mask = cv2.inRange(hsv_bar, np.array([130, 55, 60]), np.array([175, 255, 255]))
+            if np.sum(pink_mask > 0) > 55:
+                return "battle"
+
+        # 3. Check for Main Menu yellow 'Battle' button (y=0.70..0.80, x=0.33..0.67) + bottom nav tabs
+        battle_btn_roi = frame[int(0.70 * h):int(0.80 * h), int(0.33 * w):int(0.67 * w)]
+        nav_roi = frame[int(0.92 * h):int(0.99 * h), :]
+        if battle_btn_roi.size > 0 and nav_roi.size > 0:
+            hsv_btn = cv2.cvtColor(battle_btn_roi, cv2.COLOR_BGR2HSV)
+            yellow_btn = cv2.inRange(hsv_btn, np.array([15, 130, 130]), np.array([35, 255, 255]))
+            hsv_nav = cv2.cvtColor(nav_roi, cv2.COLOR_BGR2HSV)
+            yellow_nav = cv2.inRange(hsv_nav, np.array([15, 120, 120]), np.array([35, 255, 255]))
+            if np.sum(yellow_btn > 0) > 800 or np.sum(yellow_nav > 0) > 1200:
+                return "menu"
+
+        # 4. If dark elixir bar background exists alongside arena grass/river, it is battle (even at 0 elixir)
         if bar_roi.size > 0:
             hsv_bar = cv2.cvtColor(bar_roi, cv2.COLOR_BGR2HSV)
             dark_mask = cv2.inRange(hsv_bar, np.array([0, 0, 10]), np.array([180, 80, 80]))
-            if np.sum(dark_mask > 0) > (bar_roi.size * 0.20):
+            if np.sum(dark_mask > 0) > (bar_roi.shape[0] * bar_roi.shape[1] * 0.20):
                 return "battle"
 
         return "menu"
@@ -466,14 +544,17 @@ class ClashRoyaleDetector:
         elixir = float(np.clip(ratio * 10.0, 0.0, 10.0))
         return elixir
 
-    def read_hand_cards(self, frame: np.ndarray) -> List[int]:
+    def read_hand_cards(self, frame: np.ndarray, force_best_match: bool = False) -> List[int]:
         """
-        Reads the 4 card IDs in the player's hand slots 0..3 using template matching.
+        Reads the 4 card IDs in the player's hand slots 0..3 using multi-channel
+        translation-invariant template matching (full 64x64 + sliding 52x52 inner core
+        across BGR, Grayscale, and CLAHE-equalized Grayscale) with temporal slot persistence.
         Restricted to the account's unlocked_cards.
-        Returns 0 for unknown card and logs unknown crop to unknown_cards/.
+        Returns 0 for blank/unknown slots and logs unknown crops to unknown_cards/.
         """
         h, w = frame.shape[:2]
         hand_ids: List[int] = []
+        now = time.time()
 
         for slot_idx, box in enumerate(HAND_SLOTS):
             bx1, by1, bx2, by2 = box
@@ -487,38 +568,74 @@ class ClashRoyaleDetector:
             pad_y = int(crop_h * 0.12)
             card_crop = frame[y1 + pad_y:y2 - pad_y, x1 + pad_x:x2 - pad_x]
 
-            if card_crop.size == 0 or float(np.std(card_crop)) < 4.0:
+            if card_crop.size == 0 or float(np.std(card_crop)) < 12.0:
+                self._last_known_hand_ids[slot_idx] = 0
+                self._last_known_hand_ts[slot_idx] = 0.0
                 hand_ids.append(0)
                 continue
 
             card_crop_std = cv2.resize(card_crop, (64, 64), interpolation=cv2.INTER_AREA)
             card_crop_gray = cv2.cvtColor(card_crop_std, cv2.COLOR_BGR2GRAY)
+            card_crop_clahe = self._clahe.apply(card_crop_gray)
 
             best_card_id = 0
-            best_score = 0.0
+            best_score = -1.0
 
-            # Match against templates of unlocked cards only (BGR + Grayscale for dimmed/cooldown cards)
+            # Match against templates of unlocked cards (full 64x64 + sliding 52x52 inner core)
             for cid in self.unlocked_cards:
                 if cid in self.card_templates:
                     for tmpl in self.card_templates[cid]:
                         res_bgr = cv2.matchTemplate(card_crop_std, tmpl, cv2.TM_CCOEFF_NORMED)
                         score_bgr = float(res_bgr[0, 0])
+
+                        # Inner 52x52 core sliding window tolerates ±6px vertical/horizontal shift in BlueStacks
+                        tmpl_core_bgr = tmpl[6:58, 6:58]
+                        res_core_bgr = cv2.matchTemplate(card_crop_std, tmpl_core_bgr, cv2.TM_CCOEFF_NORMED)
+                        score_core_bgr = float(np.max(res_core_bgr))
+
                         tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
                         res_gray = cv2.matchTemplate(card_crop_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
                         score_gray = float(res_gray[0, 0])
-                        score = max(score_bgr, 0.92 * score_gray)
+
+                        tmpl_core_gray = tmpl_gray[6:58, 6:58]
+                        res_core_gray = cv2.matchTemplate(card_crop_gray, tmpl_core_gray, cv2.TM_CCOEFF_NORMED)
+                        score_core_gray = float(np.max(res_core_gray))
+
+                        tmpl_clahe = self._clahe.apply(tmpl_gray)
+                        res_clahe = cv2.matchTemplate(card_crop_clahe, tmpl_clahe[6:58, 6:58], cv2.TM_CCOEFF_NORMED)
+                        score_clahe = float(np.max(res_clahe))
+
+                        score = max(
+                            score_bgr,
+                            0.96 * score_core_bgr,
+                            0.92 * score_gray,
+                            0.90 * score_core_gray,
+                            0.88 * score_clahe,
+                        )
                         if score > best_score:
                             best_score = score
                             best_card_id = cid
 
-            if best_score >= 0.40:
+            min_threshold = 0.16 if force_best_match else 0.30
+            if best_score >= min_threshold and best_card_id > 0:
+                self._last_known_hand_ids[slot_idx] = best_card_id
+                self._last_known_hand_ts[slot_idx] = now
                 hand_ids.append(best_card_id)
+            elif (
+                self._last_known_hand_ids[slot_idx] > 0
+                and (now - self._last_known_hand_ts[slot_idx]) < 8.0
+                and best_score >= 0.20
+            ):
+                # Retain temporally locked card during brief elixir flash / cooldown wipe
+                hand_ids.append(self._last_known_hand_ids[slot_idx])
             else:
-                # Log unknown crop for template expansion
-                ts = int(time.time() * 1000)
-                unknown_path = os.path.join(self.unknown_cards_dir, f"unknown_slot{slot_idx}_{ts}.png")
-                cv2.imwrite(unknown_path, card_crop)
-                hand_ids.append(0)  # unknown: never guess a card (guesses corrupt cost masks + hand embeddings)
+                # Throttle unknown crop logging to at most once every 5s per slot
+                if now - self._last_unknown_log_ts[slot_idx] >= 5.0:
+                    self._last_unknown_log_ts[slot_idx] = now
+                    ts = int(now * 1000)
+                    unknown_path = os.path.join(self.unknown_cards_dir, f"unknown_slot{slot_idx}_{ts}.png")
+                    cv2.imwrite(unknown_path, card_crop)
+                hand_ids.append(0)
 
         return hand_ids
 

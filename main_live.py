@@ -253,8 +253,20 @@ class CRZeroLiveAgent:
 
                 scalars = obs["scalars"]
                 legal_card_mask = obs["legal_card_mask"].copy()
-                hand_ids = obs["hand_ids"]
+                hand_ids = list(obs["hand_ids"])
                 elixir = obs["elixir"]
+
+                if 0 in hand_ids:
+                    forced_hand = self.detector.read_hand_cards(frame, force_best_match=True)
+                    hand_ids = [
+                        hand_ids[i] if (i < len(hand_ids) and hand_ids[i] > 0) else forced_hand[i]
+                        for i in range(4)
+                    ]
+                    for i in range(4):
+                        cid = hand_ids[i]
+                        if cid > 0:
+                            c_cost = CARD_ID_TO_COST.get(cid, 99)
+                            legal_card_mask[i + 1] = (c_cost <= elixir)
 
                 # No-Wait guard at elixir == 10: force playing a card so elixir is not wasted
                 if elixir >= 9.8 and legal_card_mask[1:].any():
