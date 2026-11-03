@@ -1,5 +1,5 @@
 """
-State encoder for Clash Royale board state.
+State encoder and opponent intelligence tracker for Clash Royale board state.
 
 All card IDs are GLOBAL ``CARD_DATABASE`` IDs. There is no separate local deck
 vocabulary. Outputs:
@@ -27,14 +27,17 @@ from configs.constants import (
     screen_to_grid,
     get_default_deployable_mask,
 )
+from configs.card_features import (
+    get_card_roles,
+    get_intrinsic_danger,
+)
 from configs.meta_decks import identify_meta_deck
 from configs.observation_schema import Ch, Sc
 
 
-
 @dataclass
 class Detection:
-    """Represents one detection from YOLO or template matching with ByteTrack tracking."""
+    """Represents one detection from YOLO or template/CV matching with tracking."""
 
     x1: float
     y1: float
@@ -51,22 +54,24 @@ class Detection:
 
 class OpponentTracker:
     """
-    Advanced real-time tracker for opponent:
+    Advanced real-time intelligence tracker for the opponent:
     1. Elixir tracking: dynamic rate (single/double/triple), tracking elixir leaked at 10.0.
-    2. Card cycle tracking: tracks exact rotation history.
+    2. Card cycle tracking: tracks exact rotation history and total cards played.
        - Each played card enters position 4 (needs 4 other cards before returning).
        - Tracks which 4 cards are currently estimated to be IN HAND.
-    3. Next-card prediction: ranks affordable cards in hand by threat level / cycle efficiency.
-    4. Meta Deck Identification: matches revealed cards against competitive archetype signatures
-       (2.6 Hog, Log Bait, Golem Beatdown, Pekka Bridge Spam, Lavaloon, X-Bow, etc.),
-       predicts remaining unrevealed cards, and provides tailored counter-strategies.
-    5. Formats live HUD & console intelligence reports.
+    3. Spatial placement memory & next-placement prediction:
+       - Learns opponent lane bias (left vs right) and deployment depth habits.
+       - Predicts exact (tile_y, tile_x) where the opponent will deploy their next threat.
+    4. Counter reservation advisories:
+       - Signals when to hold Arrows (vs Goblin Barrel / Swarm), Mini P.E.K.K.A (vs Hog / Giant / Tank),
+         or Musketeer / Archers (vs Balloon / Air).
+    5. Meta Deck Identification: matches revealed cards against competitive archetype signatures.
     """
     def __init__(self, initial_elixir: float = 5.0):
         self.enemy_elixir = float(initial_elixir)
         self.last_update_time = time.time()
         self.seen_track_ids: Set[int] = set()
-        self.seen_cards: List[int] = []  # Unique cards identified in opponent deck
+        self.seen_cards: List[int] = []  # Unique cards identified in opponent deck (max 8)
         self.active_tracks: Dict[int, Dict[str, Any]] = {}
         self.total_elixir_spent: int = 0
         self.elixir_leaked: float = 0.0
@@ -74,6 +79,12 @@ class OpponentTracker:
         # Card cycle rotation tracking
         self.play_history: List[int] = []  # Chronological order of opponent card plays
         self.card_last_play_idx: Dict[int, int] = {}  # cid -> index in play_history
+
+        # Spatial placement memory for predicting opponent habits
+        self.spatial_play_history: List[Dict[str, Any]] = []
+        self.left_lane_plays: int = 0
+        self.right_lane_plays: int = 0
+        self._recent_untracked_spawns: List[Tuple[float, int, int, int]] = []  # (time, gy, gx, cid)
 
     def reset(self, initial_elixir: float = 5.0):
         """Resets tracker state at the beginning of a match."""
@@ -86,6 +97,56 @@ class OpponentTracker:
         self.elixir_leaked = 0.0
         self.play_history.clear()
         self.card_last_play_idx.clear()
+        self.spatial_play_history.clear()
+        self.left_lane_plays = 0
+        self.right_lane_plays = 0
+        self._recent_untracked_spawns.clear()
+
+    def _register_card_play(
+        self,
+        cid: int,
+        current_time: float,
+        grid_pos: Optional[Tuple[int, int]] = None,
+        track_id: Optional[int] = None,
+    ):
+        """Records a confirmed opponent card play, deducts cost, and updates cycle & spatial memory."""
+        cost = CARD_ID_TO_COST.get(cid, 3) if cid > 0 else 3
+        self.enemy_elixir = max(0.0, self.enemy_elixir - cost)
+        self.total_elixir_spent += cost
+
+        if cid > 0:
+            play_idx = len(self.play_history)
+            self.play_history.append(cid)
+            self.card_last_play_idx[cid] = play_idx
+
+            if cid not in self.seen_cards and len(self.seen_cards) < 8:
+                self.seen_cards.append(cid)
+
+        gy, gx = grid_pos if grid_pos is not None else (14, 14)
+        if gx < 9:
+            self.left_lane_plays += 1
+            lane = "left"
+        else:
+            self.right_lane_plays += 1
+            lane = "right"
+
+        self.spatial_play_history.append({
+            "cls_id": cid,
+            "time": current_time,
+            "tile_y": gy,
+            "tile_x": gx,
+            "lane": lane,
+            "cost": cost,
+        })
+
+        if track_id is not None:
+            self.active_tracks[track_id] = {
+                "cls_id": cid,
+                "spawn_time": current_time,
+                "cost": cost,
+                "tile_y": gy,
+                "tile_x": gx,
+            }
 
     def update(
         self,
@@ -96,6 +157,8 @@ class OpponentTracker:
     ) -> float:
         """
         Updates opponent elixir and registers any newly spawned units.
+        Supports both ByteTrack track_id detections and spatial-temporal deduplication
+        when track_id is absent.
         """
         # 1. Passive regeneration over dt
         dt = max(0.0, current_time - self.last_update_time)
@@ -115,33 +178,36 @@ class OpponentTracker:
         else:
             self.enemy_elixir = potential_elixir
 
+        # Prune old untracked spawn memory (> 4.5s old)
+        self._recent_untracked_spawns = [
+            s for s in self._recent_untracked_spawns if (current_time - s[0]) <= 4.5
+        ]
+
         # 2. Check for newly spawned enemy tracks
         for d in enemy_detections:
             if d.is_ally:
                 continue
             tid = d.track_id
-            cid = d.cls_id
+            cid = int(d.cls_id)
+            grid_pos = screen_to_grid((d.x1 + d.x2) / 2.0, d.y2)
 
             if tid is not None and cid > 0:
                 if tid not in self.seen_track_ids:
                     self.seen_track_ids.add(tid)
-                    cost = CARD_ID_TO_COST.get(cid, 3)
-                    self.enemy_elixir = max(0.0, self.enemy_elixir - cost)
-                    self.total_elixir_spent += cost
-
-                    # Record play in cycle history
-                    play_idx = len(self.play_history)
-                    self.play_history.append(cid)
-                    self.card_last_play_idx[cid] = play_idx
-
-                    if cid not in self.seen_cards and len(self.seen_cards) < 8:
-                        self.seen_cards.append(cid)
-
-                    self.active_tracks[tid] = {
-                        "cls_id": cid,
-                        "spawn_time": current_time,
-                        "cost": cost,
-                    }
+                    self._register_card_play(cid, current_time, grid_pos=grid_pos, track_id=tid)
+                elif tid in self.active_tracks and grid_pos is not None:
+                    self.active_tracks[tid]["tile_y"] = grid_pos[0]
+                    self.active_tracks[tid]["tile_x"] = grid_pos[1]
+            elif tid is None and cid > 0 and grid_pos is not None:
+                gy, gx = grid_pos
+                # Check if this unit matches a recently seen untracked spawn within 4 tiles
+                already_seen = any(
+                    (s_cid == cid and abs(gy - s_gy) <= 4 and abs(gx - s_gx) <= 3)
+                    for (_, s_gy, s_gx, s_cid) in self._recent_untracked_spawns
+                )
+                if not already_seen:
+                    self._recent_untracked_spawns.append((current_time, gy, gx, cid))
+                    self._register_card_play(cid, current_time, grid_pos=grid_pos, track_id=None)
 
         return float(np.clip(self.enemy_elixir, 0.0, 10.0))
 
@@ -151,7 +217,17 @@ class OpponentTracker:
 
     def get_normalized_elixir(self) -> float:
         """Returns normalized enemy elixir [0.0..1.0] for model scalars[1]."""
-        return float(np.clip(self.enemy_elixir / 10.0, 0.0, 1.0))
+        return float(np.clip(self.enemy_elixir / 10.0, 0.0, 10.0))
+
+    def get_cards_played_count(self) -> int:
+        """Returns total number of cards the opponent has played in the current match."""
+        return len(self.play_history)
+
+    def get_favored_lane(self) -> str:
+        """Returns 'left' or 'right' based on opponent's observed placement history."""
+        if self.left_lane_plays > self.right_lane_plays:
+            return "left"
+        return "right"
 
     def get_card_cycle_distance(self, cid: int) -> int:
         """
@@ -206,6 +282,92 @@ class OpponentTracker:
                 })
         return sorted(queue, key=lambda x: x["plays_away"])
 
+    def predict_opponent_placement(self, card_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Predicts where the opponent is most likely to place their next card based on
+        their card cycle, elixir, card combat role, and observed lane preferences.
+        """
+        favored_lane = self.get_favored_lane()
+        lane_x = 3 if favored_lane == "left" else 14
+
+        if card_id is None:
+            next_preds = self.predict_next_card()
+            if next_preds:
+                card_id = next_preds[0]["id"]
+            else:
+                card_id = 0
+
+        cid = int(card_id or 0)
+        roles = get_card_roles(cid)
+
+        # Look for historical placement of this exact card by the opponent
+        prev_for_card = [p for p in self.spatial_play_history if p["cls_id"] == cid]
+        if prev_for_card:
+            last_p = prev_for_card[-1]
+            pred_y, pred_x = int(last_p["tile_y"]), int(last_p["tile_x"])
+            zone = f"{last_p['lane']}_custom"
+        elif cid in (12, 55, 113, 16):  # Goblin Barrel, Miner, Goblin Drill, Graveyard -> direct on our tower
+            pred_y, pred_x = 24, lane_x
+            zone = f"ally_princess_{favored_lane}"
+        elif "tank" in roles and CARD_ID_TO_COST.get(cid, 4) >= 6:
+            # Heavy tank (Golem, Lava Hound, P.E.K.K.A) -> usually started in back when elixir is high
+            pred_y, pred_x = (4, 7 if favored_lane == "left" else 10) if self.enemy_elixir >= 7.0 else (14, lane_x)
+            zone = f"back_{favored_lane}" if self.enemy_elixir >= 7.0 else f"bridge_{favored_lane}"
+        elif "win_condition" in roles or "fast" in roles or cid in (51, 59, 69, 74, 81, 110, 109):
+            # Hog Rider, Battle Ram, Bandit, X-Bow, Mortar -> bridge placement
+            pred_y, pred_x = 15, lane_x
+            zone = f"bridge_{favored_lane}"
+        else:
+            pred_y, pred_x = 14, lane_x
+            zone = f"bridge_{favored_lane}"
+
+        return {
+            "card_id": cid,
+            "card_name": CARD_ID_TO_NAME.get(cid, "Unknown"),
+            "predicted_tile": (pred_y, pred_x),
+            "zone": zone,
+            "favored_lane": favored_lane,
+        }
+
+    def get_counter_hold_flags(self) -> Dict[str, Any]:
+        """
+        Determines which counters the bot should hold in reserve based on the
+        opponent's currently tracked hand and next-up cycle card.
+        """
+        near_cycle_ids: Set[int] = set()
+        for cid in self.seen_cards:
+            if self.get_card_cycle_distance(cid) <= 1:
+                near_cycle_ids.add(cid)
+
+        meta = self.get_meta_deck()
+        if meta.get("confidence", 0.0) >= 0.6:
+            for u_cid in meta.get("predicted_unrevealed_cards", [])[:2]:
+                near_cycle_ids.add(int(u_cid))
+
+        hold_small_spell = False
+        hold_tank_killer = False
+        hold_anti_air = False
+        avoid_ground_swarm = False
+
+        for cid in near_cycle_ids:
+            roles = get_card_roles(cid)
+            if "spell_bait" in roles or cid in (12, 31, 44, 64, 49):
+                hold_small_spell = True
+            if "tank" in roles or "building_targeter" in roles or cid in (24, 51, 37, 25, 78, 108, 53):
+                hold_tank_killer = True
+            if "air_unit" in roles or cid in (46, 54, 29, 44, 60):
+                hold_anti_air = True
+            if "splash" in roles or "small_spell" in roles:
+                avoid_ground_swarm = True
+
+        return {
+            "hold_small_spell": hold_small_spell,
+            "hold_tank_killer": hold_tank_killer,
+            "hold_anti_air": hold_anti_air,
+            "avoid_ground_swarm": avoid_ground_swarm,
+            "near_cycle_ids": sorted(near_cycle_ids),
+        }
+
     def predict_next_card(self) -> List[Dict[str, Any]]:
         """
         Predicts which cards the opponent is most likely to play next.
@@ -220,11 +382,12 @@ class OpponentTracker:
             cost = card_info["cost"]
             affordable = card_info["affordable"]
 
-            # Threat score: higher for win conditions & direct damage
+            danger = get_intrinsic_danger(cid)
             is_win_con = cid in (24, 51, 12, 37, 25, 46, 110, 109, 108, 93, 113)
-            urgency = 2.0 if is_win_con else (1.5 if cost <= 3 else 1.0)
+            urgency = 2.0 if is_win_con else (1.5 if cost <= 3 else 1.0 + danger * 0.05)
             score = (10.0 if affordable else 2.0) * urgency
 
+            placement = self.predict_opponent_placement(cid)
             candidates.append({
                 "id": cid,
                 "name": card_info["name"],
@@ -233,12 +396,15 @@ class OpponentTracker:
                 "in_hand": True,
                 "confidence": round(min(1.0, score / 15.0), 2),
                 "is_revealed": True,
+                "predicted_tile": placement["predicted_tile"],
+                "predicted_zone": placement["zone"],
             })
 
         # 2. Predicted unrevealed cards from matched meta deck
         for cid in meta.get("predicted_unrevealed_cards", []):
             cost = CARD_ID_TO_COST.get(cid, 3)
             affordable = bool(cost <= self.enemy_elixir)
+            placement = self.predict_opponent_placement(cid)
             candidates.append({
                 "id": cid,
                 "name": CARD_ID_TO_NAME.get(cid, f"Card_{cid}"),
@@ -247,6 +413,8 @@ class OpponentTracker:
                 "in_hand": False,  # candidate unrevealed
                 "confidence": round(meta.get("confidence", 0.5) * 0.7, 2),
                 "is_revealed": False,
+                "predicted_tile": placement["predicted_tile"],
+                "predicted_zone": placement["zone"],
             })
 
         return sorted(candidates, key=lambda x: (x["affordable"], x["confidence"]), reverse=True)
@@ -261,11 +429,13 @@ class OpponentTracker:
         return {
             "estimated_elixir": round(self.enemy_elixir, 1),
             "elixir_leaked": round(self.elixir_leaked, 1),
+            "cards_played_count": len(self.play_history),
             "seen_cards_count": len(self.seen_cards),
             "seen_card_ids": list(self.seen_cards),
             "seen_card_names": [CARD_ID_TO_NAME.get(cid, f"Card_{cid}") for cid in self.seen_cards],
             "total_elixir_spent": self.total_elixir_spent,
             "active_tracks_count": len(self.active_tracks),
+            "favored_lane": self.get_favored_lane(),
             "archetype": meta.get("archetype", "Unknown"),
             "matched_deck": meta.get("matched_deck_name", "Unknown"),
             "confidence": meta.get("confidence", 0.0),
@@ -277,7 +447,9 @@ class OpponentTracker:
         return {
             "elixir": round(self.enemy_elixir, 1),
             "elixir_leaked": round(self.elixir_leaked, 1),
+            "cards_played_count": len(self.play_history),
             "revealed_count": f"{len(self.seen_cards)}/8",
+            "favored_lane": self.get_favored_lane(),
             "seen_cards": [
                 {
                     "id": cid,
@@ -291,6 +463,7 @@ class OpponentTracker:
             "estimated_hand": self.get_estimated_hand(),
             "cycle_queue": self.get_cycle_queue(),
             "next_card_predictions": self.predict_next_card()[:4],
+            "counter_holds": self.get_counter_hold_flags(),
             "meta_deck": meta,
         }
 
@@ -299,14 +472,17 @@ class OpponentTracker:
         meta = self.get_meta_deck()
         e_hand = [f"{c['name']}({c['cost']})" for c in self.get_estimated_hand()]
         q_cards = [f"{c['name']} ({c['plays_away']} away)" for c in self.get_cycle_queue()]
-        preds = [f"{p['name']} ({'AFFORDABLE' if p['affordable'] else 'saving'})" for p in self.predict_next_card()[:3]]
+        preds = [
+            f"{p['name']} @ {p.get('predicted_zone', 'bridge')} ({'AFFORDABLE' if p['affordable'] else 'saving'})"
+            for p in self.predict_next_card()[:3]
+        ]
 
         lines = [
-            f"[OPPONENT INTEL] Elixir: {self.enemy_elixir:.1f}/10.0 (Leaked: {self.elixir_leaked:.1f}) | Archetype: {meta['matched_deck_name']} ({int(meta['confidence']*100)}%)",
+            f"[OPPONENT INTEL] Elixir: {self.enemy_elixir:.1f}/10.0 (Spent: {self.total_elixir_spent}, Plays: {len(self.play_history)}) | Archetype: {meta['matched_deck_name']} ({int(meta['confidence']*100)}%)",
             f"  -> Revealed ({len(self.seen_cards)}/8): {', '.join([CARD_ID_TO_NAME.get(c, str(c)) for c in self.seen_cards]) if self.seen_cards else 'None'}",
             f"  -> Estimated In Hand: {', '.join(e_hand) if e_hand else 'Waiting for rotation'}",
             f"  -> Cycling Back: {', '.join(q_cards) if q_cards else 'All in rotation'}",
-            f"  -> Next Play Threat: {', '.join(preds) if preds else 'Unknown'}",
+            f"  -> Next Play & Placement Prediction: {', '.join(preds) if preds else 'Unknown'}",
             f"  -> Counter Strategy: {meta.get('counter_strategy', 'None')}",
         ]
         return "\n".join(lines)

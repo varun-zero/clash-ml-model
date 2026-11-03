@@ -94,10 +94,10 @@ class CRZeroLiveAgent:
         )
         self.encoder = StateEncoder()
 
-        # 3. Decision Policy Model (RuleBot or DeckConditionedPolicy)
+        # 3. Decision Policy Model (RuleBot + optional DeckConditionedPolicy)
+        self.rule_bot = RuleBotPolicy()
         if self.use_rule_bot:
-            print("[CR-Zero] Running with RuleBot heuristic strategy engine.")
-            self.rule_bot = RuleBotPolicy()
+            print("[CR-Zero] Running with Human-Like Tactical RuleBot strategy engine.")
             self.policy = None
         else:
             if not checkpoint_path or not os.path.exists(checkpoint_path):
@@ -120,7 +120,7 @@ class CRZeroLiveAgent:
             adb_path=adb_path,
             screen_width=screen_width,
             screen_height=screen_height,
-            tap_delay_ms=40,
+            tap_delay_ms=80,
             action_cooldown_sec=action_cooldown_sec,
             max_actions=max_actions,
             dry_run=dry_run,
@@ -188,6 +188,7 @@ class CRZeroLiveAgent:
 
                 # Handle Result Screen & Match Shard Logging
                 if screen_state == "result":
+                    result_meta = self.detector.read_match_result(frame)
                     # Drain any pending plays that finished right as the battle concluded
                     if self.log_dir:
                         for ack in self.adb.get_completed_actions():
@@ -273,9 +274,10 @@ class CRZeroLiveAgent:
                         hand_card_ids=hand_ids,
                         legal_card_mask=legal_card_mask,
                         detections=obs.get("detections"),
+                        opponent_tracker=obs.get("opponent_tracker"),
                     )
                 else:
-                    # Neural policy evaluation
+                    # Neural policy evaluation with tactical sanity guardrails
                     grid_tensor = torch.from_numpy(stacked_grid).unsqueeze(0).to(self.torch_device)
                     scalar_tensor = torch.from_numpy(scalars).unsqueeze(0).to(self.torch_device)
                     hand_tensor = torch.tensor([hand_ids], dtype=torch.long, device=self.torch_device)
@@ -313,6 +315,18 @@ class CRZeroLiveAgent:
                             temperature=self.temperature,
                         )
 
+                    # 3. Validate against wasted corner spells and ignored CRITICAL threats
+                    chosen_slot, chosen_tile, _ = self.rule_bot.validate_or_override_action(
+                        chosen_slot=chosen_slot,
+                        chosen_tile=chosen_tile,
+                        arena_grid=stacked_grid,
+                        scalars=scalars,
+                        hand_card_ids=hand_ids,
+                        legal_card_mask=legal_card_mask,
+                        detections=obs.get("detections"),
+                        opponent_tracker=obs.get("opponent_tracker"),
+                    )
+
                 dt_pol = (time.perf_counter() - t_pol0) * 1000.0
 
                 # Step 4: Dispatch action via ADB
@@ -346,7 +360,10 @@ class CRZeroLiveAgent:
                     if sent:
                         aid = self.adb.get_last_action_id()
                         played_tile_mask = self.encoder.get_legal_tile_mask(played_card_id, tower_hps=obs.get("tower_hps"))
-                        action_desc = f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) [Conf: {card_conf*100:.1f}%]"
+                        action_desc = (
+                            f"PLAY [{card_meta['name']}] (Slot {slot_idx}) -> Tile ({tile_y:02d}, {tile_x:02d}) "
+                            f"| {self.rule_bot.last_decision_reason}"
+                        )
                         last_action = (chosen_slot, chosen_tile)   # persists until the next accepted play
                         if self.log_dir:
                             pending_plays[aid] = {

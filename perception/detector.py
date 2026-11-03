@@ -1,8 +1,10 @@
 """
 YOLO and Vision Perception Pipeline for Clash Royale.
-Supports Ultralytics YOLO (PyTorch .pt), ONNX Runtime FP16, and Template Vision.
+Supports Ultralytics YOLO (PyTorch .pt), ONNX Runtime FP16, and Template/CV Vision.
 Features:
 - Single global card vocabulary with unlocked-cards template matching for hand slots.
+- Built-in CV arena unit & health-bar detector fallback when YOLO weights are not loaded,
+  ensuring the agent is never blind to enemy troops in --rule-bot mode.
 - Logs unknown hand crops to unknown_cards/ for active expansion.
 - Accurate HP bar ratio calculation (returns 0.0 for destroyed towers).
 - Match timer reading and double-elixir / overtime derivation.
@@ -39,7 +41,7 @@ from perception.state_encoder import StateEncoder, Detection, OpponentTracker
 
 class ClashRoyaleDetector:
     """
-    Perception engine wrapping YOLO detection, UI cropping, and board parsing.
+    Perception engine wrapping YOLO detection, CV fallback unit tracking, UI cropping, and board parsing.
     Restricted to the account's unlocked card vocabulary.
     """
     def __init__(
@@ -68,6 +70,7 @@ class ClashRoyaleDetector:
         # Opponent Elixir and Card-Cycle Tracker + Track Velocity History
         self.opponent_tracker = OpponentTracker()
         self.track_history: Dict[int, Tuple[float, float, float]] = {}
+        self._next_cv_track_id: int = 1000
         self._prev_screen_state = "menu"
         self._battle_t0: Optional[float] = None
 
@@ -132,6 +135,137 @@ class ClashRoyaleDetector:
         """Resets match-specific tracker state and velocity history."""
         self.opponent_tracker.reset()
         self.track_history.clear()
+        self._next_cv_track_id = 1000
+
+    def _assign_cv_track_id(self, cx: float, cy: float, is_ally: bool, now: float) -> Tuple[int, float, float]:
+        """Assigns a persistent track_id and computes (vx, vy) for CV-detected arena units."""
+        best_tid = None
+        best_dist = 0.085  # Normalized screen distance threshold (~45px)
+
+        # Offset ally vs enemy track IDs so they never collide
+        id_min = 5000 if is_ally else 1000
+        id_max = 9000 if is_ally else 4999
+
+        for tid, (px, py, pt) in list(self.track_history.items()):
+            if not (id_min <= tid <= id_max):
+                continue
+            if now - pt > 2.5:
+                del self.track_history[tid]
+                continue
+            dist = float(np.hypot(cx - px, cy - py))
+            if dist < best_dist:
+                best_dist = dist
+                best_tid = tid
+
+        if best_tid is not None:
+            px, py, pt = self.track_history[best_tid]
+            dt = max(1e-3, now - pt)
+            vx = float(np.clip((cx - px) / dt, -0.5, 0.5))
+            vy = float(np.clip((cy - py) / dt, -0.5, 0.5))
+            self.track_history[best_tid] = (cx, cy, now)
+            return best_tid, vx, vy
+
+        new_tid = self._next_cv_track_id
+        self._next_cv_track_id += 1
+        if self._next_cv_track_id > 4990:
+            self._next_cv_track_id = 1000
+        if is_ally:
+            new_tid += 4000
+        self.track_history[new_tid] = (cx, cy, now)
+        return new_tid, 0.0, 0.0
+
+    def _detect_units_cv(self, frame: np.ndarray) -> List[Detection]:
+        """
+        Computer-vision arena troop & health-bar detector fallback when YOLO weights are absent.
+        Detects enemy (red health bars / level badges / troop markers) and ally (blue health bars / troop markers)
+        inside ARENA_BOX while masking out static towers, river water, and bridges.
+        """
+        h, w = frame.shape[:2]
+        if h == 0 or w == 0:
+            return []
+
+        ax1, ay1, ax2, ay2 = ARENA_BOX
+        x1, y1 = int(ax1 * w), int(ay1 * h)
+        x2, y2 = int(ax2 * w), int(ay2 * h)
+        arena_roi = frame[y1:y2, x1:x2]
+        if arena_roi.size == 0:
+            return []
+
+        hsv = cv2.cvtColor(arena_roi, cv2.COLOR_BGR2HSV)
+
+        # Enemy red mask (health bars, level badges, red unit bodies)
+        red_m1 = cv2.inRange(hsv, np.array([0, 110, 110]), np.array([8, 255, 255]))
+        red_m2 = cv2.inRange(hsv, np.array([170, 110, 110]), np.array([180, 255, 255]))
+        enemy_mask = red_m1 | red_m2
+
+        # Ally blue mask (ally health bars, blue level badges, blue unit bodies)
+        ally_mask = cv2.inRange(hsv, np.array([100, 110, 110]), np.array([132, 255, 255]))
+
+        # Mask out the 6 static tower regions + HP bars + river/bridges so towers are never confused with troops
+        exclusion_boxes = list(TOWER_BOXES.values()) + list(TOWER_HP_BOXES.values())
+        # Also mask out the river strip (norm y 0.405..0.455) where blue water / brown bridges sit
+        exclusion_boxes.append((0.0, 0.405, 1.0, 0.456))
+
+        for ebx1, eby1, ebx2, eby2 in exclusion_boxes:
+            rx1 = max(0, int(ebx1 * w) - x1 - 4)
+            ry1 = max(0, int(eby1 * h) - y1 - 4)
+            rx2 = min(x2 - x1, int(ebx2 * w) - x1 + 4)
+            ry2 = min(y2 - y1, int(eby2 * h) - y1 + 4)
+            if rx2 > rx1 and ry2 > ry1:
+                enemy_mask[ry1:ry2, rx1:rx2] = 0
+                ally_mask[ry1:ry2, rx1:rx2] = 0
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        enemy_mask = cv2.morphologyEx(enemy_mask, cv2.MORPH_CLOSE, kernel)
+        ally_mask = cv2.morphologyEx(ally_mask, cv2.MORPH_CLOSE, kernel)
+
+        now = time.time()
+        cv_detections: List[Detection] = []
+
+        for is_ally, mask in [(False, enemy_mask), (True, ally_mask)]:
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < 24 or area > (w * h * 0.08):
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                abs_x1 = (x1 + bx) / float(w)
+                abs_y1 = (y1 + by) / float(h)
+                abs_x2 = (x1 + bx + bw) / float(w)
+                # If the detected region is a thin horizontal health bar, project foot_y slightly below the bar
+                is_thin_bar = (bw > bh * 2.2) and (bh < 14)
+                foot_offset = 0.028 if is_thin_bar else 0.0
+                abs_y2 = min(ay2 - 0.002, (y1 + by + bh) / float(h) + foot_offset)
+
+                cx = (abs_x1 + abs_x2) / 2.0
+                cy = abs_y2
+
+                tid, vx, vy = self._assign_cv_track_id(cx, cy, is_ally, now)
+                # Assign representative global card ID based on footprint size so OpponentTracker tracks costs
+                if area > 1200:
+                    est_cid = 24  # Tank-sized footprint (Giant)
+                elif is_ally:
+                    est_cid = 21  # Ally troop (Archers/Knight)
+                else:
+                    est_cid = 20  # Enemy ground troop (Knight-class)
+
+                cv_detections.append(
+                    Detection(
+                        x1=float(abs_x1),
+                        y1=float(abs_y1),
+                        x2=float(abs_x2),
+                        y2=float(abs_y2),
+                        confidence=0.75,
+                        cls_id=est_cid,
+                        is_ally=is_ally,
+                        category="ground",
+                        track_id=tid,
+                        vx=vx,
+                        vy=vy,
+                    )
+                )
+
+        return cv_detections
 
     def detect_raw(self, frame: np.ndarray) -> List[Detection]:
         """Runs object detection with ByteTrack tracking on the frame and returns Detection objects."""
@@ -211,6 +345,10 @@ class ClashRoyaleDetector:
                             vy=vy,
                         )
                     )
+        else:
+            # Fallback to CV arena troop & health-bar detector when YOLO weights are not provided
+            detections = self._detect_units_cv(frame)
+
         return detections
 
     def classify_screen_state(self, frame: np.ndarray) -> str:
@@ -308,7 +446,7 @@ class ClashRoyaleDetector:
         }
 
     def read_elixir(self, frame: np.ndarray) -> float:
-        """Reads elixir value (0.0 to 10.0) from pink bar."""
+        """Reads elixir value (0.0 to 10.0) from pink/magenta bar."""
         h, w = frame.shape[:2]
         bx1, by1, bx2, by2 = ELIXIR_BAR_BOX
         x1, y1 = int(bx1 * w), int(by1 * h)
@@ -319,10 +457,11 @@ class ClashRoyaleDetector:
             return 5.0
 
         hsv = cv2.cvtColor(bar_crop, cv2.COLOR_BGR2HSV)
-        pink_mask = cv2.inRange(hsv, np.array([135, 70, 70]), np.array([170, 255, 255]))
+        # Include standard pink/magenta and bright full-bar shimmer
+        pink_mask = cv2.inRange(hsv, np.array([130, 55, 70]), np.array([175, 255, 255]))
 
         col_sums = np.sum(pink_mask > 0, axis=0)
-        filled_cols = np.sum(col_sums > (bar_crop.shape[0] * 0.20))
+        filled_cols = np.sum(col_sums > (bar_crop.shape[0] * 0.18))
         ratio = filled_cols / float(bar_crop.shape[1])
         elixir = float(np.clip(ratio * 10.0, 0.0, 10.0))
         return elixir
@@ -348,21 +487,26 @@ class ClashRoyaleDetector:
             pad_y = int(crop_h * 0.12)
             card_crop = frame[y1 + pad_y:y2 - pad_y, x1 + pad_x:x2 - pad_x]
 
-            if card_crop.size == 0:
+            if card_crop.size == 0 or float(np.std(card_crop)) < 4.0:
                 hand_ids.append(0)
                 continue
 
             card_crop_std = cv2.resize(card_crop, (64, 64), interpolation=cv2.INTER_AREA)
+            card_crop_gray = cv2.cvtColor(card_crop_std, cv2.COLOR_BGR2GRAY)
 
             best_card_id = 0
             best_score = 0.0
 
-            # Match against templates of unlocked cards only
+            # Match against templates of unlocked cards only (BGR + Grayscale for dimmed/cooldown cards)
             for cid in self.unlocked_cards:
                 if cid in self.card_templates:
                     for tmpl in self.card_templates[cid]:
-                        res = cv2.matchTemplate(card_crop_std, tmpl, cv2.TM_CCOEFF_NORMED)
-                        score = float(res[0, 0])
+                        res_bgr = cv2.matchTemplate(card_crop_std, tmpl, cv2.TM_CCOEFF_NORMED)
+                        score_bgr = float(res_bgr[0, 0])
+                        tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+                        res_gray = cv2.matchTemplate(card_crop_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                        score_gray = float(res_gray[0, 0])
+                        score = max(score_bgr, 0.92 * score_gray)
                         if score > best_score:
                             best_score = score
                             best_card_id = cid

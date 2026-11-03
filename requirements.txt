@@ -6,11 +6,12 @@ torchvision>=0.17.0
 
 # Numerical & Vision
 numpy>=1.24.0,<2.5.0
-opencv-python>=4.8.0
+opencv-python>=4.8.0; sys_platform == 'win32'
+opencv-python-headless>=4.8.0; sys_platform != 'win32'
 ultralytics>=8.1.0
 
 # Windows High-Performance Screen Capture
-dxcam>=0.1.1
+dxcam>=0.1.1; sys_platform == 'win32'
 mss>=9.0.1
 
 # YouTube Scraping & Trajectory Reconstruction
@@ -26,8 +27,10 @@ huggingface_hub
 
 # Inference Engine & Export
 onnx>=1.15.0
-onnxruntime-gpu>=1.17.0
+onnxruntime-gpu>=1.17.0; sys_platform == 'win32'
+onnxruntime>=1.17.0; sys_platform != 'win32'
 
 # Testing & Dev
 pytest
+
 

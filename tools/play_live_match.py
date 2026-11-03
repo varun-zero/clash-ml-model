@@ -62,7 +62,7 @@ class LiveMatchRunner:
             device_address=device_address,
             screen_width=540,
             screen_height=960,
-            tap_delay_ms=40,
+            tap_delay_ms=80,
             action_cooldown_sec=0.8,
             dry_run=dry_run,
         )
@@ -167,6 +167,7 @@ class LiveMatchRunner:
         # Hybrid Elixir Tracking: starts at 5.0, tracks passive regen and action spending
         elixir_est = 5.0
         last_elixir_update_time = time.time()
+        pending_slot_verify: Optional[Dict[str, Any]] = None
 
         target_dt = 0.20  # 5 Hz loop
         match_start_time = time.time()
@@ -195,10 +196,20 @@ class LiveMatchRunner:
             if len(tower_hps) >= 6:
                 last_tower_hps = tower_hps
 
-            # 3. Hybrid Elixir Estimation
+            # 3. Hybrid Elixir Estimation & Unplayed Card Refund Guard
             now = time.time()
             dt_elixir = now - last_elixir_update_time
             last_elixir_update_time = now
+
+            if pending_slot_verify is not None and (now - pending_slot_verify["time"]) >= 1.1:
+                p_slot = pending_slot_verify["slot"]
+                p_cid = pending_slot_verify["card_id"]
+                p_cost = pending_slot_verify["cost"]
+                if p_slot < len(hand_ids) and hand_ids[p_slot] == p_cid and not self.dry_run:
+                    # Card is still in the exact same hand slot 1.1s later -> tap was not accepted in-game
+                    elixir_est = min(10.0, elixir_est + p_cost)
+                    print(f"[Runner] Card [{CARD_ID_TO_NAME.get(p_cid)}] still in Slot {p_slot}; refunded {p_cost} elixir estimate.")
+                pending_slot_verify = None
 
             # Regen rate: 1/2.8 normal, 1/1.4 in double elixir (after 2 min)
             is_double = (now - self.stats["start_time"]) >= 120.0
@@ -243,7 +254,7 @@ class LiveMatchRunner:
                 time.sleep(0.3)
                 continue
 
-            # 4. Decision & Action via RuleBot
+            # 4. Decision & Action via Human-Like Tactical RuleBot
             arena_grid = obs["arena_grid"]
             grid_history.append(arena_grid.copy())
             if len(grid_history) > 4:
@@ -273,6 +284,7 @@ class LiveMatchRunner:
                 hand_card_ids=hand_ids,
                 legal_card_mask=legal_card_mask,
                 detections=obs.get("detections"),
+                opponent_tracker=obs.get("opponent_tracker"),
             )
 
             # 5. Dispatch Action
@@ -288,9 +300,15 @@ class LiveMatchRunner:
 
                 success = self.adb.play_card(slot_idx, tile_y, tile_x, non_blocking=True)
                 if success:
-                    # Deduct cost from hybrid accumulator
+                    # Deduct cost from hybrid accumulator and register verification check
                     elixir_est = max(0.0, elixir_est - cost)
                     current_elixir = max(0.0, current_elixir - cost)
+                    pending_slot_verify = {
+                        "slot": slot_idx,
+                        "card_id": card_id,
+                        "cost": cost,
+                        "time": now,
+                    }
 
                     self.stats["actions_played"].append({
                         "time_sec": round(elapsed_match, 1),
@@ -300,12 +318,13 @@ class LiveMatchRunner:
                         "cost": cost,
                         "tile": (tile_y, tile_x),
                         "elixir_before": round(current_elixir + cost, 1),
+                        "reason": self.rule_bot.last_decision_reason,
                     })
                     self.stats["elixir_spent"] += cost
                     last_action = (chosen_slot, chosen_tile)
                     print(
                         f"[{elapsed_match:5.1f}s | Elixir: {current_elixir + cost:4.1f}] -> PLAY [{card_name}] (Slot {slot_idx}) "
-                        f"-> Tile ({tile_y:02d}, {tile_x:02d}) [Cost: {cost}]",
+                        f"-> Tile ({tile_y:02d}, {tile_x:02d}) [Cost: {cost}] | {self.rule_bot.last_decision_reason}",
                         flush=True
                     )
             else:
@@ -315,7 +334,8 @@ class LiveMatchRunner:
                     if tracker and tracker.seen_cards:
                         print("\n" + tracker.format_console_banner(), flush=True)
                     print(
-                        f"[{elapsed_match:5.1f}s | Elixir: {current_elixir:4.1f}] WAIT | Hand: {[CARD_ID_TO_NAME.get(c, str(c)) for c in hand_ids]}",
+                        f"[{elapsed_match:5.1f}s | Elixir: {current_elixir:4.1f}] {self.rule_bot.last_decision_reason} | "
+                        f"Hand: {[CARD_ID_TO_NAME.get(c, str(c)) for c in hand_ids]}",
                         flush=True
                     )
 

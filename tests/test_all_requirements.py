@@ -242,6 +242,88 @@ class TestCRZeroRequirements(unittest.TestCase):
             # Weights must reflect outcome (1.5 for win or 0.5 for loss)
             self.assertTrue((weights == 1.5).any() or (weights == 0.5).any())
 
+    def test_08_human_tactical_intelligence_and_spell_discipline(self):
+        """Verifies human-like threat assessment, counter selection, spell discipline, and cycle awareness."""
+        from perception.state_encoder import OpponentTracker
+        encoder = StateEncoder()
+        bot = RuleBotPolicy()
+        tracker = OpponentTracker(initial_elixir=6.0)
+
+        # 1. Threat level flagging (LOW, MID, HIGH, CRITICAL)
+        low_unit = [{"y": 5, "x": 3, "category": "ground", "cls_id": 30, "vy": 0.0, "vx": 0.0}]  # Skeletons in enemy back
+        high_unit = [{"y": 19, "x": 3, "category": "ground", "cls_id": 51, "vy": 0.05, "vx": 0.0}]  # Hog Rider on ally side
+        crit_unit = [{"y": 24, "x": 3, "category": "ground", "cls_id": 25, "vy": 0.0, "vx": 0.0}]  # PEKKA on ally tower
+
+        t_low = bot.assess_threats(low_unit, [1.0] * 6)[0]
+        t_high = bot.assess_threats(high_unit, [1.0] * 6)[0]
+        t_crit = bot.assess_threats(crit_unit, [1.0] * 6)[0]
+        self.assertEqual(t_low.threat_level, "LOW")
+        self.assertIn(t_high.threat_level, ("HIGH", "CRITICAL"))
+        self.assertEqual(t_crit.threat_level, "CRITICAL")
+
+        # 2. Tank Killer vs Hog Rider: Bot selects Mini P.E.K.K.A (26) instead of wasting Arrows (1) or Giant (24)
+        hog_det = [Detection(0.21, 0.49, 0.29, 0.56, 0.95, 51, False, "ground", track_id=201)]
+        hand_hog = [24, 1, 26, 2]  # Giant(24), Arrows(1), Mini P.E.K.K.A(26), Fireball(2)
+        grid_h, scalars_h, cmask_h = encoder.encode(hog_det, elixir=6.0, hand_card_ids=hand_hog, time_left=120.0)
+        slot_h, tile_h, _, _ = bot.predict_action(grid_h, scalars_h, hand_hog, cmask_h, detections=hog_det, opponent_tracker=tracker)
+        self.assertEqual(slot_h, 3)  # Slot 3 is index 2 -> Mini P.E.K.K.A (26)
+        self.assertGreaterEqual(tile_h // 18, 16)
+
+        # 3. Anti-Air vs Balloon: Bot selects Musketeer (27), never melee ground-only Knight/Mini P.E.K.K.A
+        balloon_det = [Detection(0.74, 0.48, 0.84, 0.55, 0.95, 46, False, "air", track_id=202)]
+        hand_air = [20, 26, 27, 24]  # Knight(20), Mini P.E.K.K.A(26), Musketeer(27), Giant(24)
+        grid_a, scalars_a, cmask_a = encoder.encode(balloon_det, elixir=6.0, hand_card_ids=hand_air, time_left=120.0)
+        slot_a, tile_a, _, _ = bot.predict_action(grid_a, scalars_a, hand_air, cmask_a, detections=balloon_det, opponent_tracker=tracker)
+        self.assertEqual(slot_a, 3)  # Slot 3 is index 2 -> Musketeer (27)
+
+        # 4. Strict Spell Discipline: Never cast spells on a solo tank or into corners (0, 0)
+        giant_det = [Detection(0.21, 0.50, 0.31, 0.58, 0.95, 24, False, "ground", track_id=203)]
+        hand_spells_only = [1, 2, 0, 0]  # Only Arrows and Fireball affordable
+        grid_s, scalars_s, cmask_s = encoder.encode(giant_det, elixir=5.0, hand_card_ids=hand_spells_only, time_left=120.0)
+        slot_s, tile_s, _, _ = bot.predict_action(grid_s, scalars_s, hand_spells_only, cmask_s, detections=giant_det, opponent_tracker=tracker)
+        self.assertEqual(slot_s, 0)  # Waits rather than wasting Arrows/Fireball on a solo full-HP Giant
+
+        # 5. Neural Spell Guardrail: Blocks neural policy from throwing Fireball at corner (0, 0) on empty arena
+        empty_grid, empty_scalars, empty_cmask = encoder.encode([], elixir=6.0, hand_card_ids=[2, 20, 21, 24], time_left=120.0)
+        safe_slot, safe_tile, reason = bot.validate_or_override_action(
+            chosen_slot=1,  # Fireball
+            chosen_tile=0,  # Corner (0, 0)
+            arena_grid=empty_grid,
+            scalars=empty_scalars,
+            hand_card_ids=[2, 20, 21, 24],
+            legal_card_mask=empty_cmask,
+            detections=[],
+            opponent_tracker=tracker,
+        )
+        self.assertEqual(safe_slot, 0)  # Overridden to WAIT because board is calm at 6.0 elixir
+        self.assertIn("SPELL GUARD OVERRIDE", reason)
+
+        # 6. Patient Elixir Banking at 6.0 Elixir vs Slow-Roll Behind King at 9.2 Elixir
+        hand_std = [24, 27, 20, 1]
+        grid_c, scalars_c, cmask_c = encoder.encode([], elixir=6.0, hand_card_ids=hand_std, time_left=130.0, est_enemy_elixir=0.6)
+        slot_calm, _, _, _ = bot.predict_action(grid_c, scalars_c, hand_std, cmask_c, detections=[], opponent_tracker=tracker)
+        self.assertEqual(slot_calm, 0)  # Banks elixir at 6.0 when board is calm
+
+        grid_full, scalars_full, cmask_full = encoder.encode([], elixir=9.2, hand_card_ids=hand_std, time_left=130.0, est_enemy_elixir=0.6)
+        slot_full, tile_full, _, _ = bot.predict_action(grid_full, scalars_full, hand_std, cmask_full, detections=[], opponent_tracker=tracker)
+        self.assertEqual(slot_full, 1)  # Deploys Giant (24)
+        self.assertGreaterEqual(tile_full // 18, 26)  # Slow-rolled in the back behind King Tower (rows 27..30)
+
+    def test_09_cv_arena_unit_fallback(self):
+        """Verifies that ClashRoyaleDetector detects arena units on samples/real_01.png even without YOLO weights."""
+        import cv2
+        detector = ClashRoyaleDetector(weights=None)
+        frame = cv2.imread(os.path.join(REPO_ROOT, "samples", "real_01.png"))
+        self.assertIsNotNone(frame)
+        obs = detector.parse_frame(frame)
+        dets = obs["detections"]
+        self.assertGreaterEqual(len(dets), 2)
+        has_enemy = any(not d.is_ally for d in dets)
+        has_ally = any(d.is_ally for d in dets)
+        self.assertTrue(has_enemy)
+        self.assertTrue(has_ally)
+
 
 if __name__ == "__main__":
     unittest.main()
+

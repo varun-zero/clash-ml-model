@@ -36,7 +36,7 @@ class ADBHarness:
         screen_width: Optional[int] = None,
         screen_height: Optional[int] = None,
         adb_path: Optional[str] = None,
-        tap_delay_ms: int = 40,
+        tap_delay_ms: int = 80,
         action_cooldown_sec: float = 0.800,  # 800ms minimum interval between plays
         max_actions: Optional[int] = None,   # Halt after N actions
         dry_run: bool = False,
