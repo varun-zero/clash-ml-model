@@ -1,11 +1,12 @@
 """Guards the failure mode shape-only tests cannot catch: producers disagreeing on
 what channel/scalar index N MEANS, label leakage, and hand/action misalignment."""
 import json
+import pytest
 import numpy as np
-from configs.observation_schema import Ch, Sc
+from configs.observation_schema import Ch, Sc, SCHEMA_VERSION, check_schema
 from configs.constants import CARD_NAME_TO_ID
 from perception.state_encoder import StateEncoder
-from tools.ingest_vanguard_replays import process_match
+from tools.ingest_vanguard_replays import process_match, card_key_to_id
 
 NAMES = ["arrows", "fireball", "knight", "archers", "goblins", "spear goblins", "giant", "minions"]
 
@@ -64,3 +65,30 @@ def test_unreconstructable_hand_is_rejected_not_guessed():
     meta, acts = _replay()
     acts[2]["card_key"] = "hog-rider"            # card not in the deck -> impossible sequence
     assert process_match(meta, acts) is None
+
+
+def test_card_key_normalization_xbow_and_minipekka():
+    """Verify alphanumeric card normalization correctly maps hyphenated cards."""
+    xbow_id = card_key_to_id("x-bow")
+    mini_pekka_id = card_key_to_id("mini-pekka")
+    log_id = card_key_to_id("the-log")
+    ev_id = card_key_to_id("firecracker-ev1")
+
+    assert xbow_id > 0, f"Expected non-zero id for 'x-bow', got {xbow_id}"
+    assert mini_pekka_id > 0, f"Expected non-zero id for 'mini-pekka', got {mini_pekka_id}"
+    assert log_id > 0, f"Expected non-zero id for 'the-log', got {log_id}"
+    assert ev_id > 0, f"Expected non-zero id for 'firecracker-ev1', got {ev_id}"
+    assert xbow_id == CARD_NAME_TO_ID["x-bow"]
+    assert mini_pekka_id == CARD_NAME_TO_ID["mini p.e.k.k.a"]
+
+
+def test_strict_schema_enforcement():
+    """Verify check_schema strictly rejects shards missing schema_version or with version mismatch."""
+    with pytest.raises(ValueError, match="missing schema_version"):
+        check_schema({"scalars": np.zeros(12)}, path="legacy_shard.npz")
+
+    with pytest.raises(ValueError, match="schema_version=1"):
+        check_schema({"schema_version": 1}, path="old_shard.npz")
+
+    # Valid schema_version must not raise
+    check_schema({"schema_version": SCHEMA_VERSION}, path="valid_shard.npz")

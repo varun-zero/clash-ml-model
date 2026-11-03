@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import argparse
+import re
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pyarrow.parquet as pq
@@ -32,91 +33,25 @@ from configs.constants import (
 from perception.state_encoder import stack_spatial_frames
 
 
-def normalize_card_key(card_key: str) -> str:
-    """Normalizes dataset card keys (e.g., 'firecracker-ev1' -> 'firecracker')."""
-    k = str(card_key).lower().strip()
+def normalize_card_key(s: str) -> str:
+    """Normalizes card names and dataset keys by stripping evolution tags and non-alphanumerics."""
+    k = str(s).lower().strip()
     if "-ev" in k:
         k = k.split("-ev")[0]
-    # Specific remappings
-    remap = {
-        "the-log": "the log",
-        "mini-pekka": "mini p.e.k.k.a",
-        "pekka": "p.e.k.k.a",
-        "boss-bandit": "boss bandit",
-        "giant-skeleton": "giant skeleton",
-        "royal-recruits": "royal recruits",
-        "royal-hogs": "royal hogs",
-        "royal-giant": "royal giant",
-        "royal-ghost": "royal ghost",
-        "royal-delivery": "royal delivery",
-        "three-musketeers": "three musketeers",
-        "skeleton-army": "skeleton army",
-        "skeleton-barrel": "skeleton barrel",
-        "skeleton-dragons": "skeleton dragons",
-        "skeleton-king": "skeleton king",
-        "goblin-barrel": "goblin barrel",
-        "goblin-gang": "goblin gang",
-        "goblin-giant": "goblin giant",
-        "goblin-cage": "goblin cage",
-        "goblin-drill": "goblin drill",
-        "goblin-hut": "goblin hut",
-        "goblin-demolisher": "goblin demolisher",
-        "goblin-machine": "goblin machine",
-        "goblin-curse": "goblin curse",
-        "spear-goblins": "spear goblins",
-        "ice-spirit": "ice spirit",
-        "fire-spirit": "fire spirit",
-        "electro-spirit": "electro spirit",
-        "heal-spirit": "heal spirit",
-        "ice-wizard": "ice wizard",
-        "electro-wizard": "electro wizard",
-        "magic-archer": "magic archer",
-        "archer-queen": "archer queen",
-        "golden-knight": "golden knight",
-        "mighty-miner": "mighty miner",
-        "little-prince": "little prince",
-        "dark-prince": "dark prince",
-        "hog-rider": "hog rider",
-        "ram-rider": "ram rider",
-        "battle-ram": "battle ram",
-        "battle-healer": "battle healer",
-        "flying-machine": "flying machine",
-        "inferno-dragon": "inferno dragon",
-        "inferno-tower": "inferno tower",
-        "bomb-tower": "bomb tower",
-        "barbarian-hut": "barbarian hut",
-        "barbarian-barrel": "barbarian barrel",
-        "elite-barbarians": "elite barbarians",
-        "minion-horde": "minion horde",
-        "mega-minion": "mega minion",
-        "mega-knight": "mega knight",
-        "night-witch": "night witch",
-        "mother-witch": "mother witch",
-        "baby-dragon": "baby dragon",
-        "electro-dragon": "electro dragon",
-        "electro-giant": "electro giant",
-        "elixir-collector": "elixir collector",
-        "elixir-golem": "elixir golem",
-        "giant-snowball": "giant snowball",
-        "wall-breakers": "wall breakers",
-        "suspicious-bush": "suspicious bush",
-        "cannon-cart": "cannon cart",
-        "rune-giant": "rune giant",
-        "spirit-empress": "spirit empress",
-    }
-    k = remap.get(k, k.replace("-", " "))
-    return k
+    return re.sub(r"[^a-z0-9]", "", k)
+
+
+# Precompute canonical dictionary mapping normalized alphanumeric string -> global card ID
+CANONICAL_CARD_NAME_TO_ID = {
+    re.sub(r"[^a-z0-9]", "", name.lower()): cid
+    for name, cid in CARD_NAME_TO_ID.items()
+}
 
 
 def card_key_to_id(card_key: str) -> int:
+    """Resolves raw dataset card keys (e.g. 'x-bow', 'mini-pekka', 'knight') to global card ID."""
     norm = normalize_card_key(card_key)
-    if norm in CARD_NAME_TO_ID:
-        return CARD_NAME_TO_ID[norm]
-    # Fallback search
-    for name, cid in CARD_NAME_TO_ID.items():
-        if norm in name or name in norm:
-            return cid
-    return 0
+    return CANONICAL_CARD_NAME_TO_ID.get(norm, 0)
 
 
 def build_legal_tile_mask(card_id: int) -> np.ndarray:

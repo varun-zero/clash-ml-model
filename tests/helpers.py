@@ -12,6 +12,7 @@ from configs.constants import (
     TOTAL_TILES,
     DEFAULT_UNLOCKED_CARD_IDS,
 )
+from configs.observation_schema import SCHEMA_VERSION
 
 
 def generate_synthetic_shard(
@@ -58,6 +59,6 @@ def generate_synthetic_shard(
         match_outcome=match_outcome,
         ally_crowns=2 if match_outcome == 1 else 0,
         enemy_crowns=1 if match_outcome == 1 else 2,
+        schema_version=np.int32(SCHEMA_VERSION),
     )
     return output_path
-

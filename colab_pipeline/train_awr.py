@@ -40,7 +40,7 @@ from configs.constants import (
     ARENA_COLS,
 )
 from policy.model import DeckConditionedPolicy
-from configs.observation_schema import check_schema
+from configs.observation_schema import Sc, check_schema, ALLY_TOWER_SLICE, ENEMY_TOWER_SLICE
 
 
 class AWRTrajectoryDataset(Dataset):
@@ -81,20 +81,28 @@ class AWRTrajectoryDataset(Dataset):
                 if "rewards" in data:
                     r = data["rewards"].astype(np.float32)
                 else:
-                    # Estimate reward: 10s tower HP delta + elixir trade + outcome bonus
+                    # Estimate reward: 10s tower HP delta + elixir trade (outcome is applied via outcome_w)
                     n_samples = len(ac)
                     r = np.zeros(n_samples, dtype=np.float32)
+                    has_timestamps = "timestamps" in data and len(data["timestamps"]) == n_samples
+                    timestamps = data["timestamps"].astype(np.float32) if has_timestamps else None
                     for idx in range(n_samples):
-                        fut_idx = min(n_samples - 1, idx + 50)
+                        if has_timestamps:
+                            target_t = float(timestamps[idx]) + 10.0
+                            fut_idx = int(np.searchsorted(timestamps, target_t, side="left"))
+                            fut_idx = min(n_samples - 1, fut_idx)
+                        else:
+                            fut_idx = min(n_samples - 1, idx + 50)
+
                         # Ally king/princess HP vs Enemy king/princess HP
-                        ally_hp_curr = s[idx, 3:6].sum()
-                        ally_hp_fut = s[fut_idx, 3:6].sum()
-                        enemy_hp_curr = s[idx, 6:9].sum()
-                        enemy_hp_fut = s[fut_idx, 6:9].sum()
+                        ally_hp_curr = s[idx, ALLY_TOWER_SLICE].sum()
+                        ally_hp_fut = s[fut_idx, ALLY_TOWER_SLICE].sum()
+                        enemy_hp_curr = s[idx, ENEMY_TOWER_SLICE].sum()
+                        enemy_hp_fut = s[fut_idx, ENEMY_TOWER_SLICE].sum()
 
                         delta_tower = (enemy_hp_curr - enemy_hp_fut) - (ally_hp_curr - ally_hp_fut)
-                        elixir_diff = (s[idx, 0] - s[idx, 1])
-                        r[idx] = float(delta_tower + 0.15 * elixir_diff + 0.5 * outcome)
+                        elixir_diff = (s[idx, Sc.ALLY_ELIXIR] - s[idx, Sc.ENEMY_ELIXIR])
+                        r[idx] = float(delta_tower + 0.15 * elixir_diff)
 
                 if sample_range is not None:
                     s_frac, e_frac = sample_range
@@ -401,7 +409,7 @@ def main():
     # Optional warm start from Stage 1 BC
     if args.init_checkpoint and os.path.exists(args.init_checkpoint):
         try:
-            ckpt = torch.load(args.init_checkpoint, map_location=device)
+            ckpt = torch.load(args.init_checkpoint, map_location=device, weights_only=True)
             state_dict = ckpt.get("model_state_dict", ckpt)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if missing or unexpected:
@@ -457,7 +465,7 @@ def main():
 
     # Export best model to ONNX
     if os.path.exists(best_ckpt_path):
-        ckpt = torch.load(best_ckpt_path, map_location=device)
+        ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
         export_to_onnx(model, best_onnx_path, device)
 

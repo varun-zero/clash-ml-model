@@ -38,10 +38,9 @@ ENEMY_TOWER_SLICE = slice(Sc.ENEMY_KING, Sc.ENEMY_RIGHT + 1)
 
 
 def check_schema(data, path: str = "") -> None:
-    """Call right after np.load(). Refuses shards written under another layout."""
+    """Call right after np.load(). Strictly refuses shards without schema_version or with layout mismatch."""
     if "schema_version" not in data:
-        print(f"[Schema] WARNING {path}: no schema_version (legacy shard, layout unverified).")
-        return
+        raise ValueError(f"{path}: missing schema_version. Re-generate or explicitly migrate this shard.")
     v = int(data["schema_version"])
     if v != SCHEMA_VERSION:
         raise ValueError(f"{path}: schema_version={v}, code expects {SCHEMA_VERSION}. Re-generate the shard.")

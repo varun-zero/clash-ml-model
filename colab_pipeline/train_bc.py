@@ -377,7 +377,7 @@ def main():
 
     print("\n[Training Complete] Loading best checkpoint for ONNX export...")
     if os.path.exists(best_pt_path):
-        ckpt = torch.load(best_pt_path, map_location=device)
+        ckpt = torch.load(best_pt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
         export_to_onnx(model, best_onnx_path, device=device)
 

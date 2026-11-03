@@ -141,7 +141,7 @@ class CRZeroLiveAgent:
     def _load_policy_weights(self, checkpoint_path: str):
         """Loads trained behavior cloning weights."""
         print(f"[CR-Zero] Loading policy weights from {checkpoint_path}...")
-        ckpt = torch.load(checkpoint_path, map_location=self.torch_device)
+        ckpt = torch.load(checkpoint_path, map_location=self.torch_device, weights_only=True)
         state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
         self.policy.load_state_dict(state_dict)
         print("[CR-Zero] Policy loaded successfully.")
@@ -188,12 +188,10 @@ class CRZeroLiveAgent:
                 # Handle Result Screen & Match Shard Logging
                 if screen_state == "result":
                     if self.log_dir and len(self.match_buffer["action_card"]) > 10:
-                        result_meta = self.detector.read_match_result(frame)
-                        outcome = result_meta["outcome"]
-                        shard_path = os.path.join(
-                            self.log_dir,
-                            f"match_{int(time.time())}_{outcome}.npz"
-                        )
+                        ts = int(time.time())
+                        outcome = result_meta.get("outcome", "unknown")
+                        shard_name = f"live_match_{ts}_{outcome}.npz"
+                        shard_path = os.path.join(self.log_dir, shard_name)
                         np.savez_compressed(
                             shard_path,
                             arena_grid=np.array(self.match_buffer["arena_grid"], dtype=np.float32),
@@ -205,11 +203,13 @@ class CRZeroLiveAgent:
                             action_tile=np.array(self.match_buffer["action_tile"], dtype=np.int64),
                             timestamps=np.array(self.match_buffer["timestamps"], dtype=np.float32),
                             schema_version=np.int32(SCHEMA_VERSION),
-                match_outcome=1 if outcome == "victory" else (-1 if outcome == "defeat" else 0),
+                            match_outcome=1 if outcome == "victory" else (-1 if outcome == "defeat" else 0),
                             ally_crowns=result_meta["ally_crowns"],
                             enemy_crowns=result_meta["enemy_crowns"],
                         )
                         print(f"[Match Logger] Saved match shard to {shard_path} (Outcome: {outcome})")
+
+                    if self.log_dir:
                         self.match_buffer = {k: [] for k in self.match_buffer}
 
                     action_desc = "[RESULT] Match Concluded. Waiting for Lobby..."

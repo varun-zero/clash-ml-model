@@ -15,7 +15,7 @@ The system operates across two coordinated subsystems:
 
 ## Autonomous Match Record
 
-CR-Zero has demonstrated continuous autonomous battle loops on live ladder and training camp, securing **5 consecutive verified victories** using its tactical RuleBot heuristic engine (including 3–0 Three-Crown sweeps against ladder opponents, advancing trophies from 28 $\to$ 58). In parallel, the dual-stage neural policy achieves 43.2% card accuracy and 16.2% tile placement accuracy within 2 tiles on clean trajectory shards.
+CR-Zero has demonstrated continuous autonomous battle loops on live ladder and training camp, securing **5 consecutive verified victories** using its tactical RuleBot heuristic engine (including 3–0 Three-Crown sweeps against ladder opponents, advancing trophies from 28 $\to$ 58). (In parallel, BC card/tile prior on 30 Vanguard matches (no board state) achieves 43.2% card accuracy and 16.2% tile within 2 tiles).
 
 ![Official In-Game Battle Log](official_battle_log.png)
 
@@ -56,7 +56,7 @@ CR-Zero has demonstrated continuous autonomous battle loops on live ladder and t
 |  - 135 Card Embeddings |   +---------------------------------------+
 |  - Opponent Tracker    |                        |
 |  - Spell Lead Aiming   |                        v
-+------------------------+   <-- [checkpoints/cr_zero_policy_awr_best.pt]
++------------------------+   <-- [checkpoints/cr_zero_policy_best.pt]
             |
             v
 +------------------------+
@@ -153,7 +153,7 @@ python tools/play_5_wins.py --target-wins 5 --max-games 10
 #### Live Match Play via Policy or Heuristics
 ```powershell
 # 1. Run with Stage 2 AWR trained neural policy:
-python main_live.py --weights weights/yolo_units.pt --checkpoint checkpoints/cr_zero_policy_awr_best.pt
+python main_live.py --weights weights/yolo_units.pt --checkpoint checkpoints/cr_zero_policy_best.pt
 
 # 2. Run with heuristic RuleBot (no neural weights required):
 python main_live.py --rule-bot
