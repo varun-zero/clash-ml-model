@@ -114,6 +114,15 @@ def run_tactical_simulation() -> None:
                 Detection(0.74, 0.50, 0.84, 0.58, 0.95, 24, True, "ground", track_id=50, vy=-0.03),
             ],
         },
+        {
+            "title": "Scenario H: Enemy Giant at Left Bridge -> Pro 4-3 Center Building Pull (Cannon)",
+            "elixir": 5.0,
+            "time_left": 110.0,
+            "hand": [35, 21, 2, 1],  # Cannon(35), Archers(21), Fireball(2), Arrows(1)
+            "detections": [
+                Detection(0.21, 0.48, 0.31, 0.55, 0.95, 24, False, "ground", track_id=60, vy=0.03),
+            ],
+        },
     ]
 
     print("\n2. TACTICAL DECISION & THREAT ASSESSMENT BENCHMARK")
@@ -164,3 +173,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
+

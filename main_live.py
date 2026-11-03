@@ -277,55 +277,68 @@ class CRZeroLiveAgent:
                         opponent_tracker=obs.get("opponent_tracker"),
                     )
                 else:
-                    # Neural policy evaluation with tactical sanity guardrails
+                    # Neural policy evaluation fused with tactical priors + sanity guardrails
                     grid_tensor = torch.from_numpy(stacked_grid).unsqueeze(0).to(self.torch_device)
                     scalar_tensor = torch.from_numpy(scalars).unsqueeze(0).to(self.torch_device)
                     hand_tensor = torch.tensor([hand_ids], dtype=torch.long, device=self.torch_device)
                     cmask_tensor = torch.from_numpy(legal_card_mask).unsqueeze(0).to(self.torch_device)
 
-                    # 1. Sample card slot
-                    chosen_slot, card_conf = self.policy.predict_card(
-                        arena_grid=grid_tensor,
-                        scalars=scalar_tensor,
-                        hand_card_ids=hand_tensor,
-                        legal_card_mask=cmask_tensor,
-                        temperature=self.temperature,
-                    )
-
-                    # Play threshold check
-                    if chosen_slot > 0 and card_conf < self.play_thresh and legal_card_mask[0]:
-                        chosen_slot = 0
-
-                    # 2. Condition tile prediction on chosen card slot
-                    if chosen_slot == 0:
-                        chosen_tile = 0
-                        tile_conf = 1.0
-                    else:
-                        played_cid = hand_ids[chosen_slot - 1]
-                        tile_mask = self.encoder.get_legal_tile_mask(
-                            played_cid, tower_hps=obs.get("tower_hps")
-                        )
-                        tmask_tensor = torch.from_numpy(tile_mask).unsqueeze(0).to(self.torch_device)
-                        chosen_tile, tile_conf = self.policy.predict_tile(
+                    if hasattr(self.policy, "predict_hybrid_action"):
+                        chosen_slot, chosen_tile, card_conf, tile_conf = self.policy.predict_hybrid_action(
                             arena_grid=grid_tensor,
                             scalars=scalar_tensor,
                             hand_card_ids=hand_tensor,
-                            legal_tile_mask=tmask_tensor,
-                            card_slot=chosen_slot,
+                            legal_card_mask=cmask_tensor,
+                            rule_bot=self.rule_bot,
+                            detections=obs.get("detections"),
+                            opponent_tracker=obs.get("opponent_tracker"),
+                            prior_weight=0.35,
+                            temperature=self.temperature,
+                            deterministic=False,
+                        )
+                    else:
+                        # 1. Sample card slot (ONNX runtime wrapper)
+                        chosen_slot, card_conf = self.policy.predict_card(
+                            arena_grid=grid_tensor,
+                            scalars=scalar_tensor,
+                            hand_card_ids=hand_tensor,
+                            legal_card_mask=cmask_tensor,
                             temperature=self.temperature,
                         )
 
-                    # 3. Validate against wasted corner spells and ignored CRITICAL threats
-                    chosen_slot, chosen_tile, _ = self.rule_bot.validate_or_override_action(
-                        chosen_slot=chosen_slot,
-                        chosen_tile=chosen_tile,
-                        arena_grid=stacked_grid,
-                        scalars=scalars,
-                        hand_card_ids=hand_ids,
-                        legal_card_mask=legal_card_mask,
-                        detections=obs.get("detections"),
-                        opponent_tracker=obs.get("opponent_tracker"),
-                    )
+                        if chosen_slot > 0 and card_conf < self.play_thresh and legal_card_mask[0]:
+                            chosen_slot = 0
+
+                        # 2. Condition tile prediction on chosen card slot
+                        if chosen_slot == 0:
+                            chosen_tile = 0
+                            tile_conf = 1.0
+                        else:
+                            played_cid = hand_ids[chosen_slot - 1]
+                            tile_mask = self.encoder.get_legal_tile_mask(
+                                played_cid, tower_hps=obs.get("tower_hps")
+                            )
+                            tmask_tensor = torch.from_numpy(tile_mask).unsqueeze(0).to(self.torch_device)
+                            chosen_tile, tile_conf = self.policy.predict_tile(
+                                arena_grid=grid_tensor,
+                                scalars=scalar_tensor,
+                                hand_card_ids=hand_tensor,
+                                legal_tile_mask=tmask_tensor,
+                                card_slot=chosen_slot,
+                                temperature=self.temperature,
+                            )
+
+                        # 3. Validate against wasted corner spells and ignored CRITICAL threats
+                        chosen_slot, chosen_tile, _ = self.rule_bot.validate_or_override_action(
+                            chosen_slot=chosen_slot,
+                            chosen_tile=chosen_tile,
+                            arena_grid=stacked_grid,
+                            scalars=scalars,
+                            hand_card_ids=hand_ids,
+                            legal_card_mask=legal_card_mask,
+                            detections=obs.get("detections"),
+                            opponent_tracker=obs.get("opponent_tracker"),
+                        )
 
                 dt_pol = (time.perf_counter() - t_pol0) * 1000.0
 

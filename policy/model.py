@@ -321,3 +321,152 @@ class DeckConditionedPolicy(nn.Module):
             deterministic=deterministic,
         )
         return slot, tile, card_conf, tile_conf
+
+    @torch.no_grad()
+    def sample_action(
+        self,
+        arena_grid: torch.Tensor,
+        scalars: torch.Tensor,
+        hand_card_ids: torch.Tensor,
+        legal_card_mask: torch.Tensor,
+        legal_tile_mask: torch.Tensor,
+        temperature: float = 0.8,
+        deterministic: bool = False,
+    ) -> Tuple[int, int, float, float]:
+        """Alias for predict_action supporting stochastic temperature sampling."""
+        return self.predict_action(
+            arena_grid=arena_grid,
+            scalars=scalars,
+            hand_card_ids=hand_card_ids,
+            legal_card_mask=legal_card_mask,
+            legal_tile_mask=legal_tile_mask,
+            temperature=temperature,
+            deterministic=deterministic,
+        )
+
+    @torch.no_grad()
+    def predict_hybrid_action(
+        self,
+        arena_grid: torch.Tensor,
+        scalars: torch.Tensor,
+        hand_card_ids: torch.Tensor,
+        legal_card_mask: torch.Tensor,
+        rule_bot,
+        detections=None,
+        opponent_tracker=None,
+        prior_weight: float = 0.35,
+        temperature: float = 0.85,
+        deterministic: bool = True,
+    ) -> Tuple[int, int, float, float]:
+        """
+        Fuses learned neural policy logits with tactical domain priors from RuleBotPolicy:
+            combined_logits = neural_logits + prior_weight * tactical_prior_logits
+        Then validates the final decision through RuleBotPolicy.validate_or_override_action().
+        """
+        self.eval()
+        grid_b, scalars_b, hand_b, cmask_b, _ = self._ensure_batched(
+            arena_grid, scalars, hand_card_ids, legal_card_mask, None
+        )
+        trunk_feat, hand_embs = self._encode(grid_b, scalars_b, hand_b)
+
+        # Convert tensors to numpy for tactical prior computation
+        grid_np = grid_b[0].detach().cpu().numpy()
+        scalars_np = scalars_b[0].detach().cpu().numpy()
+        hand_list = [int(c) for c in hand_b[0].detach().cpu().tolist()]
+        cmask_np = cmask_b[0].detach().cpu().numpy()
+
+        card_prior_np, tile_prior_np = rule_bot.compute_tactical_action_priors(
+            arena_grid=grid_np,
+            scalars=scalars_np,
+            hand_card_ids=hand_list,
+            legal_card_mask=cmask_np,
+            detections=detections,
+            opponent_tracker=opponent_tracker,
+        )
+        card_prior_t = torch.from_numpy(card_prior_np).to(grid_b.device, dtype=trunk_feat.dtype).unsqueeze(0)
+        tile_prior_t = torch.from_numpy(tile_prior_np).to(grid_b.device, dtype=trunk_feat.dtype).unsqueeze(0)
+
+        card_logits = self.card_head(trunk_feat) + (prior_weight * card_prior_t)
+        card_logits = card_logits.masked_fill(~cmask_b.bool(), self._mask_value(card_logits.dtype))
+        slot, card_conf = self._sample_or_argmax(card_logits, temperature=temperature, deterministic=deterministic)
+
+        if slot == 0:
+            chosen_tile, tile_conf = 0, 1.0
+        else:
+            chosen_cid = hand_list[slot - 1] if (slot - 1) < len(hand_list) else 0
+            tower_hps = list(scalars_np[3:9]) if len(scalars_np) >= 9 else [1.0] * 6
+            tmask_np = rule_bot.encoder.get_legal_tile_mask(chosen_cid, tower_hps=tower_hps)
+            tmask_b = torch.from_numpy(tmask_np).to(grid_b.device, dtype=torch.bool).unsqueeze(0)
+
+            pad_zero = torch.zeros(1, 1, self.card_emb_dim, device=grid_b.device, dtype=hand_embs.dtype)
+            all_slot_embs = torch.cat([pad_zero, hand_embs], dim=1)
+            chosen_card_emb = all_slot_embs[:, int(slot)]
+
+            tile_logits = self.tile_head(torch.cat([trunk_feat, chosen_card_emb], dim=-1)) + (prior_weight * tile_prior_t)
+            tile_logits = tile_logits.masked_fill(~tmask_b, self._mask_value(tile_logits.dtype))
+            chosen_tile, tile_conf = self._sample_or_argmax(
+                tile_logits, temperature=temperature, deterministic=deterministic
+            )
+
+        # Final tactical safety check (blocks corner spells and undefended critical threats)
+        safe_slot, safe_tile, _ = rule_bot.validate_or_override_action(
+            chosen_slot=slot,
+            chosen_tile=chosen_tile,
+            arena_grid=grid_np,
+            scalars=scalars_np,
+            hand_card_ids=hand_list,
+            legal_card_mask=cmask_np,
+            detections=detections,
+            opponent_tracker=opponent_tracker,
+        )
+        return safe_slot, safe_tile, card_conf, tile_conf
+
+
+def compute_spatial_gaussian_tile_loss(
+    tile_logits: torch.Tensor,
+    target_tiles: torch.Tensor,
+    legal_tile_mask: torch.Tensor,
+    sample_weights: torch.Tensor,
+    sigma: float = 1.25,
+    gaussian_blend: float = 0.35,
+) -> torch.Tensor:
+    """
+    Computes a hybrid spatial tile loss:
+        (1 - gaussian_blend) * CrossEntropy(tile_logits, target_tiles)
+        + gaussian_blend * SoftCrossEntropy(tile_logits, Gaussian2D(target_y, target_x, sigma))
+
+    In Clash Royale, placing a troop 1 tile away from the human demonstration is nearly identical
+    tactically, whereas hard 1-hot cross-entropy treats (y, x+1) as equally wrong as the opposite
+    corner of the arena. This 2D Gaussian target distribution provides smooth spatial gradients
+    toward the optimal placement neighborhood and significantly improves Tile<=2 accuracy.
+    """
+    if tile_logits.numel() == 0 or target_tiles.numel() == 0:
+        return torch.tensor(0.0, device=tile_logits.device)
+
+    # 1. Standard hard target cross-entropy per sample
+    ce_per_sample = F.cross_entropy(tile_logits, target_tiles, reduction="none")
+
+    # 2. 2D Gaussian soft target over (32, 18) arena grid
+    B = tile_logits.size(0)
+    device = tile_logits.device
+    target_y = (target_tiles // ARENA_COLS).float().unsqueeze(1)  # (B, 1)
+    target_x = (target_tiles % ARENA_COLS).float().unsqueeze(1)   # (B, 1)
+
+    grid_idx = torch.arange(TOTAL_TILES, device=device)
+    grid_y = (grid_idx // ARENA_COLS).float().unsqueeze(0)  # (1, 576)
+    grid_x = (grid_idx % ARENA_COLS).float().unsqueeze(0)   # (1, 576)
+
+    dist_sq = (grid_y - target_y) ** 2 + (grid_x - target_x) ** 2
+    gauss_unnorm = torch.exp(-dist_sq / (2.0 * (sigma ** 2)))
+
+    # Mask out illegal tiles so probability mass stays strictly inside legal deployment zones
+    gauss_masked = gauss_unnorm * legal_tile_mask.float()
+    gauss_sum = gauss_masked.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+    soft_targets = gauss_masked / gauss_sum
+
+    log_probs = F.log_softmax(tile_logits.float(), dim=-1)
+    soft_ce_per_sample = -(soft_targets * log_probs).sum(dim=-1)
+
+    hybrid_loss_per_sample = (1.0 - gaussian_blend) * ce_per_sample + gaussian_blend * soft_ce_per_sample
+    return (hybrid_loss_per_sample * sample_weights).mean()
+

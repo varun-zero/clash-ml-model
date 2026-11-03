@@ -272,9 +272,9 @@ def train_awr_epoch(
     device: torch.device,
     tile_loss_weight: float = 1.0,
 ) -> Dict[str, float]:
+    from policy.model import compute_spatial_gaussian_tile_loss
     model.train()
-    card_crit = nn.CrossEntropyLoss(reduction="none")
-    tile_crit = nn.CrossEntropyLoss(reduction="none")
+    card_crit = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.03)
 
     total_loss_accum = 0.0
     card_correct = 0
@@ -309,9 +309,16 @@ def train_awr_epoch(
             # Advantage-Weighted Card Loss
             loss_c = (card_crit(card_logits, target_card) * sample_weights).mean()
 
-            # Advantage-Weighted Tile Loss
+            # Advantage-Weighted 2D Spatial Gaussian Tile Loss
             if played_mask.any():
-                loss_t = (tile_crit(tile_logits[played_mask], target_tile[played_mask]) * sample_weights[played_mask]).mean()
+                loss_t = compute_spatial_gaussian_tile_loss(
+                    tile_logits=tile_logits[played_mask],
+                    target_tiles=target_tile[played_mask],
+                    legal_tile_mask=tmask[played_mask],
+                    sample_weights=sample_weights[played_mask],
+                    sigma=1.25,
+                    gaussian_blend=0.35,
+                )
             else:
                 loss_t = torch.tensor(0.0, device=device)
 

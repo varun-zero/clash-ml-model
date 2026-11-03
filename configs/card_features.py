@@ -167,6 +167,26 @@ _BIG_SPELLS = {
     "fireball", "lightning", "rocket", "poison", "freeze", "void",
 }
 
+_DEFENSIVE_BUILDINGS = {
+    "cannon", "tesla", "inferno tower", "bomb tower", "tombstone", "goblin cage",
+}
+
+_SIEGE_BUILDINGS = {
+    "x-bow", "mortar",
+}
+
+_PASSIVE_BUILDINGS = {
+    "elixir collector", "goblin hut", "furnace", "barbarian hut",
+}
+
+_GLOBAL_WIN_CONDITIONS = {
+    "goblin barrel", "miner", "graveyard", "goblin drill",
+}
+
+_FAST_BYPASS_WIN_CONDITIONS = {
+    "hog rider", "battle ram", "ram rider", "royal hogs", "wall breakers",
+}
+
 
 def _name(card: Dict) -> str:
     return str(card.get("name", "")).strip().lower()
@@ -265,6 +285,16 @@ def get_card_roles(card_id: int) -> Set[str]:
         roles.add("small_spell")
     if name in _BIG_SPELLS:
         roles.add("big_spell")
+    if name in _DEFENSIVE_BUILDINGS:
+        roles.add("defensive_building")
+    if name in _SIEGE_BUILDINGS:
+        roles.add("siege_building")
+    if name in _PASSIVE_BUILDINGS:
+        roles.add("passive_building")
+    if name in _GLOBAL_WIN_CONDITIONS:
+        roles.add("global_win_condition")
+    if name in _FAST_BYPASS_WIN_CONDITIONS:
+        roles.add("fast_bypass_win_condition")
     if name in _AIR_TARGETING:
         roles.add("anti_air")
     if name in _MELEE:
@@ -308,6 +338,18 @@ def is_tank_killer_card(card_id: int) -> bool:
 
 def is_building_targeter_card(card_id: int) -> bool:
     return "building_targeter" in get_card_roles(card_id)
+
+
+def is_defensive_building_card(card_id: int) -> bool:
+    return "defensive_building" in get_card_roles(card_id)
+
+
+def is_siege_building_card(card_id: int) -> bool:
+    return "siege_building" in get_card_roles(card_id)
+
+
+def is_global_win_condition_card(card_id: int) -> bool:
+    return "global_win_condition" in get_card_roles(card_id)
 
 
 def get_intrinsic_danger(card_id: int, category: str = "ground") -> float:
@@ -365,6 +407,10 @@ def score_counter_matchup(
     def_roles = get_card_roles(defender_cid)
     def_is_spell = bool(CARD_ID_TO_IS_SPELL.get(defender_cid, False) and CARD_ID_TO_CATEGORY.get(defender_cid) == "spell")
 
+    # Global win conditions (Goblin Barrel, Graveyard) and Elixir Collector are not reactive troop counters
+    if defender_cid in (12, 16, 45):
+        return -50.0
+
     enemy_cost = float(CARD_ID_TO_COST.get(enemy_cid, 4)) if enemy_cid > 0 else max(3.5, cluster_elixir)
     enemy_roles = get_card_roles(enemy_cid) if enemy_cid > 0 else set()
     is_air_enemy = (enemy_category == "air") or ("air_unit" in enemy_roles)
@@ -374,75 +420,88 @@ def score_counter_matchup(
     is_ranged_enemy = ("ranged_support" in enemy_roles)
     is_melee_heavy = ("tank_killer" in enemy_roles and "melee" in enemy_roles and not is_swarm_enemy)
 
-    # 1. Hard rule: Air threats require air-targeting cards (or cheap building/tank kite in emergencies)
+    # 1. Hard rule: Air threats require air-targeting cards (or defensive building pull for Balloon/Lava Hound)
     if is_air_enemy and "anti_air" not in def_roles:
-        if "building" in def_roles and ("building_targeter" in enemy_roles):
-            return 2.5  # Building can pull Balloon/Lava Hound
+        if "defensive_building" in def_roles and ("building_targeter" in enemy_roles):
+            return 5.5  # Cannon/Tombstone/Goblin Cage can pull Balloon to the center kill-zone!
         return -100.0
 
     # 2. Spells should NEVER be used as generic single-target troop counters unless swarm/barrel
     if def_is_spell:
-        if defender_cid == 1:  # Arrows (cost 3)
-            if enemy_cid in (12, 31, 44, 64, 49, 63, 87, 43, 72) or is_swarm_enemy:
+        if defender_cid in (1, 3, 4, 11, 13, 14):  # Small spells (Arrows, Zap, Log, Barb Barrel, Snowball, Delivery)
+            if is_air_enemy and "anti_air" not in def_roles:
+                return -100.0
+            if enemy_cid in (12, 31, 44, 64, 49, 63, 87, 43, 72, 81) or is_swarm_enemy:
                 return 8.5 + min(4.0, (cluster_elixir - def_cost) * 1.2)
-            return -25.0  # Never waste Arrows on a single Knight/Giant/Mini PEKKA
-        if defender_cid == 2:  # Fireball (cost 4)
+            return -25.0  # Never waste small spells on a single Knight/Giant/Mini PEKKA
+        if defender_cid in (2, 7, 5, 6, 15):  # Big spells (Fireball, Poison, Lightning, Rocket, Void)
             if cluster_size >= 2 and cluster_elixir >= 5.0:
                 return 7.5 + min(4.0, (cluster_elixir - def_cost) * 1.0)
             if enemy_cid in (28, 36, 32, 115, 27, 80, 85, 75) and cluster_size >= 2:
                 return 8.0
-            return -30.0  # Never waste Fireball on a single ground troop when troops can counter
+            return -30.0  # Never waste big spells on a single ground troop when troops can counter
 
     # 3. Offensive building-targeters (like Giant) cannot attack enemy troops!
-    # Only use Giant defensively as a desperation kite sponge if nothing else is available.
     if "building_targeter" in def_roles and "building" not in def_roles:
-        if defender_cid == 61:  # Ice Golem is a great 2-elixir kite
-            return 4.5 if (is_melee_heavy or is_ranged_enemy) else 1.0
+        if defender_cid == 61:  # Ice Golem is an elite 2-elixir kite for P.E.K.K.A / Prince / Mini P.E.K.K.A
+            return 6.5 if (is_melee_heavy or is_ranged_enemy) else 1.5
         return -8.0
 
     score = 5.0
 
-    # 4. Matchup: Defending against Enemy Swarm (Skeleton Army, Minions, Goblin Gang, etc.)
+    # 4. Matchup: Defending against Enemy Swarm (Skeleton Army, Minions, Goblin Gang, Royal Hogs, etc.)
     if is_swarm_enemy:
-        if "splash" in def_roles:
+        if defender_cid == 39:  # Bomb Tower shreds ground swarms & Royal Hogs
+            score += 6.5 if not is_air_enemy else -10.0
+        elif "splash" in def_roles:
             score += 5.5  # Bomber, Valkyrie, Baby Dragon crush swarms
         elif "ranged_support" in def_roles and def_cost <= 3.0:
             score += 3.5  # Archers, Spear Goblins, Minions clean up swarms well
         elif "swarm" in def_roles and def_cost <= 3.0:
             score += 2.5
-        if defender_cid == 26:  # Mini P.E.K.K.A is terrible against swarms!
+        if defender_cid in (26, 25, 53):  # Mini P.E.K.K.A / P.E.K.K.A / Prince are terrible against swarms!
             score -= 6.0
 
     # 5. Matchup: Defending against Enemy Tank / Building-Targeter (Giant, Hog Rider, Golem, Balloon)
     if is_tank_enemy:
-        if "tank_killer" in def_roles:
-            score += 6.0  # Mini P.E.K.K.A, Goblins, Minions shred tanks
-        elif "building" in def_roles:
-            score += 5.0  # Cannon, Tesla, Inferno pull and DPS tanks
-        elif "swarm" in def_roles and not is_splash_enemy:
+        if defender_cid in (42, 60):  # Inferno Tower / Inferno Dragon melt heavy tanks
+            score += 7.5
+        elif "tank_killer" in def_roles:
+            score += 6.0  # Mini P.E.K.K.A, Hunter, Mighty Miner, Goblins shred tanks
+        elif "defensive_building" in def_roles:
+            score += 5.8  # Cannon, Tesla, Tombstone, Goblin Cage pull and DPS tanks in 4-3 plant
+        elif "swarm" in def_roles and not is_splash_enemy and enemy_cid != 93:  # Never swarm Electro Giant (93)!
             score += 4.0  # Goblins / Minions / Skeletons high DPS on single-target tank
         elif "mini_tank" in def_roles:
             score += 2.5  # Knight provides solid body + DPS
         elif "ranged_support" in def_roles:
-            score += 3.0  # Musketeer / Archers provide safe ranged DPS
+            score += 3.2  # Musketeer / Archers provide safe ranged DPS
         if defender_cid == 34 and cluster_size == 1:
             score -= 2.0  # Bomber alone has lower single-target DPS vs Giant/Hog
+        if enemy_cid == 93 and "swarm" in def_roles:
+            score -= 12.0  # Electro Giant zap pack destroys swarms!
 
-    # 6. Matchup: Defending against Enemy Melee Heavy Hitter (Mini P.E.K.K.A, Prince, P.E.K.K.A, Knight)
+    # 6. Matchup: Defending against Enemy Melee Heavy Hitter (Mini P.E.K.K.A, Prince, P.E.K.K.A, Knight, Mega Knight)
     if is_melee_heavy:
-        if "swarm" in def_roles:
-            score += 5.5  # Goblins, Spear Goblins, Minions, Archers distract and melt single-target melee
-        elif "mini_tank" in def_roles and def_cost <= 3.0:
-            score += 4.5  # Knight in center kill-zone tanks and counters
-        elif "ranged_support" in def_roles and def_cost <= 3.0:
-            score += 4.0  # Archers / Spear Goblins pull to center
+        if enemy_cid == 78:  # Mega Knight has splash jump — counter with Knight / Mini P.E.K.K.A / P.E.K.K.A, NOT ground swarm!
+            if "mini_tank" in def_roles or defender_cid in (20, 26, 25, 33):
+                score += 6.5
+            elif "swarm" in def_roles and "air_unit" not in def_roles:
+                score -= 6.0
+        else:
+            if "swarm" in def_roles:
+                score += 5.5  # Goblins, Spear Goblins, Minions, Skeletons distract and melt single-target melee
+            elif "mini_tank" in def_roles and def_cost <= 3.0:
+                score += 4.5  # Knight in center kill-zone tanks and counters
+            elif "ranged_support" in def_roles and def_cost <= 3.0:
+                score += 4.0  # Archers / Spear Goblins pull to center
 
     # 7. Matchup: Defending against Enemy Splash / Ranged Support (Witch, Wizard, Musketeer, Bomber, Baby Dragon)
     if is_splash_enemy or is_ranged_enemy:
         if "swarm" in def_roles and is_splash_enemy and def_cost <= 3.0 and defender_cid in (22, 23, 30, 31, 64, 72):
             score -= 5.5  # Never feed squishy Goblins/Skeletons into Bomber/Valkyrie/Witch/Baby Dragon!
-        if "mini_tank" in def_roles or defender_cid in (20, 26, 33):
-            score += 5.5  # Knight / Mini P.E.K.K.A dropped directly on top assassinates ranged/splash units
+        if "mini_tank" in def_roles or defender_cid in (20, 26, 33, 69, 73):
+            score += 5.5  # Knight / Mini P.E.K.K.A / Valkyrie dropped directly on top assassinates ranged/splash units
         elif defender_cid == 27:  # Musketeer duels air/ranged units well
             score += 4.5
 
@@ -451,3 +510,4 @@ def score_counter_matchup(
     score += float(np.clip(elixir_trade * 0.75, -2.5, 3.0))
 
     return float(score)
+

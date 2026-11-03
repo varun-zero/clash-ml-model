@@ -323,7 +323,59 @@ class TestCRZeroRequirements(unittest.TestCase):
         self.assertTrue(has_enemy)
         self.assertTrue(has_ally)
 
+    def test_10_pro_building_placements_and_hybrid_ml(self):
+        """Verifies 4-3 and 4-2 defensive building placements, 2D Gaussian tile loss, and hybrid neural-tactical inference."""
+        from perception.state_encoder import OpponentTracker, stack_spatial_frames
+        from policy.model import compute_spatial_gaussian_tile_loss
+
+        encoder = StateEncoder()
+        bot = RuleBotPolicy()
+        tracker = OpponentTracker(initial_elixir=6.0)
+
+        # 1. 4-3 Standard Pull: Cannon (35) vs Giant (24) in left lane -> row 19, col 9 (1 tile into opposite lane)
+        giant_left = [Detection(0.21, 0.48, 0.31, 0.55, 0.95, 24, False, "ground", track_id=301)]
+        hand_cannon = [35, 21, 2, 1]
+        grid_g, scalars_g, cmask_g = encoder.encode(giant_left, elixir=5.0, hand_card_ids=hand_cannon, time_left=120.0)
+        slot_g, tile_g, _, _ = bot.predict_action(grid_g, scalars_g, hand_cannon, cmask_g, detections=giant_left, opponent_tracker=tracker)
+        self.assertEqual(slot_g, 1)  # Cannon (35)
+        self.assertEqual(tile_g // 18, 19)  # 4-3 row (3 tiles south of river)
+        self.assertEqual(tile_g % 18, 9)    # Pulled 1 tile across center into right lane
+
+        # 2. 4-2 Anti-Bypass Plant: Cannon (35) vs Pig-Pushed Outer-Edge Hog Rider (51) at col 1 -> row 18, col 7
+        hog_outer = [Detection(0.08, 0.48, 0.14, 0.54, 0.95, 51, False, "ground", track_id=302)]
+        grid_hb, scalars_hb, cmask_hb = encoder.encode(hog_outer, elixir=5.0, hand_card_ids=hand_cannon, time_left=120.0)
+        slot_hb, tile_hb, _, _ = bot.predict_action(grid_hb, scalars_hb, hand_cannon, cmask_hb, detections=hog_outer, opponent_tracker=tracker)
+        self.assertEqual(slot_hb, 1)  # Cannon (35)
+        self.assertEqual(tile_hb // 18, 18)  # 4-2 row (higher up to prevent Hog bypass)
+        self.assertEqual(tile_hb % 18, 7)
+
+        # 3. 2D Spatial Gaussian Tile Loss produces smooth finite gradients
+        logits = torch.randn(4, 576, requires_grad=True)
+        targets = torch.tensor([350, 400, 420, 500], dtype=torch.long)
+        mask = torch.ones(4, 576, dtype=torch.bool)
+        weights = torch.ones(4, dtype=torch.float32)
+        loss = compute_spatial_gaussian_tile_loss(logits, targets, mask, weights, sigma=1.25)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss).item())
+        self.assertIsNotNone(logits.grad)
+
+        # 4. Hybrid Neural + Tactical Prior Inference
+        policy = DeckConditionedPolicy()
+        stacked = stack_spatial_frames([grid_g], target_frames=4)
+        h_slot, h_tile, _, _ = policy.predict_hybrid_action(
+            arena_grid=torch.from_numpy(stacked),
+            scalars=torch.from_numpy(scalars_g),
+            hand_card_ids=torch.tensor(hand_cannon, dtype=torch.long),
+            legal_card_mask=torch.from_numpy(cmask_g),
+            rule_bot=bot,
+            detections=giant_left,
+            opponent_tracker=tracker,
+        )
+        self.assertGreater(h_slot, 0)
+        self.assertGreaterEqual(h_tile // 18, 16)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

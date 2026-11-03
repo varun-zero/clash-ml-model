@@ -34,7 +34,7 @@ from configs.constants import (
     ARENA_ROWS,
     ARENA_COLS,
 )
-from policy.model import DeckConditionedPolicy
+from policy.model import DeckConditionedPolicy, compute_spatial_gaussian_tile_loss
 from colab_pipeline.dataset import ClashRoyaleDataset, create_dataloaders
 
 
@@ -96,8 +96,7 @@ def train_one_epoch(
     tile_loss_weight: float = 1.0,
 ) -> Dict[str, float]:
     model.train()
-    card_criterion_none = nn.CrossEntropyLoss(reduction="none")
-    tile_criterion_none = nn.CrossEntropyLoss(reduction="none")
+    card_criterion_none = nn.CrossEntropyLoss(reduction="none", label_smoothing=0.05)
 
     total_loss_accum = 0.0
     card_loss_accum = 0.0
@@ -137,11 +136,16 @@ def train_one_epoch(
             loss_card_per_sample = card_criterion_none(card_logits, target_card)
             loss_card = (loss_card_per_sample * sample_weights).mean()
 
-            # 2. Outcome-weighted Tile Loss
+            # 2. Outcome-weighted 2D Spatial Gaussian Tile Loss
             if played_mask.any():
-                loss_tile_per_sample = tile_criterion_none(tile_logits[played_mask], target_tile[played_mask])
-                weights_played = sample_weights[played_mask]
-                loss_tile = (loss_tile_per_sample * weights_played).mean()
+                loss_tile = compute_spatial_gaussian_tile_loss(
+                    tile_logits=tile_logits[played_mask],
+                    target_tiles=target_tile[played_mask],
+                    legal_tile_mask=tmask[played_mask],
+                    sample_weights=sample_weights[played_mask],
+                    sigma=1.25,
+                    gaussian_blend=0.35,
+                )
             else:
                 loss_tile = torch.tensor(0.0, device=device)
 
