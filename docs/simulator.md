@@ -11,18 +11,16 @@ The engine and policy are research approximations. Some card-specific behavior,
 collision, timing, and live-game edge cases are simplified; a valid card entry
 does not imply exact parity with the current game.
 
-## Local parameter data
+## Parameter Model Data
 
-`data/logic.json` is local generated data and is intentionally excluded from
-version control. To rebuild it, provide the decoded logic directory with
+`data/logic.json` contains decoded unit, spell, and building attributes used by `crsim`.
+It is tracked in the repository to provide out-of-the-box battle simulation.
+To rebuild or update parameters from fresh assets, provide the decoded logic directory with
 `--src` or `CRSIM_LOGIC_SRC`:
 
 ```powershell
 python tools/load_logic.py --src C:\path\to\decoded\logic
 ```
-
-The loader writes `data/logic.json` by default. Do not publish the decoded
-parameter file or extracted game assets.
 
 Run the regression checks from the repository root with `python -m pytest` and
 the focused mechanics probes with `python tools/fidelity.py`.

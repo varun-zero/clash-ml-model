@@ -80,6 +80,41 @@ ClashBot's simulator rewards and pro sparring curriculum (`TacticalProBot`) trai
 
 ---
 
+## 🃏 Authentic 8-Card Cycles & Predefined Decks
+
+ClashBot models the exact **8-card FIFO deck cycle** of Clash Royale. Each deck consists of 8 distinct cards, 4 in hand, and 1 upcoming in the queue:
+
+* **Authentic Tournament Archetypes:**
+  - **PEKKA Bridge Spam:** Pekka (cost 7), Battle Ram, Dark Prince, Royal Ghost, Musketeer, Minions, Poison, Zap.
+  - **Hog 2.6 Cycle:** Hog Rider, Musketeer, Cannon, Ice Golem, Skeletons, Ice Spirit, Fireball, The Log.
+  - **Golem Beatdown:** Golem, Baby Dragon, Inferno Dragon, Mega Minion, Night Witch, Dark Prince, Poison, Zap.
+  - **Classic Log Bait:** Goblin Barrel, Princess, Goblin Gang, Knight, Skeletons, Inferno Tower, The Log, Fireball.
+  - **Giant Beatdown:** Giant, Witch, Mini P.E.K.K.A, Musketeer, Mega Minion, Fireball, Zap, Minions.
+  - **Double Dragon Beatdown:** Golem, Baby Dragon, Inferno Dragon, Mega Minion, Night Witch, Dark Prince, Poison, Zap.
+  - **Mega Knight Bait:** Mega Knight, Inferno Dragon, Princess, Goblin Gang, Bats, Goblin Barrel, Zap, Fireball.
+  - **Lavaloon Air Beatdown:** Lava Hound, Balloon, Mega Minion, Minions, Fireball, Zap, Inferno Dragon, Dark Prince.
+* **🎲 Genuine Randomized Deck Option:** Uniform random sampling of 8 distinct cards without replacement from 35 fully functional competitive cards, rolling a completely new deck every match.
+* **Elixir Banking & Starvation-Free Cadence:** Actions execute at 2.5 Hz (400ms cadence) with a dedicated **Wait / Bank Elixir** policy action that allows heavy 4+ cost win conditions (Hog Rider, Pekka, Golem) to build up elixir without getting starved by cheap card spam.
+
+---
+
+## 🛡️ Reward Shaping & Anti-Farming Safeguards
+
+To prevent the agent from exploiting micro-mechanics rather than winning the game:
+1. **Scaled Decision Bonuses:** Dual-tower kiting and bridge meat-shielding bonuses are scaled to `+0.015` per RL step.
+2. **Strict Episode Micro Cap (`+0.25`):** Cumulative micro shaping is clamped to a strict maximum of `+0.25` per episode, ensuring that macro objectives like tower damage (`+1.0`), crown differential, and match victory (`+3.0`) remain the decisive drivers of policy optimization.
+3. **Entropy Annealing:** Spatial tile entropy is annealed to focus probability mass onto tactical hotspots (king back-corners, center crossfire, and river bridgehead) rather than uniform center-arena clustering.
+
+---
+
+## 📓 Real-Time Telemetry & Obsidian Vault Sync
+
+ClashBot automatically logs training curves, win rates, and spatial deployment distributions directly into Obsidian:
+* **Live Obsidian Note:** Automatically updates `ClashBot - AlphaStar RL Agent.md` with active step counts, win/loss/draw records, and tactical zone tables.
+* **Dark-Themed Telemetry Plot:** `plot_progress.py` renders high-resolution 3-panel performance visualizations (`clashbot_training_curve.png`) tracking Win Rate (%), Policy Gradient Loss, Value Critic MSE, and cumulative match outcomes.
+
+---
+
 ## 🕹️ Interactive Web Spectator UI
 
 ClashBot includes a real-time web dashboard running at `http://127.0.0.1:8080`:
