@@ -1,0 +1,1606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClashBot — Live Match</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #101213;
+  --surface: #151819;
+  --surface-soft: #191d1e;
+  --surface-raised: #202526;
+  --border: #2a3031;
+  --border-soft: #222829;
+  --text: #eeefeb;
+  --muted: #a3aaa8;
+  --quiet: #7d8684;
+  --blue: #79a9cc;
+  --blue-soft: rgba(121, 169, 204, .13);
+  --red: #d58076;
+  --red-soft: rgba(213, 128, 118, .13);
+  --elixir: #b39aca;
+  --amber: #cfaa70;
+  --green: #88b49e;
+  --sans: "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  --radius: 8px;
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; min-width: 0; min-height: 100%; margin: 0; }
+body {
+  height: 100dvh;
+  min-height: 620px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 var(--sans);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+button, select { font: inherit; }
+button, select, canvas { -webkit-tap-highlight-color: transparent; }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+::selection { background: rgba(121, 169, 204, .28); color: var(--text); }
+button { color: inherit; }
+header {
+  z-index: 10;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "left score" "controls controls";
+  align-items: center;
+  gap: 10px 18px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.h-left { grid-area: left; display: flex; align-items: center; gap: 12px; min-width: 0; }
+.logo { display: inline-flex; align-items: center; gap: 9px; flex: 0 0 auto; color: var(--text); font: 650 15px/1 var(--sans); letter-spacing: -.02em; white-space: nowrap; }
+.logo-mark {
+  position: relative; width: 23px; height: 23px; flex: 0 0 auto;
+  border: 1px solid #475150; border-radius: 7px;
+}
+.logo-mark::before, .logo-mark::after { position: absolute; content: ""; border-radius: 1px; }
+.logo-mark::before { left: 4px; bottom: 4px; width: 5px; height: 8px; background: var(--blue); }
+.logo-mark::after { right: 4px; top: 4px; width: 5px; height: 8px; background: var(--red); }
+.logo-bridge { position: absolute; left: 7px; top: 10px; width: 9px; height: 2px; background: var(--green); }
+.pill {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  min-height: 28px; padding: 4px 8px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--surface-soft); color: var(--muted);
+  font: 12px/1.2 var(--sans); white-space: nowrap;
+}
+.pill.cyan { color: var(--blue); border-color: rgba(121,169,204,.32); background: var(--blue-soft); }
+.pill.amber { color: var(--amber); border-color: rgba(207,170,112,.34); background: rgba(207,170,112,.10); }
+.pill.emerald { color: var(--green); border-color: rgba(136,180,158,.32); background: rgba(136,180,158,.10); }
+.deck-field { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--quiet); font-size: 12px; }
+.deck-select {
+  width: clamp(150px, 13vw, 218px); max-width: 100%; min-width: 0;
+  padding: 8px 30px 8px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg); color: var(--text); font: 13px var(--sans); cursor: pointer;
+}
+.deck-select:hover { border-color: #46504f; }
+.h-center {
+  grid-area: score; display: flex; align-items: center; justify-content: flex-end;
+  gap: 14px; padding: 5px 0 5px 14px; white-space: nowrap;
+}
+.crown-score { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.c-blue, .c-red { display: inline-flex; align-items: center; gap: 6px; }
+.c-blue { color: var(--blue); }
+.c-red { color: var(--red); }
+.clock { min-width: 58px; color: var(--text); font: 650 16px/1 var(--mono); }
+#otBadge { min-height: 25px; }
+.h-right { grid-area: controls; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.control-group, .speed-group { display: flex; align-items: center; gap: 4px; }
+.control-label { margin-right: 3px; color: var(--quiet); font-size: 12px; }
+.speed-group { padding-left: 10px; border-left: 1px solid var(--border); }
+.btn {
+  min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 6px 10px; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--muted); font: 12px/1.2 var(--sans);
+  white-space: nowrap; cursor: pointer; transition: background-color .14s ease, color .14s ease, border-color .14s ease;
+}
+.btn:hover { background: var(--surface-raised); color: var(--text); }
+.btn.active { background: var(--surface-raised); color: var(--text); border-color: #394142; }
+.btn.danger { color: var(--red); }
+.btn.danger:hover { background: var(--red-soft); }
+.btn.primary { border-color: var(--border); color: var(--text); }
+header .h-right .transport { margin-left: auto; display: flex; gap: 5px; }
+main {
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  display: grid; grid-template-columns: minmax(340px, .96fr) minmax(420px, 1.08fr) minmax(290px, .76fr);
+  gap: 0; padding: 0 12px 10px; overflow: hidden;
+}
+.col {
+  min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
+  padding: 0 12px; border-right: 1px solid var(--border-soft);
+}
+.col:last-child { border-right: 0; }
+.sec-head {
+  flex: 0 0 46px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  border-bottom: 1px solid var(--border); color: var(--muted);
+}
+.sec-head h1, .sec-head h2 { margin: 0; color: var(--text); font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.sec-head > span { min-width: 0; overflow: hidden; color: var(--quiet); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+#fpsLockBadge { color: var(--green) !important; }
+.arena-stage {
+  position: relative; flex: 1 1 auto; min-height: 0; display: grid; place-items: center;
+  margin: 10px 0 8px; overflow: hidden; border: 1px solid var(--border);
+  border-radius: 10px; background: #121718;
+}
+#battleCanvas {
+  position: absolute; left: 50%; top: 50%; display: block;
+  width: auto; height: calc(100% - 16px);
+  max-width: calc(100% - 16px); max-height: calc(100% - 16px);
+  aspect-ratio: 342 / 576; border-radius: 6px; cursor: crosshair;
+  transform: translate(-50%, -50%); transition: transform .24s ease;
+}
+#battleCanvas.iso-tilt { transform: translate(-50%, -50%) perspective(950px) rotateX(18deg) scale(.95); }
+.arena-hud-top {
+  position: absolute; z-index: 5; top: 10px; left: 10px; right: 10px;
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
+  pointer-events: none;
+}
+.status-banner {
+  min-width: 0; max-width: 75%; display: flex; align-items: center; gap: 7px;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: 7px;
+  background: rgba(16,18,19,.93); color: var(--muted); font-size: 12px;
+}
+#intentText { min-width: 0; overflow: hidden; color: var(--text) !important; text-overflow: ellipsis; white-space: nowrap; }
+.status-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--blue); }
+.hand-dock { flex: 0 0 auto; padding: 6px 0 2px; }
+.elixir-strip { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; }
+#blueElixirLbl { min-width: 74px; color: var(--elixir) !important; font: 600 12px var(--sans) !important; }
+.pips-wrap { flex: 1; display: grid; grid-template-columns: repeat(10, minmax(0,1fr)); gap: 3px; height: 8px; }
+.pip { overflow: hidden; border-radius: 3px; background: #252a2b; }
+.pip-fill { height: 100%; background: var(--elixir); transition: width .1s linear; }
+#deltaElixirTag { min-width: 56px; text-align: right; font-size: 12px !important; }
+.cards-row { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) minmax(62px,.72fr); gap: 6px; }
+.deck-card {
+  min-width: 0; height: 72px; display: flex; flex-direction: column; justify-content: space-between;
+  padding: 8px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px;
+  appearance: none; background: var(--surface); color: var(--text); font: inherit; text-align: left; cursor: pointer;
+}
+.deck-card:hover { border-color: #5d6c6c; background: var(--surface-soft); }
+.deck-card.chosen { border-color: var(--blue); background: var(--blue-soft); }
+.deck-card.selected-manual { outline: 2px solid var(--amber); outline-offset: 1px; }
+.deck-card.unaffordable { opacity: .48; }
+.cost-hex { min-width: 20px; height: 20px; display: grid; place-items: center; border-radius: 5px; background: rgba(179,154,202,.17); color: var(--elixir); font: 650 12px var(--sans); }
+.card-prob { color: var(--quiet); font-size: 12px; }
+.card-name { overflow: hidden; color: var(--text); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.card-role { color: var(--quiet); font-size: 12px; }
+.deck-card:last-child { align-items: center; justify-content: center; gap: 5px; border-style: dashed; color: var(--muted); text-align: center; }
+.deck-roster { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.roster-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
+#deckRosterTitle { color: var(--muted) !important; font-size: 12px !important; font-weight: 600 !important; }
+#deckTypeBadge { overflow: hidden; color: var(--quiet) !important; font-size: 12px !important; font-weight: 500 !important; text-overflow: ellipsis; white-space: nowrap; }
+#deckRosterPills { display: grid !important; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 5px !important; overflow: visible !important; font-size: 12px !important; }
+#deckRosterPills .pill {
+  min-width: 0; justify-content: flex-start; overflow: hidden; padding: 5px 7px !important;
+  font-size: 12px !important; text-overflow: ellipsis;
+}
+#deckRosterPills .pill[aria-label] { gap: 0; }
+.next-card-name { max-width: 100%; overflow: hidden; color: var(--amber); font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.cycle-queue {
+  margin-top: 7px; color: var(--muted); font-size: 12px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 3px 7px;
+}
+.cycle-queue .cycle-label { color: var(--quiet); }
+.cycle-queue .cycle-cards { overflow: hidden; text-overflow: ellipsis; }
+#toastBar { min-height: 24px; margin-top: 4px; color: var(--quiet) !important; font-size: 12px !important; text-align: left !important; }
+.center-grid {
+  flex: 1 1 auto; min-height: 0; display: grid;
+  grid-template-rows: minmax(92px,.62fr) minmax(150px,1.12fr) minmax(116px,.82fr) minmax(190px,1.12fr);
+}
+.chart-box { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 12px 0; border-bottom: 1px solid var(--border-soft); }
+.right-split { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.right-split > .chart-box:first-child { flex: 0 0 auto; padding-top: 12px; }
+.right-split > .chart-box:nth-child(2) { flex: 0 0 220px; }
+.right-split .stream-list { flex: 1 1 auto; }
+.box-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: var(--muted); font-size: 13px; font-weight: 550; }
+.box-title > span:last-child { color: var(--quiet); font-size: 12px; font-weight: 500; }
+.layer-strip { flex: 1; display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 12px; align-items: end; }
+.node-card { min-width: 0; padding: 0; border: 0; background: none; }
+.node-top { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; color: var(--muted); font-size: 12px; }
+.node-top span:first-child { white-space: nowrap; }
+.node-top span:last-child { color: var(--quiet) !important; white-space: nowrap; }
+.mini-bars { height: 34px; display: flex; align-items: end; gap: 3px; margin-top: 6px; }
+.m-bar { flex: 1; min-width: 2px; border-radius: 2px 2px 0 0; background: #5d7777; }
+.m-bar:nth-child(4n+2) { background: #9b7f65; }
+.m-bar:nth-child(4n+3) { background: #887798; }
+.m-bar:nth-child(4n) { background: #796e5a; }
+.chart-canvas { display: block; width: 100%; min-height: 0; flex: 1 1 auto; }
+.split-bottom { min-height: 0; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 18px; }
+.split-bottom .chart-box { border-bottom: 0; }
+#policyRowsContainer { display: flex; flex-direction: column; gap: 11px; margin-top: 3px !important; }
+.policy-row { display: grid; grid-template-columns: minmax(74px,112px) minmax(30px,1fr) 48px; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+.policy-row > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.p-bar-wrap { height: 6px; overflow: hidden; border-radius: 4px; background: var(--surface-raised); }
+.p-bar-fill { height: 100%; border-radius: inherit; background: var(--blue); }
+.series-legend { display: inline-flex; align-items: center; gap: 9px; margin-left: 10px; color: var(--quiet); font-size: 12px; font-weight: 400; }
+.series-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.series-dot { width: 7px; height: 7px; border-radius: 50%; }
+.series-dot.blue { background: var(--blue); }
+.series-dot.red { background: var(--red); }
+#opponentTitle { min-width: 0; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+#oppHandPills {
+  display: grid !important; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 5px !important;
+  color: var(--muted); font-size: 12px !important;
+}
+#oppHandPills .pill { min-width: 0; justify-content: flex-start; overflow: hidden; padding: 5px 7px !important; font-size: 12px !important; text-overflow: ellipsis; }
+#oppHandPills .pill.red-hand { color: var(--red); border-color: rgba(213,128,118,.38); background: var(--red-soft); }
+.spatial-split { flex: 1; display: grid; grid-template-columns: 112px minmax(0,1fr); gap: 14px; min-height: 0; align-items: center; }
+#miniHeatCanvas { display: block; width: 100%; height: auto; max-height: 100%; border: 1px solid var(--border); border-radius: 7px; }
+.spatial-title { margin-bottom: 6px; color: var(--muted); font-size: 13px; }
+#topCandidatesList { min-width: 0; }
+.cand-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 33px; border-bottom: 1px solid var(--border-soft); color: var(--text); font-size: 12px; }
+.cand-row > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stream-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 0 2px; scrollbar-color: #46504f var(--surface); scrollbar-width: thin; }
+.stream-item { min-height: 34px; display: grid; grid-template-columns: 42px 36px minmax(0,1fr) auto; gap: 7px; align-items: center; border-bottom: 1px solid var(--border-soft); color: var(--text); font-size: 12px; }
+.stream-item span:last-child { color: var(--quiet); }
+.tag-b { color: var(--blue); font-size: 12px; font-weight: 650; }
+.tag-r { color: var(--red); font-size: 12px; font-weight: 650; }
+.footer-actions { display: flex; gap: 7px; padding-top: 8px; }
+.footer-actions .btn { flex: 1; min-width: 0; border-color: var(--border-soft); }
+@media (max-width: 1320px) {
+  header { grid-template-columns: minmax(0,1fr) auto; }
+  .h-left { flex-wrap: wrap; }
+  main { grid-template-columns: minmax(310px,.9fr) minmax(380px,1.1fr); overflow-y: auto; }
+  .inspector-col { grid-column: 1 / -1; min-height: 500px; display: grid; grid-template-rows: 46px minmax(0,1fr); }
+  .inspector-col .right-split { display: grid; grid-template-columns: minmax(230px,.8fr) minmax(300px,1fr) minmax(260px,1fr); grid-template-rows: minmax(0,1fr) auto; gap: 14px; }
+  .inspector-col .stream-list { max-height: 330px; }
+  .inspector-col .footer-actions { grid-column: 1 / -1; }
+  body { overflow: auto; height: auto; min-height: 100dvh; }
+  header { position: sticky; top: 0; }
+}
+@media (max-width: 900px) {
+  header { grid-template-columns: minmax(0,1fr); grid-template-areas: "left" "score" "controls"; gap: 8px; padding: 9px 12px; }
+  .h-left { display: grid; grid-template-columns: auto auto minmax(0,1fr) minmax(0,1fr) auto; gap: 6px; }
+  .deck-field { min-width: 0; gap: 4px; }
+  .deck-select { width: auto; min-width: 0; flex: 1 1 auto; }
+  .h-center { justify-content: flex-start; padding: 2px 0; }
+  .h-right { overflow-x: auto; padding: 1px 0 3px; scrollbar-width: thin; }
+  .control-label { display: none; }
+  .btn, .deck-select { min-height: 44px; }
+  main { display: flex; flex-direction: column; overflow: visible; padding: 0 12px 18px; }
+  .col { overflow: visible; border-right: 0; padding: 0; }
+  .match-col { min-height: 0; }
+  .arena-stage { flex: none; height: min(62dvh, 600px); min-height: 300px; }
+  #battleCanvas { height: calc(100% - 16px); width: auto; max-width: calc(100% - 16px); }
+  .hand-dock { padding: 3px 0 8px; }
+  .elixir-strip { gap: 7px; margin-bottom: 5px; }
+  .pips-wrap { gap: 2px; height: 7px; }
+  .cards-row { gap: 4px; }
+  .deck-card { height: 60px; padding: 6px; }
+  .cost-hex { min-width: 18px; height: 18px; }
+  .card-role { display: none; }
+  .deck-roster { margin-top: 5px; padding-top: 5px; }
+  .roster-head { margin-bottom: 5px; }
+  #deckRosterPills { gap: 4px !important; }
+  #deckRosterPills .pill { min-height: 30px; padding: 4px 6px !important; }
+  .cycle-queue { margin-top: 4px; }
+  #toastBar { min-height: 18px; margin-top: 2px; }
+  .analytics-col { min-height: 650px; }
+  .center-grid { min-height: 600px; }
+  .inspector-col { min-height: 660px; display: flex; }
+  .inspector-col .right-split { display: flex; }
+  .inspector-col .stream-list { max-height: 360px; }
+  .split-bottom { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 520px) {
+  .h-left {
+    grid-template-columns: minmax(0,1fr) minmax(0,1fr) auto;
+    grid-template-areas: "brand step shuffle" "blue red .";
+    gap: 6px;
+  }
+  .h-left .logo { grid-area: brand; }
+  #stepPill { grid-area: step; justify-self: start; }
+  .h-left .deck-field:nth-of-type(1) { grid-area: blue; }
+  .h-left .deck-field:nth-of-type(2) { grid-area: red; }
+  .h-left > button { grid-area: shuffle; }
+  .deck-field { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .deck-select { width: 100%; padding: 5px 24px 5px 7px; font-size: 12px; }
+  .btn { padding: 6px 8px; }
+  .speed-group { padding-left: 6px; }
+  .cards-row { grid-template-columns: repeat(4,minmax(0,1fr)); }
+  .deck-card:last-child { grid-column: 1 / -1; height: 42px; flex-direction: row; }
+  #deckRosterPills { grid-template-columns: repeat(2,minmax(0,1fr)) !important; }
+  .split-bottom { grid-template-columns: 1fr; }
+  .split-bottom .chart-box { min-height: 180px; }
+  .layer-strip { gap: 7px; }
+  .node-top { flex-direction: column; }
+  .spatial-split { grid-template-columns: 88px minmax(0,1fr); }
+  .stream-item { grid-template-columns: 38px 32px minmax(0,1fr); }
+  .stream-item span:last-child { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+}
+</style>
+</head>
+<body>
+<header class="app-header">
+  <div class="h-left">
+    <div class="logo"><span class="logo-mark" aria-hidden="true"><i class="logo-bridge"></i></span><span>ClashBot</span></div>
+    <span class="pill cyan" id="stepPill">MODEL 0</span>
+    <label class="deck-field"><span>Blue</span>
+      <select class="deck-select" id="blueDeckSelect" aria-label="Blue deck" onchange="applyDeckChange()">
+        <option value="Randomized Deck">Random · 35 cards</option>
+        <option value="Golem Beatdown">Golem Beatdown</option>
+        <option value="PEKKA Bridge Spam">PEKKA Bridge Spam</option>
+        <option value="Classic Log Bait">Classic Log Bait</option>
+        <option value="Hog 2.6 Cycle">Hog 2.6 Cycle</option>
+        <option value="Giant Beatdown">Giant Beatdown</option>
+        <option value="Double Dragon Beatdown">Golem Double Dragon</option>
+        <option value="Mega Knight Bait">Mega Knight Bait</option>
+        <option value="Lavaloon Air Beatdown">LavaLoon Air Beatdown</option>
+      </select>
+    </label>
+    <label class="deck-field"><span>Red</span>
+      <select class="deck-select" id="redDeckSelect" aria-label="Red deck" onchange="applyDeckChange()">
+        <option value="Randomized Deck">Random · 35 cards</option>
+        <option value="Classic Log Bait">Classic Log Bait</option>
+        <option value="Golem Beatdown">Golem Beatdown</option>
+        <option value="PEKKA Bridge Spam">PEKKA Bridge Spam</option>
+        <option value="Hog 2.6 Cycle">Hog 2.6 Cycle</option>
+        <option value="Giant Beatdown">Giant Beatdown</option>
+        <option value="Double Dragon Beatdown">Golem Double Dragon</option>
+        <option value="Mega Knight Bait">Mega Knight Bait</option>
+        <option value="Lavaloon Air Beatdown">LavaLoon Air Beatdown</option>
+      </select>
+    </label>
+    <button class="btn primary" onclick="quickRandomizeDecks()" title="Roll fresh 8-card decks from the supported 35-card pool">Shuffle decks</button>
+  </div>
+
+  <div class="h-center">
+    <div class="crown-score">
+      <span class="c-blue" id="blueCrownCount">BLUE 0</span>
+      <span aria-hidden="true" style="color:var(--quiet)">:</span>
+      <span class="c-red" id="redCrownCount">0 RED</span>
+    </div>
+    <div class="clock" id="clockReadout">03:00</div>
+    <span class="pill amber" id="otBadge" style="display:none;">2× Elixir</span>
+  </div>
+
+  <nav class="h-right" aria-label="Match controls">
+    <div class="control-group" aria-label="Arena display">
+      <span class="control-label">Arena</span>
+      <button class="btn" id="btnIso" onclick="toggleIso()">2.5D</button>
+      <button class="btn active" id="btnHeat" onclick="toggleHeatmap()">Contours</button>
+      <button class="btn active" id="btnVectors" onclick="toggleVectors()">Vectors</button>
+    </div>
+    <div class="speed-group" aria-label="Simulation speed">
+      <span class="control-label">Speed</span>
+      <button class="btn active" id="sp1" onclick="setSimSpeed(1)">1×</button>
+      <button class="btn" id="sp2" onclick="setSimSpeed(2)">2×</button>
+      <button class="btn" id="sp4" onclick="setSimSpeed(4)">4×</button>
+      <button class="btn" id="sp10" onclick="setSimSpeed(10)">10×</button>
+      <button class="btn" id="sp20" onclick="setSimSpeed(20)">20×</button>
+    </div>
+    <div class="transport">
+      <button class="btn" id="pauseBtn" onclick="togglePauseGame()">Pause</button>
+      <button class="btn danger" onclick="resetCurrentGame()">Reset</button>
+    </div>
+  </nav>
+</header>
+
+<main>
+  <section class="col match-col" aria-label="Live match">
+    <div class="sec-head">
+      <h1>Match</h1>
+      <span id="fpsLockBadge">100 ms tick</span>
+    </div>
+
+    <div class="arena-stage" id="arenaStage">
+      <div class="arena-hud-top">
+        <div class="status-banner" id="intentBanner">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="intentText">Starting match…</span>
+        </div>
+        <div class="status-banner">
+          <span>Red</span><strong id="redElixirTxt">5.0</strong><span>elixir</span>
+        </div>
+      </div>
+      <canvas id="battleCanvas" width="342" height="576" tabindex="0" aria-label="ClashBot arena. Select a card, then choose a deployment tile. Use the arrow keys and Enter to place a selected card."></canvas>
+    </div>
+
+    <section class="hand-dock" aria-label="Blue hand and deck cycle">
+      <div class="elixir-strip">
+        <span id="blueElixirLbl">Elixir 5.0</span>
+        <div class="pips-wrap" id="elixirPips" aria-label="Elixir meter"></div>
+        <span id="deltaElixirTag">+0.0 Δ</span>
+      </div>
+
+      <div class="cards-row" id="cardsRow" aria-label="Current hand">
+        <!-- Four active cards and the next card are rendered from match state. -->
+      </div>
+
+      <div class="deck-roster">
+        <div class="roster-head">
+          <span id="deckRosterTitle">BLUE · 8 CARDS</span>
+          <span id="deckTypeBadge">DECK PROFILE</span>
+        </div>
+        <div id="deckRosterPills" aria-label="All eight cards in the Blue deck"></div>
+        <div class="cycle-queue" id="cycleQueueText" aria-live="polite">
+          <span class="cycle-label">Cycle</span><span class="cycle-cards">Waiting for match state</span>
+        </div>
+      </div>
+
+      <div id="toastBar" role="status" aria-live="polite">Select a card, then select a tile in the arena.</div>
+    </section>
+  </section>
+
+  <section class="col analytics-col" aria-label="Policy and match analytics">
+    <div class="sec-head">
+      <h2>Policy</h2>
+      <span id="headerTelemetryTag">Loading policy…</span>
+    </div>
+
+    <div class="center-grid">
+      <section class="chart-box">
+        <div class="box-title"><span>Network activity</span><span>Live</span></div>
+        <div class="layer-strip" id="layerStrip"></div>
+      </section>
+
+      <section class="chart-box">
+        <div class="box-title">
+          <span>Win outlook</span>
+          <span id="criticReadout">+0.00 · Even</span>
+        </div>
+        <canvas class="chart-canvas" id="criticChart" aria-label="Value estimate over time"></canvas>
+      </section>
+
+      <section class="chart-box">
+        <div class="box-title">
+          <span>Elixir <span class="series-legend" aria-label="Blue and Red elixir"><span><i class="series-dot blue"></i>Blue</span><span><i class="series-dot red"></i>Red</span></span></span>
+          <span id="elixirRateTag">0.35 / sec</span>
+        </div>
+        <canvas class="chart-canvas" id="elixirChart" aria-label="Blue and Red elixir over time"></canvas>
+      </section>
+
+      <div class="split-bottom">
+        <section class="chart-box">
+          <div class="box-title"><span>Card choice</span><span id="cardMaskTag">Ready</span></div>
+          <div id="policyRowsContainer"></div>
+        </section>
+        <section class="chart-box">
+          <div class="box-title"><span>Policy posture</span><span id="radarPostureTag">—</span></div>
+          <canvas class="chart-canvas" id="radarChart" aria-label="Policy posture by tactical dimension"></canvas>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <aside class="col inspector-col" aria-label="Opponent and match activity">
+    <div class="sec-head">
+      <h2>Activity</h2>
+      <span id="targetTileSummaryTag">Placement distribution</span>
+    </div>
+
+    <div class="right-split">
+      <section class="chart-box">
+        <div class="box-title">
+          <span id="opponentTitle">Opponent deck</span>
+        </div>
+        <div id="oppHandPills" aria-label="Cards in the Red deck"></div>
+      </section>
+
+      <section class="chart-box">
+        <div class="box-title"><span class="spatial-title">Likely placements</span></div>
+        <div class="spatial-split">
+          <canvas id="miniHeatCanvas" width="96" height="148" aria-label="Arena placement density"></canvas>
+          <div id="topCandidatesList">
+            <div class="cand-row"><span>Waiting…</span><span>—</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="stream-list" id="streamList" aria-label="Recent match events"></div>
+
+      <div class="footer-actions">
+        <button class="btn" onclick="exportCurrentReplay()">Export replay</button>
+        <button class="btn" onclick="stepSingleTick()">Step 1 tick</button>
+      </div>
+    </div>
+  </aside>
+</main>
+<script>
+  let gameState = null;
+  let showHeat = true;
+  let showVec = true;
+  let tick = 0;
+  let manualSelectedIdx = null;
+  let manualTarget = { x: 8.5, y: 5.5 };
+  let decksPopulated = false;
+
+  const bCanvas = document.getElementById('battleCanvas');
+  const bCtx = bCanvas.getContext('2d');
+  const cChart = document.getElementById('criticChart');
+  const eChart = document.getElementById('elixirChart');
+  const rChart = document.getElementById('radarChart');
+  const mHeat = document.getElementById('miniHeatCanvas');
+
+  // Convert arena coords (0..18, 0..32) to canvas coordinates
+  // Blue is at y = 3.0..6.5 (bottom), Red is at y = 25.5..29.0 (top)
+  function gx(x) { return (x / 18.0) * bCanvas.width; }
+  function gy(y) { return ((32.0 - y) / 32.0) * bCanvas.height; }
+
+  // 1. Initialize Pips & Layer Strip
+  const pipsWrap = document.getElementById('elixirPips');
+  for (let i = 0; i < 10; i++) {
+    const pip = document.createElement('div');
+    pip.className = 'pip';
+    const fill = document.createElement('div');
+    fill.className = 'pip-fill';
+    fill.id = `pip_fill_${i}`;
+    pip.appendChild(fill);
+    pipsWrap.appendChild(pip);
+  }
+
+  const defaultLayers = [
+    { name: 'Entities', dim: '40 × 128' },
+    { name: 'Spatial', dim: '6 × 32 × 18' },
+    { name: 'Fusion', dim: '128-D' },
+    { name: 'Card policy', dim: '5 choices' },
+    { name: 'Tile policy', dim: '576 tiles' }
+  ];
+  const layerStrip = document.getElementById('layerStrip');
+  defaultLayers.forEach((l, idx) => {
+    const card = document.createElement('div');
+    card.className = 'node-card';
+    let barsHtml = '';
+    for (let b = 0; b < 8; b++) {
+      barsHtml += `<div class="m-bar" id="lbar_${idx}_${b}" style="height:25%"></div>`;
+    }
+    card.innerHTML = `<div class="node-top"><span>${l.name}</span><span style="color:var(--blue)">${l.dim}</span></div><div class="mini-bars">${barsHtml}</div>`;
+    layerStrip.appendChild(card);
+  });
+
+  // 2. Poll Backend Game State
+  async function pollState() {
+    try {
+      const res = await fetch('/api/state');
+      if (res.ok) {
+        gameState = await res.json();
+        updateUI();
+      }
+    } catch (err) {
+      console.error('UI poll error:', err);
+    }
+  }
+  setInterval(pollState, 100);
+
+  // 3. Update Dashboard Elements
+  function updateUI() {
+    if (!gameState || !gameState.initialized) return;
+
+    // Header metrics
+    document.getElementById('stepPill').textContent = `MODEL ${(gameState.latest_ckpt_step || 0).toLocaleString()}`;
+    document.getElementById('blueCrownCount').textContent = `BLUE ${gameState.crowns[0]}`;
+    document.getElementById('redCrownCount').textContent = `${gameState.crowns[1]} RED`;
+
+    const sec = Math.max(0, gameState.time_left_sec || 0);
+    const mm = Math.floor(sec / 60);
+    const ss = sec % 60;
+    document.getElementById('clockReadout').textContent = `${mm < 10 ? '0' : ''}${mm}:${ss < 10 ? '0' : ''}${ss}`;
+
+    const elapsedMs = Math.max(0, Number(gameState.t_ms) || 0);
+    const elixirMultiplier = elapsedMs >= 240_000 ? 3 : (elapsedMs >= 120_000 ? 2 : 1);
+    const elixirRate = (10_000 / [28_000, 14_000, 9_300][elixirMultiplier - 1]).toFixed(2);
+    const isBoosted = elixirMultiplier > 1;
+    const otBadge = document.getElementById('otBadge');
+    otBadge.style.display = isBoosted ? 'inline-flex' : 'none';
+    otBadge.textContent = gameState.is_overtime ? `OT · ${elixirMultiplier}×` : `${elixirMultiplier}× Elixir`;
+    document.getElementById('elixirRateTag').textContent = `${elixirRate} / sec`;
+
+    document.getElementById('pauseBtn').textContent = gameState.paused ? 'RESUME' : 'PAUSE';
+    const currentSpeed = Number(gameState.speed) || 1;
+    [1, 2, 4, 10, 20].forEach(speed => {
+      const button = document.getElementById(`sp${speed}`);
+      if (button) button.classList.toggle('active', currentSpeed === speed);
+    });
+
+    // Populate or update decks dropdown
+    const bSel = document.getElementById('blueDeckSelect');
+    const rSel = document.getElementById('redDeckSelect');
+    if (gameState.popular_decks && (!decksPopulated || bSel.options.length !== gameState.popular_decks.length)) {
+      bSel.innerHTML = '';
+      rSel.innerHTML = '';
+      gameState.popular_decks.forEach(d => {
+        const isRand = (d === 'Randomized Deck');
+        const bOpt = document.createElement('option');
+        bOpt.value = d;
+        bOpt.textContent = isRand ? 'Random · 35 cards' : d;
+        if (d === gameState.blue_deck_name) bOpt.selected = true;
+        bSel.appendChild(bOpt);
+
+        const rOpt = document.createElement('option');
+        rOpt.value = d;
+        rOpt.textContent = isRand ? 'Random · 35 cards' : d;
+        if (d === gameState.red_deck_name) rOpt.selected = true;
+        rSel.appendChild(rOpt);
+      });
+      decksPopulated = true;
+    }
+
+    // Keep dropdown selection matching active deck if not currently interacting or changing decks
+    if (!isChangingDecks) {
+      if (bSel && document.activeElement !== bSel && gameState.blue_deck_name && bSel.value !== gameState.blue_deck_name) {
+        bSel.value = gameState.blue_deck_name;
+      }
+      if (rSel && document.activeElement !== rSel && gameState.red_deck_name && rSel.value !== gameState.red_deck_name) {
+        rSel.value = gameState.red_deck_name;
+      }
+    }
+
+    // Elixir Bars & Pips
+    const blueE = Math.min(10.0, Math.max(0.0, gameState.elixir[0]));
+    const redE = Math.min(10.0, Math.max(0.0, gameState.elixir[1]));
+    document.getElementById('blueElixirLbl').textContent = `Elixir ${blueE.toFixed(1)}`;
+    document.getElementById('redElixirTxt').textContent = redE.toFixed(1);
+
+    for (let i = 0; i < 10; i++) {
+      const fillEl = document.getElementById(`pip_fill_${i}`);
+      if (fillEl) {
+        if (blueE >= i + 1) {
+          fillEl.style.width = '100%';
+        } else if (blueE > i) {
+          fillEl.style.width = `${((blueE - i) * 100).toFixed(0)}%`;
+        } else {
+          fillEl.style.width = '0%';
+        }
+      }
+    }
+
+    const deltaE = gameState.delta_e !== undefined ? gameState.delta_e : (blueE - redE);
+    const deltaEl = document.getElementById('deltaElixirTag');
+    deltaEl.textContent = `${deltaE >= 0 ? '+' : ''}${deltaE.toFixed(1)} ΔE`;
+    deltaEl.style.color = deltaE >= 0 ? 'var(--green)' : 'var(--red)';
+
+    // Intent & Match End Display (Bug 3 Fix: Non-blocking in Top Status Banner)
+    const nh = gameState.neural_hud;
+    const telemetryTag = document.getElementById('headerTelemetryTag');
+    if (nh && nh.layer_signals) {
+      telemetryTag.textContent = `${nh.layer_signals.entity_count} entities · core ${Number(nh.layer_signals.core_energy).toFixed(2)}`;
+    } else {
+      telemetryTag.textContent = 'Policy unavailable';
+    }
+    const radarTag = document.getElementById('radarPostureTag');
+    if (nh && nh.tactical_radar) {
+      const pressure = Number(nh.tactical_radar.aggro) || 0;
+      const defense = Number(nh.tactical_radar.def) || 0;
+      radarTag.textContent = nh.is_waiting ? 'Waiting'
+        : (pressure > defense + 0.25 ? 'Pressing'
+          : (defense > pressure + 0.25 ? 'Defending' : 'Balanced'));
+    } else {
+      radarTag.textContent = '—';
+    }
+    const intentBanner = document.getElementById('intentBanner');
+    const intentText = document.getElementById('intentText');
+
+    if (gameState.done) {
+      if (gameState.winner === 0) {
+        intentText.textContent = `Match complete · Blue ${gameState.crowns[0]}–${gameState.crowns[1]}`;
+        intentBanner.style.borderColor = 'var(--blue)';
+      } else if (gameState.winner === 1) {
+        intentText.textContent = `Match complete · Red ${gameState.crowns[1]}–${gameState.crowns[0]}`;
+        intentBanner.style.borderColor = 'var(--red)';
+      } else {
+        intentText.textContent = `Match complete · Draw ${gameState.crowns[0]}–${gameState.crowns[1]}`;
+        intentBanner.style.borderColor = 'var(--amber)';
+      }
+    } else if (nh && nh.tactical_intent) {
+      const intentTeam = nh.team === 1 ? 1 : 0;
+      const teamName = intentTeam === 0 ? 'Blue' : 'Red';
+      const teamColor = intentTeam === 0 ? 'var(--blue)' : 'var(--red)';
+      if (nh.is_waiting) {
+        intentText.textContent = `${teamName} saving elixir · ${gameState.elixir[intentTeam].toFixed(1)} / 10`;
+      } else {
+        intentText.textContent = `${teamName} · ${nh.tactical_intent.summary}`;
+      }
+      intentBanner.style.borderColor = teamColor;
+    } else {
+      intentText.textContent = 'Match in progress';
+      intentBanner.style.borderColor = 'var(--border)';
+    }
+
+    // Hand Cards Row
+    const cardsRow = document.getElementById('cardsRow');
+    cardsRow.innerHTML = '';
+    const chosenSlot = (nh && nh.tactical_intent) ? nh.tactical_intent.best_slot : -1;
+    const cardProbs = (nh && nh.probs) ? nh.probs : [0,0,0,0,0];
+
+    (gameState.hand || []).forEach((c, idx) => {
+      const cardDiv = document.createElement('button');
+      cardDiv.type = 'button';
+      const isChosenByAi = (chosenSlot === idx);
+      const isManual = (manualSelectedIdx === idx);
+      cardDiv.className = `deck-card ${isChosenByAi ? 'chosen' : ''} ${isManual ? 'selected-manual' : ''} ${c.affordable ? '' : 'unaffordable'}`;
+      cardDiv.setAttribute('aria-pressed', String(isManual));
+      cardDiv.setAttribute('aria-label', `${formatCardName(c.name)}, ${c.cost} elixir${c.affordable ? '' : ', not currently playable'}`);
+      cardDiv.onclick = () => selectCardManual(idx);
+
+      const probVal = (cardProbs[idx] * 100).toFixed(1);
+      const role = c.is_spell ? 'SPELL' : 'TROOP';
+      const cardName = formatCardName(c.name);
+
+      cardDiv.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span class="cost-hex">${c.cost}</span>
+          <span class="card-prob">${probVal}%</span>
+        </div>
+        <div class="card-name" title="${cardName}">${cardName}</div>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span class="card-role">${role}</span>
+          <span style="font-size:12px; color:var(--muted);">${idx+1}</span>
+        </div>
+      `;
+      cardsRow.appendChild(cardDiv);
+    });
+
+    // 5th Next Queued Card
+    const nextCardName = gameState.next_card || 'Cycle';
+    const nextDiv = document.createElement('div');
+    nextDiv.className = 'deck-card';
+    nextDiv.style.alignItems = 'center';
+    nextDiv.style.justifyContent = 'center';
+    nextDiv.style.borderStyle = 'dashed';
+    nextDiv.innerHTML = `
+      <span style="font-size:12px; color:var(--text);">Next</span>
+      <span class="next-card-name" title="${formatCardName(nextCardName)}">${formatCardName(nextCardName)}</span>
+    `;
+    cardsRow.appendChild(nextDiv);
+
+    // Blue Deck 8-Card Full Roster & Cycle Queue Update
+    const badge = document.getElementById('deckTypeBadge');
+    if (badge) {
+      const isRand = (gameState.blue_deck_name === 'Randomized Deck');
+      badge.textContent = isRand ? 'Random · 35-card pool' : (gameState.blue_deck_name || 'Custom deck');
+      badge.style.color = isRand ? 'var(--green)' : 'var(--amber)';
+    }
+
+    const rosterEl = document.getElementById('deckRosterPills');
+    if (rosterEl && gameState.blue_deck) {
+      rosterEl.innerHTML = '';
+      const inHand = new Set((gameState.hand || []).map(c => c.name));
+      const nextCard = gameState.next_card;
+      gameState.blue_deck.forEach(cName => {
+        const p = document.createElement('span');
+        const isH = inHand.has(cName);
+        const isN = (cName === nextCard);
+        const inCycle = (gameState.cycle?.[0] || []).includes(cName);
+        p.className = `pill ${isH ? 'cyan' : (isN ? 'amber' : '')}`;
+        p.title = `${formatCardName(cName)} · ${isH ? 'in hand' : (isN ? 'next in cycle' : (inCycle ? 'in cycle' : 'deck'))}`;
+        p.setAttribute('aria-label', `${formatCardName(cName)}: ${isH ? 'hand' : (isN ? 'next in cycle' : (inCycle ? 'in cycle' : 'deck'))}`);
+        p.textContent = `${formatCardName(cName)}${isH ? ' · H' : (isN ? ' · N' : '')}`;
+        rosterEl.appendChild(p);
+      });
+    }
+
+    const cycleQueueText = document.getElementById('cycleQueueText');
+    if (cycleQueueText && gameState.cycle && gameState.cycle[0] && gameState.cycle[0].length > 0) {
+      const qNames = gameState.cycle[0].map(formatCardName).join(' → ');
+      cycleQueueText.innerHTML = `<span class="cycle-label">Next</span><span class="cycle-cards" title="${qNames}">${qNames}</span>`;
+    }
+
+    // Neural Layer Activation Bars
+    if (nh && nh.layers) {
+      nh.layers.forEach((layer, lIdx) => {
+        (layer.bars || []).forEach((bVal, bIdx) => {
+          const barEl = document.getElementById(`lbar_${lIdx}_${bIdx}`);
+          if (barEl) {
+            const pct = Math.max(10, Math.min(100, Math.round(bVal * 100)));
+            barEl.style.height = `${pct}%`;
+          }
+        });
+      });
+    }
+
+    // Policy Rows (Head 1 Autoregressive Logits)
+    const policyContainer = document.getElementById('policyRowsContainer');
+    policyContainer.innerHTML = '';
+    const policyTeam = nh && nh.team === 1 ? 1 : 0;
+    const policyHand = policyTeam === 1 ? (gameState.red_hand || []) : (gameState.hand || []);
+    document.getElementById('cardMaskTag').textContent = policyTeam === 0 ? 'Blue policy' : 'Red policy';
+    const cardLabels = [...policyHand.map(c => c.name), 'Wait'];
+    cardProbs.forEach((p, idx) => {
+      const pct = (p * 100).toFixed(1);
+      const isWait = (idx === 4);
+      const isTop = (idx === chosenSlot);
+      const row = document.createElement('div');
+      row.className = 'policy-row';
+      const name = idx < 4 ? formatCardName(cardLabels[idx] || `Slot ${idx}`) : 'Wait';
+      row.innerHTML = `
+        <span style="color:${isTop ? 'var(--blue)' : 'var(--text)'}; font-weight:${isTop ? '700' : '400'};" title="${name}">${name}</span>
+        <div class="p-bar-wrap">
+          <div class="p-bar-fill" style="width:${pct}%; background:${isWait ? '#64726d' : (isTop ? 'var(--blue)' : '#668a89')};"></div>
+        </div>
+        <span style="color:${isTop ? 'var(--blue)' : 'var(--muted)'}; text-align:right;">${pct}%</span>
+      `;
+      policyContainer.appendChild(row);
+    });
+
+    // Opponent Tracker Card
+    document.getElementById('opponentTitle').textContent = `Opponent · ${gameState.red_deck_name || 'defender'}`;
+    const oppPills = document.getElementById('oppHandPills');
+    if (oppPills && gameState.red_deck) {
+      oppPills.innerHTML = '';
+      gameState.red_deck.forEach(cName => {
+        const p = document.createElement('span');
+        const isHand = (gameState.red_hand || []).some(c => c.name === cName);
+        const isNext = (gameState.cycle?.[1] || [])[0] === cName;
+        p.className = `pill ${isHand ? 'red-hand' : (isNext ? 'amber' : '')}`;
+        p.title = `${formatCardName(cName)} · ${isHand ? 'in hand' : (isNext ? 'next in cycle' : 'in cycle')}`;
+        p.textContent = `${formatCardName(cName)}${isHand ? ' · H' : (isNext ? ' · N' : '')}`;
+        oppPills.appendChild(p);
+      });
+    }
+
+    // Top Gaussian Spatial Candidate Coordinates
+    const candList = document.getElementById('topCandidatesList');
+    if (nh && !nh.is_waiting && nh.top_tiles && nh.top_tiles.length > 0) {
+      candList.innerHTML = '';
+      nh.top_tiles.slice(0, 5).forEach((t, i) => {
+        const row = document.createElement('div');
+        row.className = 'cand-row';
+        const isRedPolicy = nh.team === 1;
+        const role = (t.y >= 14 && t.y <= 18) ? 'Bridge'
+          : ((isRedPolicy ? t.y > 18 : t.y < 14) ? 'Deep Defense' : 'Offense Lane');
+        row.innerHTML = `
+          <span>#${i+1} (${t.x}, ${t.y}) <span style="color:var(--muted); font-size:12px;">${role}</span></span>
+          <span style="color:${i === 0 ? 'var(--blue)' : 'var(--text)'}; font-weight:700;">${(t.p * 100).toFixed(1)}%</span>
+        `;
+        candList.appendChild(row);
+      });
+      document.getElementById('targetTileSummaryTag').textContent = `P((${nh.top_tiles[0].x}, ${nh.top_tiles[0].y}) | ${nh.target_card_name || 'CARD'})`;
+    } else if (nh && nh.is_waiting) {
+      candList.innerHTML = '<div class="cand-row"><span>Waiting for a card</span><span>—</span></div>';
+      document.getElementById('targetTileSummaryTag').textContent = 'No placement · waiting';
+    } else {
+      candList.innerHTML = '<div class="cand-row"><span>Placement data unavailable</span><span>—</span></div>';
+      document.getElementById('targetTileSummaryTag').textContent = 'Placement distribution';
+    }
+
+    // Live Combat Log Stream
+    const streamList = document.getElementById('streamList');
+    if (gameState.recent_events && gameState.recent_events.length > 0) {
+      streamList.innerHTML = '';
+      gameState.recent_events.slice().reverse().forEach(ev => {
+        const item = document.createElement('div');
+        item.className = 'stream-item';
+        const isB = (ev.team === 0);
+        const s = Math.floor((ev.t_ms || 0) / 1000);
+        const tStr = `${Math.floor(s/60)}:${(s%60) < 10 ? '0' : ''}${s%60}`;
+        item.innerHTML = `
+          <span style="color:var(--muted)">${tStr}</span>
+          <span class="${isB ? 'tag-b' : 'tag-r'}">${isB ? 'BLU' : 'RED'}</span>
+          <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${ev.card || 'Deploy'}</span>
+          <span style="color:var(--muted)">(${ev.x ? ev.x.toFixed(1) : '0'}, ${ev.y ? ev.y.toFixed(1) : '0'})</span>
+        `;
+        streamList.appendChild(item);
+      });
+    }
+  }
+
+  // 4. Procedural Arena Rendering
+  function renderBattleground() {
+    tick++;
+    const W = bCanvas.width;
+    const H = bCanvas.height;
+
+    // A. Tactical Turf Checkerboard
+    const tileW = W / 18.0;
+    const tileH = H / 32.0;
+    for (let r = 0; r < 32; r++) {
+      for (let c = 0; c < 18; c++) {
+        const isDark = (r + c) % 2 === 0;
+        // In screen Y: r=0 is Red top (y=32 in sim), r=31 is Blue bottom (y=0 in sim)
+        if (r < 15) {
+          bCtx.fillStyle = isDark ? '#111622' : '#141a28'; // Red half
+        } else if (r > 16) {
+          bCtx.fillStyle = isDark ? '#0e1922' : '#111f2a'; // Blue half
+        } else {
+          bCtx.fillStyle = '#071929'; // River line
+        }
+        bCtx.fillRect(c * tileW, r * tileH, tileW + 0.5, tileH + 0.5);
+      }
+    }
+
+    // Engraved Lane Guides
+    bCtx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
+    bCtx.lineWidth = 5;
+    bCtx.beginPath();
+    bCtx.moveTo(gx(3.5), gy(25.5)); bCtx.lineTo(gx(3.5), gy(6.5));
+    bCtx.moveTo(gx(14.5), gy(25.5)); bCtx.lineTo(gx(14.5), gy(6.5));
+    bCtx.stroke();
+
+    // B. Animated River Currents
+    const rivTopY = gy(16.6);
+    const rivBotY = gy(15.4);
+    const rivH = Math.abs(rivBotY - rivTopY);
+    const rivGrad = bCtx.createLinearGradient(0, rivTopY, 0, rivTopY + rivH);
+    rivGrad.addColorStop(0, '#233b3d');
+    rivGrad.addColorStop(0.5, '#507b76');
+    rivGrad.addColorStop(1, '#233b3d');
+    bCtx.fillStyle = rivGrad;
+    bCtx.fillRect(0, rivTopY, W, rivH);
+
+    // Water Ripples
+    bCtx.strokeStyle = 'rgba(186, 230, 253, 0.22)';
+    bCtx.lineWidth = 1.2;
+    for (let i = 0; i < 10; i++) {
+      const rx = ((i * 38 + tick * 0.7) % (W + 30)) - 15;
+      const ry = rivTopY + 4 + (i % 3) * 6;
+      bCtx.beginPath();
+      bCtx.moveTo(rx, ry);
+      bCtx.lineTo(rx + 15, ry);
+      bCtx.stroke();
+    }
+
+    // C. Timber & Stone Bridges (at x=3.5 and x=14.5)
+    [3.5, 14.5].forEach(bx => {
+      const px = gx(bx - 1.1);
+      const pw = gx(2.2);
+      bCtx.fillStyle = '#303737';
+      bCtx.strokeStyle = '#59625f';
+      bCtx.lineWidth = 1.5;
+      bCtx.fillRect(px, rivTopY - 3, pw, rivH + 6);
+      bCtx.strokeRect(px, rivTopY - 3, pw, rivH + 6);
+      // Timber planks
+      bCtx.strokeStyle = '#252d2c';
+      for (let p = 0; p < 5; p++) {
+        const py = rivTopY - 1 + p * ((rivH + 2) / 5);
+        bCtx.beginPath(); bCtx.moveTo(px + 2, py); bCtx.lineTo(px + pw - 2, py); bCtx.stroke();
+      }
+    });
+
+    if (!gameState) {
+      requestAnimationFrame(renderBattleground);
+      return;
+    }
+
+    // D. Head 2 Spatial Probability Contour Heatmap
+    const nh = gameState.neural_hud;
+    // Bug 2 Fix: Only render target heatmap when NOT waiting!
+    if (showHeat && nh && !nh.is_waiting && nh.top_tiles && nh.top_tiles.length > 0) {
+      const topT = nh.top_tiles[0];
+      const hx = gx(topT.x + 0.5);
+      const hy = gy(topT.y + 0.5);
+      [48, 32, 18].forEach((rad, i) => {
+        bCtx.fillStyle = `rgba(121, 169, 204, ${0.08 + i * 0.055})`;
+        bCtx.strokeStyle = `rgba(121, 169, 204, ${0.24 + i * 0.12})`;
+        bCtx.lineWidth = 1;
+        bCtx.beginPath();
+        bCtx.arc(hx, hy, rad + Math.sin(tick * 0.06) * 2, 0, Math.PI * 2);
+        bCtx.fill();
+        bCtx.stroke();
+      });
+
+      // Crosshairs & Tag
+      bCtx.strokeStyle = 'rgba(121, 169, 204, 0.72)';
+      bCtx.lineWidth = 1;
+      bCtx.beginPath();
+      bCtx.moveTo(hx - 16, hy); bCtx.lineTo(hx + 16, hy);
+      bCtx.moveTo(hx, hy - 16); bCtx.lineTo(hx, hy + 16);
+      bCtx.stroke();
+
+      bCtx.fillStyle = '#79a9cc';
+      bCtx.font = '600 11px Cascadia Code, monospace';
+      bCtx.textAlign = 'center';
+      bCtx.fillText(`TARGET [${(topT.p * 100).toFixed(0)}%]`, hx, hy - 14);
+    }
+
+    // E. Area Spell Fields
+    (gameState.fields || []).forEach(f => {
+      const fx = gx(f.x);
+      const fy = gy(f.y);
+      const fr = gx(f.radius || 2.5);
+      bCtx.beginPath();
+      bCtx.arc(fx, fy, fr, 0, Math.PI * 2);
+      const isPoison = (f.name || '').includes('Poison');
+      bCtx.fillStyle = isPoison ? 'rgba(207, 170, 112, 0.18)' : 'rgba(179, 154, 202, 0.16)';
+      bCtx.fill();
+      bCtx.strokeStyle = isPoison ? '#cfaa70' : '#b39aca';
+      bCtx.lineWidth = 1.5;
+      bCtx.stroke();
+    });
+
+    // F. Units & Fortifications
+    const unitsList = gameState.units || [];
+    const aliveIds = new Set(unitsList.map(u => u.id));
+
+    // Expected tower positions in standard CR
+    const stdTowers = [
+      { id: 'KB', side: 'blue', king: true, x: 9.0, y: 3.0, maxhp: 4008 },
+      { id: 'PLB', side: 'blue', king: false, x: 3.5, y: 6.5, maxhp: 2534 },
+      { id: 'PRB', side: 'blue', king: false, x: 14.5, y: 6.5, maxhp: 2534 },
+      { id: 'KR', side: 'red', king: true, x: 9.0, y: 29.0, maxhp: 4008 },
+      { id: 'PLR', side: 'red', king: false, x: 3.5, y: 25.5, maxhp: 2534 },
+      { id: 'PRR', side: 'red', king: false, x: 14.5, y: 25.5, maxhp: 2534 }
+    ];
+
+    // Check which standard towers are still alive
+    stdTowers.forEach(st => {
+      const match = unitsList.find(u => u.tower && Math.hypot(u.x - st.x, u.y - st.y) < 1.8);
+      if (!match) {
+        // Destroyed tower crater
+        const cx = gx(st.x);
+        const cy = gy(st.y);
+        bCtx.fillStyle = '#202526';
+        bCtx.strokeStyle = '#46504f';
+        bCtx.setLineDash([3, 3]);
+        bCtx.beginPath();
+        bCtx.arc(cx, cy, 14, 0, Math.PI * 2);
+        bCtx.fill();
+        bCtx.stroke();
+        bCtx.setLineDash([]);
+        bCtx.fillStyle = '#d58076';
+        bCtx.font = '600 11px Cascadia Code, monospace';
+        bCtx.textAlign = 'center';
+        bCtx.fillText('DESTROYED', cx, cy + 3);
+      }
+    });
+
+    // Render all alive units and towers
+    unitsList.forEach(u => {
+      const ux = gx(u.x);
+      const uy = gy(u.y);
+      const isBlue = (u.team === 0);
+      const col = isBlue ? '#79a9cc' : '#d58076';
+      const darkCol = isBlue ? '#293a3e' : '#423134';
+
+      if (u.tower) {
+        // Octagonal Fortress Keep
+        const isKing = u.is_king || (u.kind === 'KingTower');
+        const sleeping = isKing && !u.activated;
+        const towerCol = sleeping ? '#6d7773' : col;
+        const rad = isKing ? 19 : 14;
+
+        // Base Octagon
+        bCtx.fillStyle = '#202526';
+        bCtx.strokeStyle = '#394142';
+        bCtx.lineWidth = 1.5;
+        bCtx.beginPath();
+        for (let i = 0; i < 8; i++) {
+          const a = (i * Math.PI) / 4 + Math.PI / 8;
+          const px = ux + Math.cos(a) * rad;
+          const py = uy + Math.sin(a) * rad;
+          if (i === 0) bCtx.moveTo(px, py); else bCtx.lineTo(px, py);
+        }
+        bCtx.closePath();
+        bCtx.fill();
+        bCtx.stroke();
+
+        // Inner armor plate
+        bCtx.fillStyle = darkCol;
+        bCtx.strokeStyle = towerCol;
+        bCtx.lineWidth = 1.2;
+        bCtx.beginPath();
+        bCtx.arc(ux, uy, rad * 0.68, 0, Math.PI * 2);
+        bCtx.fill();
+        bCtx.stroke();
+
+        // Rotating Turret Barrel
+        let barrelAngle = isBlue ? -Math.PI / 2 : Math.PI / 2;
+        if (u.target_id !== undefined && u.target_id !== -1) {
+          const tgt = unitsList.find(t => t.id === u.target_id);
+          if (tgt) {
+            barrelAngle = Math.atan2(gy(tgt.y) - uy, gx(tgt.x) - ux);
+          }
+        }
+        bCtx.save();
+        bCtx.translate(ux, uy);
+        bCtx.rotate(barrelAngle);
+        bCtx.fillStyle = sleeping ? '#59625f' : '#a3aaa8';
+        bCtx.fillRect(0, -2.5, rad * 0.95, 5);
+        bCtx.strokeStyle = '#151819';
+        bCtx.strokeRect(0, -2.5, rad * 0.95, 5);
+        bCtx.restore();
+
+        // Core pip
+        bCtx.fillStyle = towerCol;
+        bCtx.beginPath();
+        bCtx.arc(ux, uy, isKing ? 5 : 3.5, 0, Math.PI * 2);
+        bCtx.fill();
+
+        // Radial HP Shield Arc
+        const hpPct = Math.max(0, Math.min(1, u.hp_pct !== undefined ? u.hp_pct : (u.hp / (u.maxhp || 1))));
+        bCtx.strokeStyle = sleeping ? '#59625f' : (hpPct > 0.5 ? '#88b49e' : (hpPct > 0.2 ? '#cfaa70' : '#d58076'));
+        bCtx.lineWidth = 2.5;
+        bCtx.beginPath();
+        bCtx.arc(ux, uy, rad + 3, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * hpPct));
+        bCtx.stroke();
+
+        // HP Tag
+        bCtx.fillStyle = '#eeefeb';
+        bCtx.font = '600 11px Cascadia Code, monospace';
+        bCtx.textAlign = 'center';
+        bCtx.fillText(u.hp, ux, uy + rad + 11);
+      } else {
+        // Troop or Building
+        const r = u.flying ? 9.5 : (u.building ? 11 : 8.5);
+
+        // Flying shadow
+        if (u.flying) {
+          bCtx.beginPath();
+          bCtx.ellipse(ux, uy + 8, r, r * 0.45, 0, 0, Math.PI * 2);
+          bCtx.fillStyle = 'rgba(0,0,0,0.4)';
+          bCtx.fill();
+        }
+
+        // Vectors (Range Rings & Laser Target Vectors)
+        if (showVec) {
+          // Range ring
+          const rangePx = gx(u.range || 1.2);
+          bCtx.strokeStyle = isBlue ? 'rgba(121,169,204,0.18)' : 'rgba(213,128,118,0.18)';
+          bCtx.lineWidth = 1;
+          bCtx.beginPath();
+          bCtx.arc(ux, uy, rangePx, 0, Math.PI * 2);
+          bCtx.stroke();
+
+          // Laser aggro line
+          if (u.target_id !== undefined && u.target_id !== -1) {
+            const tgt = unitsList.find(t => t.id === u.target_id);
+            if (tgt) {
+              bCtx.strokeStyle = col;
+              bCtx.setLineDash([3, 3]);
+              bCtx.lineWidth = 1.2;
+              bCtx.beginPath();
+              bCtx.moveTo(ux, uy);
+              bCtx.lineTo(gx(tgt.x), gy(tgt.y));
+              bCtx.stroke();
+              bCtx.setLineDash([]);
+            }
+          }
+        }
+
+        // Chassis
+        bCtx.beginPath();
+        if (u.building) {
+          bCtx.roundRect(ux - r, uy - r, r * 2, r * 2, 3);
+        } else {
+          bCtx.arc(ux, uy, r, 0, Math.PI * 2);
+        }
+        bCtx.fillStyle = '#151819';
+        bCtx.fill();
+        bCtx.lineWidth = 1.8;
+        bCtx.strokeStyle = col;
+        bCtx.stroke();
+
+        // Name tag
+        bCtx.fillStyle = '#eeefeb';
+        bCtx.font = '600 11px Cascadia Code, monospace';
+        bCtx.textAlign = 'center';
+        bCtx.fillText(u.name.replace(/_EV1/g, '★').slice(0, 3).toUpperCase(), ux, uy + 2.5);
+
+        // HP bar above unit
+        const bw = 18;
+        const hpPct = Math.max(0, Math.min(1, u.hp_pct !== undefined ? u.hp_pct : (u.hp / (u.maxhp || 1))));
+        bCtx.fillStyle = '#101213';
+        bCtx.fillRect(ux - bw/2, uy - r - 5, bw, 3);
+        bCtx.fillStyle = col;
+        bCtx.fillRect(ux - bw/2, uy - r - 5, bw * hpPct, 3);
+      }
+    });
+
+    // G. Projectiles
+    (gameState.projectiles || []).forEach(p => {
+      const px = gx(p.x);
+      const py = gy(p.y);
+      bCtx.fillStyle = '#cfaa70';
+      bCtx.shadowColor = '#cfaa70';
+      bCtx.shadowBlur = 8;
+      bCtx.beginPath();
+      bCtx.arc(px, py, 3.5, 0, Math.PI * 2);
+      bCtx.fill();
+      bCtx.shadowBlur = 0;
+    });
+
+    if (manualSelectedIdx !== null && document.activeElement === bCanvas) {
+      const tx = gx(manualTarget.x);
+      const ty = gy(manualTarget.y);
+      const tileW = W / 18;
+      const tileH = H / 32;
+      bCtx.fillStyle = 'rgba(207, 170, 112, 0.10)';
+      bCtx.strokeStyle = '#cfaa70';
+      bCtx.lineWidth = 1.5;
+      bCtx.fillRect(tx - tileW / 2, ty - tileH / 2, tileW, tileH);
+      bCtx.strokeRect(tx - tileW / 2, ty - tileH / 2, tileW, tileH);
+      bCtx.beginPath();
+      bCtx.arc(tx, ty, 3, 0, Math.PI * 2);
+      bCtx.fillStyle = '#cfaa70';
+      bCtx.fill();
+    }
+
+    requestAnimationFrame(renderBattleground);
+  }
+
+  // 5. Multi-Chart Telemetry Renderers (Critic, Elixir, Radar, Mini Heat)
+  function renderTelemetryCharts() {
+    if (!gameState) return;
+    const nh = gameState.neural_hud;
+
+    // A. Bipolar Critic V(s) Horizon Chart (Bug 1 Fix: 120-step history, live scalar, cyan/rose area)
+    cChart.width = cChart.offsetWidth;
+    cChart.height = cChart.offsetHeight;
+    const cw = cChart.width, ch = cChart.height;
+    const cCtx = cChart.getContext('2d');
+    const cMidY = ch / 2;
+
+    cCtx.clearRect(0, 0, cw, ch);
+
+    // Zero baseline
+    cCtx.strokeStyle = '#2e364a';
+    cCtx.setLineDash([4, 4]);
+    cCtx.beginPath(); cCtx.moveTo(0, cMidY); cCtx.lineTo(cw, cMidY); cCtx.stroke();
+    cCtx.setLineDash([]);
+
+    const valHistory = (nh && nh.value_history && nh.value_history.length > 0) ? nh.value_history : [0.0];
+    const latestVal = valHistory[valHistory.length - 1];
+
+    const readout = document.getElementById('criticReadout');
+    if (latestVal >= 0.05) {
+      readout.textContent = `+${latestVal.toFixed(2)} ADV (BLUE)`;
+      readout.style.color = 'var(--blue)';
+    } else if (latestVal <= -0.05) {
+      readout.textContent = `${latestVal.toFixed(2)} ADV (RED)`;
+      readout.style.color = 'var(--red)';
+    } else {
+      readout.textContent = `+0.00 ADV (NEUTRAL)`;
+      readout.style.color = 'var(--text)';
+    }
+
+    if (valHistory.length > 1) {
+      const stepX = cw / (valHistory.length - 1);
+
+      // Gradient Area
+      const grad = cCtx.createLinearGradient(0, 0, 0, ch);
+      grad.addColorStop(0, 'rgba(121, 169, 204, 0.25)');
+      grad.addColorStop(0.5, 'rgba(121, 169, 204, 0.02)');
+      grad.addColorStop(1, 'rgba(213, 128, 118, 0.25)');
+
+      cCtx.beginPath();
+      cCtx.moveTo(0, cMidY);
+      valHistory.forEach((v, i) => {
+        const x = i * stepX;
+        // Clamp v between -1.0 and 1.0
+        const clampedV = Math.max(-1.0, Math.min(1.0, v));
+        const y = cMidY - clampedV * (cMidY * 0.88);
+        cCtx.lineTo(x, y);
+      });
+      cCtx.lineTo(cw, cMidY);
+      cCtx.closePath();
+      cCtx.fillStyle = grad;
+      cCtx.fill();
+
+      // Stroke curve
+      cCtx.strokeStyle = latestVal >= 0 ? '#79a9cc' : '#d58076';
+      cCtx.lineWidth = 1.8;
+      cCtx.beginPath();
+      valHistory.forEach((v, i) => {
+        const x = i * stepX;
+        const clampedV = Math.max(-1.0, Math.min(1.0, v));
+        const y = cMidY - clampedV * (cMidY * 0.88);
+        if (i === 0) cCtx.moveTo(x, y); else cCtx.lineTo(x, y);
+      });
+      cCtx.stroke();
+
+      // End point
+      const lastX = (valHistory.length - 1) * stepX;
+      const lastY = cMidY - Math.max(-1.0, Math.min(1.0, latestVal)) * (cMidY * 0.88);
+      cCtx.fillStyle = latestVal >= 0 ? '#79a9cc' : '#d58076';
+      cCtx.beginPath();
+      cCtx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+      cCtx.fill();
+    }
+
+    // B. Dual-Elixir Economy Curve
+    eChart.width = eChart.offsetWidth;
+    eChart.height = eChart.offsetHeight;
+    const ew = eChart.width, eh = eChart.height;
+    const eCtx = eChart.getContext('2d');
+    eCtx.clearRect(0, 0, ew, eh);
+
+    // Elixir scale: 0, 5, and 10, with a reserved label gutter.
+    const plotLeft = 22;
+    const plotWidth = Math.max(1, ew - plotLeft - 2);
+    const yForElixir = value => eh - 8 - (Math.min(10, Math.max(0, value)) / 10) * (eh - 16);
+    eCtx.font = '11px Cascadia Code, monospace';
+    eCtx.textAlign = 'right';
+    eCtx.fillStyle = '#7d8684';
+    [0, 5, 10].forEach(value => {
+      const y = yForElixir(value);
+      eCtx.strokeStyle = '#262d2d';
+      eCtx.lineWidth = 1;
+      eCtx.beginPath(); eCtx.moveTo(plotLeft, y); eCtx.lineTo(ew, y); eCtx.stroke();
+      eCtx.fillText(String(value), plotLeft - 5, y + 4);
+    });
+
+    const bElixirHist = (nh && nh.blue_elixir_history && nh.blue_elixir_history.length > 0) ? nh.blue_elixir_history : [5.0];
+    const rElixirHist = (nh && nh.red_elixir_history && nh.red_elixir_history.length > 0) ? nh.red_elixir_history : [5.0];
+
+    [ { data: bElixirHist, col: '#79a9cc' }, { data: rElixirHist, col: '#d58076' } ].forEach(s => {
+      if (s.data.length > 1) {
+        const stepX = plotWidth / (s.data.length - 1);
+        eCtx.strokeStyle = s.col;
+        eCtx.lineWidth = 1.8;
+        eCtx.beginPath();
+        s.data.forEach((v, i) => {
+          const x = plotLeft + i * stepX;
+          const y = yForElixir(v);
+          if (i === 0) eCtx.moveTo(x, y); else eCtx.lineTo(x, y);
+        });
+        eCtx.stroke();
+      }
+    });
+
+    // C. 6-Axis Tactical Radar Spider Chart
+    rChart.width = rChart.offsetWidth;
+    rChart.height = rChart.offsetHeight;
+    const rw = rChart.width, rh = rChart.height;
+    const rCtx = rChart.getContext('2d');
+    rCtx.clearRect(0, 0, rw, rh);
+
+    const rcx = rw / 2, rcy = rh / 2, rRad = Math.min(rw, rh) * 0.35;
+    const labels = ['AGGRO', 'BANK', 'LEFT', 'RIGHT', 'SPELL', 'DEF'];
+    const radarData = (nh && nh.tactical_radar) ? [
+      nh.tactical_radar.aggro || 0.5,
+      nh.tactical_radar.bank || 0.5,
+      nh.tactical_radar.left || 0.5,
+      nh.tactical_radar.right || 0.5,
+      nh.tactical_radar.spell || 0.5,
+      nh.tactical_radar.def || 0.5
+    ] : [0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+
+    // Web grids
+    rCtx.strokeStyle = '#1e2330';
+    rCtx.lineWidth = 1;
+    [0.5, 1.0].forEach(scale => {
+      rCtx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (i * Math.PI) / 3 - Math.PI / 2;
+        const px = rcx + Math.cos(a) * rRad * scale;
+        const py = rcy + Math.sin(a) * rRad * scale;
+        if (i === 0) rCtx.moveTo(px, py); else rCtx.lineTo(px, py);
+      }
+      rCtx.closePath();
+      rCtx.stroke();
+    });
+
+    // Filled polygon
+    rCtx.fillStyle = 'rgba(121, 169, 204, 0.22)';
+    rCtx.strokeStyle = '#79a9cc';
+    rCtx.lineWidth = 1.5;
+    rCtx.beginPath();
+    radarData.forEach((v, i) => {
+      const a = (i * Math.PI) / 3 - Math.PI / 2;
+      const px = rcx + Math.cos(a) * rRad * v;
+      const py = rcy + Math.sin(a) * rRad * v;
+      if (i === 0) rCtx.moveTo(px, py); else rCtx.lineTo(px, py);
+
+      // Label
+      rCtx.fillStyle = '#a3aaa8';
+      rCtx.font = '600 12px Cascadia Code, monospace';
+      rCtx.textAlign = 'center';
+      rCtx.fillText(labels[i], rcx + Math.cos(a) * (rRad + 11), rcy + Math.sin(a) * (rRad + 11) + 2.5);
+    });
+    rCtx.closePath();
+    rCtx.fill();
+    rCtx.stroke();
+
+    // D. Mini 18x32 Spatial Heatmap Canvas
+    const mCtx = mHeat.getContext('2d');
+    mCtx.clearRect(0, 0, mHeat.width, mHeat.height);
+    mCtx.fillStyle = '#070a0f';
+    mCtx.fillRect(0, 0, mHeat.width, mHeat.height);
+
+    // River line
+    const mRivY = (15.5 / 32.0) * mHeat.height;
+    mCtx.strokeStyle = '#526260';
+    mCtx.lineWidth = 2;
+    mCtx.beginPath(); mCtx.moveTo(0, mRivY); mCtx.lineTo(mHeat.width, mRivY); mCtx.stroke();
+
+    if (nh && !nh.is_waiting && nh.top_tiles && nh.top_tiles.length > 0) {
+      nh.top_tiles.slice(0, 5).forEach((t, i) => {
+        const tx = (t.x / 18.0) * mHeat.width;
+        const ty = ((32.0 - t.y) / 32.0) * mHeat.height;
+        const grad = mCtx.createRadialGradient(tx, ty, 1, tx, ty, 12 - i * 1.5);
+        grad.addColorStop(0, i === 0 ? '#79a9cc' : 'rgba(121, 169, 204, 0.58)');
+        grad.addColorStop(1, 'transparent');
+        mCtx.fillStyle = grad;
+        mCtx.fillRect(0, 0, mHeat.width, mHeat.height);
+      });
+    }
+  }
+  setInterval(renderTelemetryCharts, 200);
+
+  // 6. User Actions & Controls
+  function selectCardManual(idx) {
+    if (manualSelectedIdx === idx) {
+      manualSelectedIdx = null;
+      document.getElementById('toastBar').textContent = 'Manual selection cleared.';
+    } else {
+      manualSelectedIdx = idx;
+      const card = (gameState.hand || [])[idx];
+      document.getElementById('toastBar').textContent = `Selected ${formatCardName(card ? card.name : 'Card')} · choose a tile`;
+      bCanvas.focus({ preventScroll: true });
+    }
+    updateUI();
+  }
+
+  async function deploySelectedAt(ex, ey) {
+    if (manualSelectedIdx === null || !gameState) return;
+    const toast = document.getElementById('toastBar');
+    manualTarget = { x: ex, y: ey };
+    try {
+      const res = await fetch('/api/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hand_idx: manualSelectedIdx, x: ex, y: ey })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        toast.textContent = 'Card deployed';
+        manualSelectedIdx = null;
+        pollState();
+      } else {
+        toast.textContent = `Blocked · ${data.reason || 'choose a valid tile'}`;
+      }
+    } catch (err) {
+      toast.textContent = 'Deployment failed · try again';
+    }
+    updateUI();
+  }
+
+  bCanvas.addEventListener('click', async (e) => {
+    if (manualSelectedIdx === null || !gameState) return;
+    const rect = bCanvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const ex = Math.min(17, Math.max(0, Math.floor((cx / rect.width) * 18))) + 0.5;
+    const ey = Math.min(31, Math.max(0, Math.floor(32 - (cy / rect.height) * 32))) + 0.5;
+    await deploySelectedAt(ex, ey);
+  });
+
+  bCanvas.addEventListener('keydown', async (e) => {
+    if (manualSelectedIdx === null) return;
+    const moves = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] };
+    if (moves[e.key]) {
+      e.preventDefault();
+      const [dx, dy] = moves[e.key];
+      manualTarget.x = Math.min(17.5, Math.max(0.5, manualTarget.x + dx));
+      manualTarget.y = Math.min(31.5, Math.max(0.5, manualTarget.y + dy));
+      document.getElementById('toastBar').textContent = `Tile · ${Math.floor(manualTarget.x)}, ${Math.floor(manualTarget.y)} · Enter to deploy`;
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      await deploySelectedAt(manualTarget.x, manualTarget.y);
+    } else if (e.key === 'Escape') {
+      manualSelectedIdx = null;
+      document.getElementById('toastBar').textContent = 'Selection cleared';
+      updateUI();
+    }
+  });
+
+  async function toggleIso() {
+    bCanvas.classList.toggle('iso-tilt');
+    document.getElementById('btnIso').classList.toggle('active');
+  }
+
+  function toggleHeatmap() {
+    showHeat = !showHeat;
+    document.getElementById('btnHeat').classList.toggle('active', showHeat);
+  }
+
+  function toggleVectors() {
+    showVec = !showVec;
+    document.getElementById('btnVectors').classList.toggle('active', showVec);
+  }
+
+  async function setSimSpeed(s) {
+    await fetch('/api/speed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ speed: s })
+    });
+    [1, 2, 4, 10, 20].forEach(n => {
+      const el = document.getElementById(`sp${n}`);
+      if (el) el.classList.toggle('active', n === s);
+    });
+    pollState();
+  }
+
+  async function togglePauseGame() {
+    await fetch('/api/pause', { method: 'POST' });
+    pollState();
+  }
+
+  async function stepSingleTick() {
+    await fetch('/api/step', { method: 'POST' });
+    pollState();
+  }
+
+  async function resetCurrentGame() {
+    await fetch('/api/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    manualSelectedIdx = null;
+    pollState();
+  }
+
+  async function quickRandomizeDecks() {
+    const bSel = document.getElementById('blueDeckSelect');
+    const rSel = document.getElementById('redDeckSelect');
+    if (bSel) bSel.value = 'Randomized Deck';
+    if (rSel) rSel.value = 'Randomized Deck';
+    await applyDeckChange();
+  }
+
+  let isChangingDecks = false;
+
+  function formatCardName(name) {
+    return String(name || 'Card')
+      .replace(/_EV1/g, ' ★')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
+      .trim();
+  }
+
+  async function applyDeckChange() {
+    isChangingDecks = true;
+    const b = document.getElementById('blueDeckSelect').value;
+    const r = document.getElementById('redDeckSelect').value;
+    const toast = document.getElementById('toastBar');
+    if (toast) toast.textContent = `Equipping ${b} vs ${r}... Resetting battle!`;
+    try {
+      const res = await fetch('/api/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blue_deck_name: b, red_deck_name: r })
+      });
+      const data = await res.json();
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || `Deck reset failed (${res.status}).`);
+      }
+      if (toast) toast.textContent = `Ready · ${b} vs ${r}`;
+      await pollState();
+    } catch(err) {
+      if (toast) toast.textContent = `Deck change error: ${err}`;
+    } finally {
+      setTimeout(() => { isChangingDecks = false; }, 800);
+    }
+  }
+
+  function exportCurrentReplay() {
+    window.location.href = '/api/export_replay';
+  }
+
+  // Hotkeys
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      togglePauseGame();
+    } else if (e.key >= '1' && e.key <= '4') {
+      selectCardManual(parseInt(e.key) - 1);
+    } else if (e.key.toLowerCase() === 't') {
+      toggleIso();
+    } else if (e.key.toLowerCase() === 'h') {
+      toggleHeatmap();
+    } else if (e.key.toLowerCase() === 'v') {
+      toggleVectors();
+    } else if (e.key.toLowerCase() === 'r') {
+      resetCurrentGame();
+    }
+  });
+
+  window.addEventListener('resize', renderTelemetryCharts);
+  renderBattleground();
+  setTimeout(renderTelemetryCharts, 80);
+</script>
+</body>
+</html>

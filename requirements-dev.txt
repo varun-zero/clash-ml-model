@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Full test suite and optional BlueStacks perception adapter.
+pytest>=8.0
+opencv-python>=4.11

@@ -1,35 +1,32 @@
-# Byte-compiled / optimized / DLL files
+# Python bytecode and test/linter caches
 __pycache__/
 *.py[cod]
-*$py.class
-
-# PyTorch checkpoints and model weights
-checkpoints/*.pt
-checkpoints/*.onnx
-!checkpoints/.gitkeep
-weights/*.pt
-*.pt
-*.onnx
-
-# Raw VoD downloads, temporary datasets, and large cloned datasets
-data/raw_vods/*
-data/trajectories/*.npz
-!data/trajectories/.gitkeep
-data/pretraining/**/*.npz
-!data/pretraining/**/.gitkeep
-data/cr_detection_dataset/
-
-# Temporary / debug screenshots and crops
-*.png
-*.jpg
-*.jpeg
-!templates/**/*.png
-!official_battle_log.png
-
-# Environments & logs
-.env
-*.log
-.vscode/
-.idea/
-unknown_cards/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local environments and build output
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Workspace & Editor artifacts
+.obsidian/
+.impeccable/
+.idea/
+.vscode/
+
+# Intermediate training checkpoints (keep latest.pt and history)
+checkpoints/ckpt_step_*.pt
+checkpoints/pool/archive_pre_tactical/
+
+# Local match replay recordings and temporary files
+replays/*.json
+*.log
+*.tmp
+
+# Windows metadata
+Thumbs.db
+Desktop.ini

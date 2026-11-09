@@ -1,0 +1,1110 @@
+<USER_REQUEST>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CR_COMMAND // Neural Battleground Telemetry</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg-0: #07080b;
+    --bg-1: #0c0e14;
+    --bg-2: #12151e;
+    --border: #1e2330;
+    --border-hi: #2e364a;
+    --text-0: #f1f5f9;
+    --text-1: #94a3b8;
+    --text-2: #475569;
+    --blue: #38bdf8;
+    --blue-dim: rgba(56, 189, 248, 0.16);
+    --red: #fb7185;
+    --red-dim: rgba(251, 113, 133, 0.16);
+    --elixir: #c084fc;
+    --amber: #fbbf24;
+    --emerald: #34d399;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Inter', system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-0);
+    color: var(--text-0);
+    font-family: var(--mono);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* HEADER BAR */
+  header {
+    height: 46px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    padding: 0 14px;
+    z-index: 20;
+  }
+  .h-left { display: flex; align-items: center; gap: 10px; }
+  .logo {
+    font-weight: 800;
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    color: var(--text-0);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .logo-dot {
+    width: 8px; height: 8px;
+    background: var(--emerald);
+    border-radius: 50%;
+    box-shadow: 0 0 10px var(--emerald);
+  }
+  .pill {
+    font-size: 10px;
+    padding: 2px 7px;
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    color: var(--text-1);
+    border-radius: 3px;
+  }
+  .pill.cyan { color: var(--blue); border-color: rgba(56,189,248,0.35); background: var(--blue-dim); }
+  .pill.amber { color: var(--amber); border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.1); }
+
+  .h-center {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    padding: 4px 16px;
+    border-radius: 4px;
+  }
+  .crown-score { font-size: 16px; font-weight: 800; display: flex; align-items: center; gap: 8px; }
+  .c-blue { color: var(--blue); }
+  .c-red { color: var(--red); }
+  .clock { font-size: 13px; font-weight: 700; color: var(--text-0); border-left: 1px solid var(--border); padding-left: 12px; }
+
+  .h-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .btn {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    color: var(--text-1);
+    padding: 4px 9px;
+    font-size: 10px;
+    font-family: var(--mono);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  .btn:hover, .btn.active {
+    color: var(--text-0);
+    border-color: var(--blue);
+    background: var(--blue-dim);
+  }
+
+  /* MAIN 3-COLUMN GRID */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 420px 1fr 370px;
+    gap: 1px;
+    background: var(--border);
+    height: calc(100vh - 46px);
+  }
+  .col {
+    background: var(--bg-0);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .sec-head {
+    height: 30px;
+    background: var(--bg-1);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-1);
+    letter-spacing: 0.06em;
+  }
+
+  /* LEFT COLUMN: DETAILED BATTLEGROUND ARENA */
+  .arena-stage {
+    flex: 1;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(circle at center, #111722 0%, #07080b 100%);
+    perspective: 1100px;
+    overflow: hidden;
+  }
+  #battleCanvas {
+    border-radius: 6px;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.75), 0 0 0 1px var(--border-hi);
+    transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  #battleCanvas.iso-tilt {
+    transform: rotateX(24deg) scale(0.96);
+    box-shadow: 0 32px 50px rgba(0,0,0,0.9), 0 0 0 1px var(--blue);
+  }
+
+  /* Non-blocking top status toast inside Arena */
+  .arena-hud-top {
+    position: absolute;
+    top: 10px; left: 12px; right: 12px;
+    display: flex;
+    justify-content: space-between;
+    pointer-events: none;
+    z-index: 5;
+  }
+  .status-banner {
+    background: rgba(12, 14, 20, 0.88);
+    border: 1px solid var(--border-hi);
+    backdrop-filter: blur(6px);
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Bottom Hand & Dual Elixir Bar */
+  .hand-dock {
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
+    padding: 10px 12px;
+  }
+  .elixir-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .pips-wrap {
+    flex: 1;
+    display: grid;
+    grid-template-columns: repeat(10, 1fr);
+    gap: 3px;
+    height: 8px;
+  }
+  .pip {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 1px;
+    overflow: hidden;
+  }
+  .pip-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #9333ea, #e879f9);
+    box-shadow: 0 0 6px var(--elixir);
+  }
+
+  .cards-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr) 54px;
+    gap: 6px;
+  }
+  .deck-card {
+    background: var(--bg-2);
+    border: 1px solid var(--border-hi);
+    border-radius: 4px;
+    height: 68px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: relative;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  .deck-card.chosen {
+    border-color: var(--blue);
+    background: rgba(56, 189, 248, 0.12);
+    box-shadow: inset 0 0 12px rgba(56, 189, 248, 0.2);
+  }
+  .deck-card.unaffordable { opacity: 0.42; filter: grayscale(0.7); }
+  .cost-hex {
+    width: 16px; height: 16px;
+    background: #7e22ce;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 800;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .card-name { font-size: 10px; font-weight: 700; color: var(--text-0); }
+  .card-prob { font-size: 9px; color: var(--blue); }
+
+  /* CENTER COLUMN: MULTI-CHART TELEMETRY MATRIX */
+  .center-grid {
+    flex: 1;
+    display: grid;
+    grid-template-rows: auto 155px 155px 1fr;
+    gap: 1px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .chart-box {
+    background: var(--bg-0);
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+  .box-title {
+    font-size: 10px;
+    color: var(--text-1);
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 6px;
+    font-weight: 600;
+  }
+  .chart-canvas {
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Neural Layer Activation Strip */
+  .layer-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    padding-top: 4px;
+  }
+  .node-card {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 7px 8px;
+  }
+  .node-top { display: flex; justify-content: space-between; font-size: 9px; color: var(--text-1); margin-bottom: 5px; }
+  .mini-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 22px;
+  }
+  .m-bar { flex: 1; background: var(--blue); opacity: 0.75; border-radius: 1px 1px 0 0; transition: height 0.2s; }
+
+  /* Split Bottom Center: Policy Bars + Radar Chart */
+  .split-bottom {
+    background: var(--bg-0);
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 1px;
+    background: var(--border);
+  }
+  .policy-row {
+    display: grid;
+    grid-template-columns: 82px 1fr 44px;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    margin-bottom: 7px;
+  }
+  .p-bar-wrap { height: 7px; background: var(--bg-2); border-radius: 2px; overflow: hidden; }
+  .p-bar-fill { height: 100%; background: var(--blue); transition: width 0.25s; }
+
+  /* RIGHT COLUMN: SPATIAL DENSITY + ACTION STREAM */
+  .right-split {
+    flex: 1;
+    display: grid;
+    grid-template-rows: auto 195px 1fr auto;
+    gap: 1px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .spatial-split {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 10px;
+    align-items: center;
+    height: 100%;
+  }
+  #miniHeatCanvas {
+    width: 96px;
+    height: 148px;
+    border: 1px solid var(--border-hi);
+    border-radius: 3px;
+    background: #070a0f;
+  }
+  .cand-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .stream-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 12px;
+    font-size: 10px;
+  }
+  .stream-item {
+    display: grid;
+    grid-template-columns: 42px 28px 1fr auto;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(30, 35, 48, 0.5);
+  }
+  .tag-b { color: var(--blue); font-weight: 700; }
+  .tag-r { color: var(--red); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="h-left">
+    <div class="logo"><span class="logo-dot"></span>ALPHASTAR // CR-SIM</div>
+    <span class="pill cyan">STEP 104,960</span>
+    <span class="pill">STAGE 2: HOG 2.6 vs GIANT</span>
+  </div>
+
+  <div class="h-center">
+    <div class="crown-score">
+      <span class="c-blue">👑 1</span>
+      <span style="color:var(--text-2)">:</span>
+      <span class="c-red">0 👑</span>
+    </div>
+    <div class="clock" id="clockReadout">01:18</div>
+    <span class="pill amber">2X ELIXIR</span>
+  </div>
+
+  <div class="h-right">
+    <button class="btn" id="btnIso" onclick="toggleIso()">2.5D TILT</button>
+    <button class="btn active" id="btnHeat" onclick="toggleHeatmap()">CONTOUR MAP</button>
+    <button class="btn active" id="btnVectors" onclick="toggleVectors()">VECTORS</button>
+    <button class="btn" onclick="triggerFireball()">CAST SPELL</button>
+  </div>
+</header>
+
+<main>
+  <!-- COLUMN 1: HIGH-CRAFT PROCEDURAL ARENA -->
+  <div class="col">
+    <div class="sec-head">
+      <span>TACTICAL ARENA [18×32 TILES]</span>
+      <span style="color:var(--emerald)">20.0 HZ LOCK</span>
+    </div>
+
+    <div class="arena-stage">
+      <div class="arena-hud-top">
+        <div class="status-banner">
+          <span style="color:var(--blue); font-weight:700;">INTENT:</span>
+          <span id="intentText">KITING GIANT // CANNON KILL-ZONE (9, 21)</span>
+        </div>
+        <div class="status-banner">
+          <span style="color:var(--text-1)">P2 ELIXIR:</span>
+          <span style="color:var(--red); font-weight:700;" id="redElixirTxt">4.2</span>
+        </div>
+      </div>
+
+      <canvas id="battleCanvas" width="342" height="576"></canvas>
+    </div>
+
+    <div class="hand-dock">
+      <div class="elixir-strip">
+        <span style="font-size:10px; font-weight:800; color:var(--elixir)">ELIXIR 6.8</span>
+        <div class="pips-wrap" id="elixirPips"></div>
+        <span style="font-size:9px; color:var(--emerald)">+1.6 ΔE</span>
+      </div>
+
+      <div class="cards-row">
+        <div class="deck-card chosen">
+          <div style="display:flex; justify-content:space-between;">
+            <span class="cost-hex">3</span>
+            <span class="card-prob">54.2%</span>
+          </div>
+          <div class="card-name">Cannon</div>
+          <div style="font-size:8px; color:var(--text-1)">BUILDING</div>
+        </div>
+        <div class="deck-card">
+          <div style="display:flex; justify-content:space-between;">
+            <span class="cost-hex">4</span>
+            <span class="card-prob">21.8%</span>
+          </div>
+          <div class="card-name">Musketeer</div>
+          <div style="font-size:8px; color:var(--text-1)">RANGED</div>
+        </div>
+        <div class="deck-card">
+          <div style="display:flex; justify-content:space-between;">
+            <span class="cost-hex">4</span>
+            <span class="card-prob">11.4%</span>
+          </div>
+          <div class="card-name">Hog Rider</div>
+          <div style="font-size:8px; color:var(--text-1)">WIN COND</div>
+        </div>
+        <div class="deck-card">
+          <div style="display:flex; justify-content:space-between;">
+            <span class="cost-hex">4</span>
+            <span class="card-prob">4.2%</span>
+          </div>
+          <div class="card-name">Fireball</div>
+          <div style="font-size:8px; color:var(--text-1)">SPELL</div>
+        </div>
+        <div class="deck-card" style="align-items:center; justify-content:center; border-style:dashed;">
+          <span style="font-size:8px; color:var(--text-1)">NEXT</span>
+          <span style="font-size:10px; font-weight:700; color:var(--amber)">Log</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COLUMN 2: MULTI-GRAPH NEURAL TELEMETRY -->
+  <div class="col">
+    <div class="sec-head">
+      <span>NEURAL ACTIVATIONS & TEMPORAL ANALYTICS</span>
+      <span>KL: 0.0031 // ENT: 3.68</span>
+    </div>
+
+    <div class="center-grid">
+      <!-- Live Layer Activation Strip (Replaces Dead Static Node Graph) -->
+      <div class="chart-box">
+        <div class="box-title">
+          <span>LIVE TENSOR ACTIVATION ENERGY (L2 NORM & ATTENTION SPIKES)</span>
+          <span style="color:var(--blue)">FP16 AUTOCAST</span>
+        </div>
+        <div class="layer-strip" id="layerStrip"></div>
+      </div>
+
+      <!-- Graph 1: Bipolar Value Critic V(s) Horizon -->
+      <div class="chart-box">
+        <div class="box-title">
+          <span>VALUE CRITIC V(s) // BIPOLAR WIN ADVANTAGE HORIZON</span>
+          <span style="color:var(--blue); font-weight:700;" id="criticReadout">+0.62 ADV (BLUE)</span>
+        </div>
+        <canvas class="chart-canvas" id="criticChart"></canvas>
+      </div>
+
+      <!-- Graph 2: Dual-Elixir Economy & Trade Differential -->
+      <div class="chart-box">
+        <div class="box-title">
+          <span>ELIXIR RESERVOIR CURVES (BLUE vs RED) & TRADE EFFICIENCY</span>
+          <span style="color:var(--elixir)">RATE: 0.70 / SEC</span>
+        </div>
+        <canvas class="chart-canvas" id="elixirChart"></canvas>
+      </div>
+
+      <!-- Bottom Split: Head 1 Distribution + 6-Axis Tactical Radar -->
+      <div class="split-bottom">
+        <div class="chart-box">
+          <div class="box-title">
+            <span>HEAD 1: AUTOREGRESSIVE LOGITS</span>
+            <span style="color:var(--emerald)">MASK: ACTIVE</span>
+          </div>
+          <div style="margin-top:4px;">
+            <div class="policy-row">
+              <span>1. Cannon</span>
+              <div class="p-bar-wrap"><div class="p-bar-fill" style="width:54.2%"></div></div>
+              <span style="color:var(--blue)">54.2%</span>
+            </div>
+            <div class="policy-row">
+              <span>2. Musketeer</span>
+              <div class="p-bar-wrap"><div class="p-bar-fill" style="width:21.8%"></div></div>
+              <span>21.8%</span>
+            </div>
+            <div class="policy-row">
+              <span>3. Hog Rider</span>
+              <div class="p-bar-wrap"><div class="p-bar-fill" style="width:11.4%"></div></div>
+              <span>11.4%</span>
+            </div>
+            <div class="policy-row">
+              <span>4. Wait (Hold)</span>
+              <div class="p-bar-wrap"><div class="p-bar-fill" style="width:8.4%; background:#64748b"></div></div>
+              <span>8.4%</span>
+            </div>
+            <div class="policy-row">
+              <span>5. Fireball</span>
+              <div class="p-bar-wrap"><div class="p-bar-fill" style="width:4.2%"></div></div>
+              <span>4.2%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="chart-box">
+          <div class="box-title">
+            <span>TACTICAL POSTURE RADAR</span>
+            <span style="color:var(--amber)">COUNTER-PUSH</span>
+          </div>
+          <canvas class="chart-canvas" id="radarChart"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COLUMN 3: SPATIAL DENSITY & COMBAT FEED -->
+  <div class="col">
+    <div class="sec-head">
+      <span>HEAD 2 SPATIAL DENSITY & COMBAT LOG</span>
+      <span>P((X,Y) | CANNON)</span>
+    </div>
+
+    <div class="right-split">
+      <!-- Opponent Status Strip -->
+      <div class="chart-box" style="padding:8px 12px;">
+        <div class="box-title" style="margin-bottom:4px;">
+          <span>OPPONENT TRACKER // GIANT BEATDOWN</span>
+          <span style="color:var(--red)">THREAT: HIGH</span>
+        </div>
+        <div style="display:flex; gap:6px; font-size:9px;">
+          <span class="pill">HAND: Wizard</span>
+          <span class="pill">Mini P.E.K.K.A</span>
+          <span class="pill">Zap</span>
+          <span class="pill">?</span>
+        </div>
+      </div>
+
+      <!-- Spatial Heatmap + Top Coordinates -->
+      <div class="chart-box">
+        <div class="spatial-split">
+          <canvas id="miniHeatCanvas" width="96" height="148"></canvas>
+          <div>
+            <div style="font-size:9px; color:var(--text-1); margin-bottom:6px;">TOP GAUSSIAN CLUSTERS (576 TILES)</div>
+            <div class="cand-row"><span>#1 (9, 21) Kill-Zone</span><span style="color:var(--blue); font-weight:700;">38.4%</span></div>
+            <div class="cand-row"><span>#2 (8, 21) Center Pull</span><span style="color:var(--blue)">19.1%</span></div>
+            <div class="cand-row"><span>#3 (9, 20) High Pull</span><span>11.6%</span></div>
+            <div class="cand-row"><span>#4 (10, 22) Low Passive</span><span>6.4%</span></div>
+            <div class="cand-row"><span>#5 (3, 16) Left Bridge</span><span>3.2%</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Combat Stream -->
+      <div class="stream-list" id="streamList">
+        <div class="stream-item"><span style="color:var(--text-2)">01:18</span><span class="tag-b">BLUE</span><span>Cannon kiting Giant</span><span>(9.0, 21.0)</span></div>
+        <div class="stream-item"><span style="color:var(--text-2)">01:15</span><span class="tag-r">RED</span><span>Giant crossed Left Bridge</span><span>(3.5, 16.5)</span></div>
+        <div class="stream-item"><span style="color:var(--text-2)">01:11</span><span class="tag-b">BLUE</span><span>Hog Rider destroyed Tower R</span><span>+1.00 R</span></div>
+        <div class="stream-item"><span style="color:var(--text-2)">01:06</span><span class="tag-b">BLUE</span><span>Fireball hit Wizard + Tower</span><span>(14.5, 6.5)</span></div>
+        <div class="stream-item"><span style="color:var(--text-2)">01:02</span><span class="tag-r">RED</span><span>Wizard deployed back</span><span>(14.5, 3.0)</span></div>
+        <div class="stream-item"><span style="color:var(--text-2)">00:54</span><span class="tag-b">BLUE</span><span>Skeletons +1.8 Elixir trade</span><span>(3.5, 22.0)</span></div>
+      </div>
+
+      <div style="padding:8px 12px; background:var(--bg-1); display:flex; gap:8px;">
+        <button class="btn" style="flex:1">EXPORT REPLAY (.JSON)</button>
+        <button class="btn" style="flex:1">SAVE SNAPSHOT</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  // 1. RENDER ELIXIR PIPS & LAYER STRIP
+  const pipsWrap = document.getElementById('elixirPips');
+  for (let i = 0; i < 10; i++) {
+    const pip = document.createElement('div');
+    pip.className = 'pip';
+    const fill = document.createElement('div');
+    fill.className = 'pip-fill';
+    fill.style.width = i < 6 ? '100%' : (i === 6 ? '80%' : '0%');
+    pip.appendChild(fill);
+    pipsWrap.appendChild(pip);
+  }
+
+  const layers = [
+    { name: 'ENTITY_TF', dim: '40×128' },
+    { name: 'SPATIAL_CNN', dim: '6×32×18' },
+    { name: 'FUSION_CORE', dim: '128-D' },
+    { name: 'HEAD1_CARD', dim: '5 LOGITS' },
+    { name: 'HEAD2_TILE', dim: '576 TILES' }
+  ];
+  const layerStrip = document.getElementById('layerStrip');
+  layers.forEach((l, idx) => {
+    const card = document.createElement('div');
+    card.className = 'node-card';
+    let barsHtml = '';
+    for (let b = 0; b < 8; b++) {
+      barsHtml += `<div class="m-bar" id="lbar_${idx}_${b}" style="height:${20 + Math.random()*80}%"></div>`;
+    }
+    card.innerHTML = `<div class="node-top"><span>${l.name}</span><span style="color:var(--blue)">${l.dim}</span></div><div class="mini-bars">${barsHtml}</div>`;
+    layerStrip.appendChild(card);
+  });
+
+  // 2. HIGH-CRAFT PROCEDURAL ARENA RENDERER
+  const bCanvas = document.getElementById('battleCanvas');
+  const bCtx = bCanvas.getContext('2d');
+  let showHeat = true;
+  let showVec = true;
+  let tick = 0;
+
+  const towers = [
+    { id: 'KR', x: 9.0, y: 3.0, r: 1.7, hp: 1.0, maxHp: 4008, side: 'red', king: true, angle: Math.PI/2 },
+    { id: 'PLR', x: 3.5, y: 6.5, r: 1.3, hp: 0.62, maxHp: 2534, side: 'red', king: false, angle: 1.4 },
+    { id: 'PRR', x: 14.5, y: 6.5, r: 0.0, hp: 0.0, maxHp: 2534, side: 'red', king: false, destroyed: true },
+    { id: 'KB', x: 9.0, y: 29.0, r: 1.7, hp: 1.0, maxHp: 4008, side: 'blue', king: true, angle: -Math.PI/2 },
+    { id: 'PLB', x: 3.5, y: 25.5, r: 1.3, hp: 0.84, maxHp: 2534, side: 'blue', king: false, angle: -1.4 },
+    { id: 'PRB', x: 14.5, y: 25.5, r: 1.3, hp: 1.0, maxHp: 2534, side: 'blue', king: false, angle: -Math.PI/2 }
+  ];
+
+  const units = [
+    { name: 'Giant', cls: 'TANK', x: 4.1, y: 18.2, vx: 0.015, vy: 0.018, r: 11, hp: 0.78, range: 1.2, side: 'red', targetX: 9.0, targetY: 21.0 },
+    { name: 'Wizard', cls: 'AOE', x: 3.6, y: 14.2, vx: 0.005, vy: 0.02, r: 7, hp: 0.95, range: 5.5, side: 'red', targetX: 6.2, targetY: 22.0 },
+    { name: 'Cannon', cls: 'BLDG', x: 9.0, y: 21.0, vx: 0, vy: 0, r: 9, hp: 0.66, range: 5.5, side: 'blue', targetX: 4.1, targetY: 18.2 },
+    { name: 'Musketeer', cls: 'RNG', x: 6.2, y: 23.0, vx: 0, vy: -0.005, r: 7, hp: 1.0, range: 6.0, side: 'blue', targetX: 4.1, targetY: 18.2 },
+    { name: 'Hog Rider', cls: 'FAST', x: 14.2, y: 5.2, vx: -0.02, vy: -0.01, r: 8, hp: 0.45, range: 1.0, side: 'blue', targetX: 9.0, targetY: 3.0 }
+  ];
+
+  const projectiles = [];
+
+  function gx(x) { return (x / 18) * bCanvas.width; }
+  function gy(y) { return (y / 32) * bCanvas.height; }
+
+  function drawOctagonKeep(ctx, cx, cy, rad, side, isKing, hp, barrelAngle) {
+    const col = side === 'blue' ? '#38bdf8' : '#fb7185';
+    const dark = side === 'blue' ? '#0c2d48' : '#4c0519';
+
+    // Drop Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath();
+    ctx.arc(cx + 3, cy + 4, rad + 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Stone Fortress Base (Octagon)
+    ctx.fillStyle = '#1e2433';
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4 + Math.PI / 8;
+      const px = cx + Math.cos(a) * rad;
+      const py = cy + Math.sin(a) * rad;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Inner Team Armor Plate
+    ctx.fillStyle = dark;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, rad * 0.68, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Rotating Turret Barrel
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(barrelAngle);
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillRect(0, -3, rad * 0.95, 6);
+    ctx.strokeStyle = '#0f172a';
+    ctx.strokeRect(0, -3, rad * 0.95, 6);
+    ctx.restore();
+
+    // Core Reactor Crown Pip
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(cx, cy, isKing ? 6 : 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Radial HP Shield Arc
+    ctx.strokeStyle = hp > 0.5 ? '#34d399' : '#fbbf24';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(cx, cy, rad + 4, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * hp));
+    ctx.stroke();
+
+    // Numeric HP Tag
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = '700 9px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText(Math.round(hp * (isKing ? 4008 : 2534)), cx, cy + rad + 13);
+  }
+
+  function renderBattleground() {
+    tick++;
+    const W = bCanvas.width;
+    const H = bCanvas.height;
+
+    // 1. Tactical Turf Checkerboard
+    const tileW = W / 18;
+    const tileH = H / 32;
+    for (let r = 0; r < 32; r++) {
+      for (let c = 0; c < 18; c++) {
+        const isDark = (r + c) % 2 === 0;
+        if (r < 15) {
+          bCtx.fillStyle = isDark ? '#111622' : '#141a28';
+        } else if (r > 16) {
+          bCtx.fillStyle = isDark ? '#0e1922' : '#111f2a';
+        } else {
+          bCtx.fillStyle = '#071929';
+        }
+        bCtx.fillRect(c * tileW, r * tileH, tileW + 0.5, tileH + 0.5);
+      }
+    }
+
+    // Engraved Lane Guides
+    bCtx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
+    bCtx.lineWidth = 6;
+    bCtx.beginPath();
+    bCtx.moveTo(gx(3.5), gy(6.5)); bCtx.lineTo(gx(3.5), gy(25.5));
+    bCtx.moveTo(gx(14.5), gy(6.5)); bCtx.lineTo(gx(14.5), gy(25.5));
+    bCtx.stroke();
+
+    // 2. Animated River Currents
+    const rivY = gy(15.2);
+    const rivH = gy(1.6);
+    const rivGrad = bCtx.createLinearGradient(0, rivY, 0, rivY + rivH);
+    rivGrad.addColorStop(0, '#082f49');
+    rivGrad.addColorStop(0.5, '#0284c7');
+    rivGrad.addColorStop(1, '#082f49');
+    bCtx.fillStyle = rivGrad;
+    bCtx.fillRect(0, rivY, W, rivH);
+
+    // Water Ripples
+    bCtx.strokeStyle = 'rgba(186, 230, 253, 0.25)';
+    bCtx.lineWidth = 1.5;
+    for (let i = 0; i < 12; i++) {
+      const rx = ((i * 35 + tick * 0.8) % (W + 30)) - 15;
+      const ry = rivY + 6 + (i % 3) * 7;
+      bCtx.beginPath();
+      bCtx.moveTo(rx, ry);
+      bCtx.lineTo(rx + 14, ry);
+      bCtx.stroke();
+    }
+
+    // 3. Detailed Timber & Stone Bridges
+    [3.5, 14.5].forEach(bx => {
+      const px = gx(bx - 1.1);
+      const pw = gx(2.2);
+      bCtx.fillStyle = '#334155';
+      bCtx.strokeStyle = '#64748b';
+      bCtx.lineWidth = 2;
+      bCtx.fillRect(px, rivY - 4, pw, rivH + 8);
+      bCtx.strokeRect(px, rivY - 4, pw, rivH + 8);
+      // Bridge planks
+      bCtx.strokeStyle = '#1e293b';
+      for (let p = 0; p < 5; p++) {
+        const py = rivY - 2 + p * ((rivH + 4) / 5);
+        bCtx.beginPath(); bCtx.moveTo(px + 2, py); bCtx.lineTo(px + pw - 2, py); bCtx.stroke();
+      }
+    });
+
+    // 4. Head 2 Spatial Probability Contour Heatmap (Centered on Kill-Zone 9, 21)
+    if (showHeat) {
+      const hx = gx(9.0);
+      const hy = gy(21.0);
+      [55, 38, 22].forEach((rad, i) => {
+        bCtx.fillStyle = `rgba(56, 189, 248, ${0.12 + i * 0.08})`;
+        bCtx.strokeStyle = `rgba(56, 189, 248, ${0.35 + i * 0.2})`;
+        bCtx.lineWidth = 1;
+        bCtx.beginPath();
+        bCtx.arc(hx, hy, rad + Math.sin(tick * 0.06) * 2, 0, Math.PI * 2);
+        bCtx.fill();
+        bCtx.stroke();
+      });
+    }
+
+    // 5. Render Fortifications (Towers)
+    towers.forEach(t => {
+      const cx = gx(t.x);
+      const cy = gy(t.y);
+      if (t.destroyed) {
+        // Craters / Rubble for destroyed Right Red Tower
+        bCtx.fillStyle = '#1e293b';
+        bCtx.strokeStyle = '#475569';
+        bCtx.setLineDash([3, 3]);
+        bCtx.beginPath(); bCtx.arc(cx, cy, 16, 0, Math.PI * 2); bCtx.fill(); bCtx.stroke();
+        bCtx.setLineDash([]);
+        bCtx.fillStyle = '#fb7185';
+        bCtx.font = '700 8px JetBrains Mono';
+        bCtx.textAlign = 'center';
+        bCtx.fillText('DESTROYED', cx, cy + 3);
+      } else {
+        drawOctagonKeep(bCtx, cx, cy, t.king ? 22 : 16, t.side, t.king, t.hp, t.angle + Math.sin(tick*0.03)*0.15);
+      }
+    });
+
+    // 6. Render Units, Sight Cones, & Aggro Vectors
+    units.forEach(u => {
+      // Gentle patrol oscillation for demo liveness
+      const ux = gx(u.x + Math.sin(tick * 0.03) * 0.25);
+      const uy = gy(u.y + Math.cos(tick * 0.03) * 0.25);
+      const tx = gx(u.targetX);
+      const ty = gy(u.targetY);
+      const col = u.side === 'blue' ? '#38bdf8' : '#fb7185';
+
+      if (showVec) {
+        // Attack Range Ring
+        bCtx.strokeStyle = u.side === 'blue' ? 'rgba(56,189,248,0.14)' : 'rgba(251,113,133,0.14)';
+        bCtx.lineWidth = 1;
+        bCtx.beginPath();
+        bCtx.arc(ux, uy, gx(u.range), 0, Math.PI * 2);
+        bCtx.stroke();
+
+        // Targeting Laser Curve
+        bCtx.strokeStyle = col;
+        bCtx.setLineDash([3, 3]);
+        bCtx.lineWidth = 1.2;
+        bCtx.beginPath();
+        bCtx.moveTo(ux, uy);
+        bCtx.lineTo(tx, ty);
+        bCtx.stroke();
+        bCtx.setLineDash([]);
+      }
+
+      // Unit Chassis
+      bCtx.fillStyle = '#0f172a';
+      bCtx.strokeStyle = col;
+      bCtx.lineWidth = 2;
+      bCtx.beginPath();
+      bCtx.arc(ux, uy, u.r, 0, Math.PI * 2);
+      bCtx.fill();
+      bCtx.stroke();
+
+      // Unit Class Tag & Mini HP Bar
+      bCtx.fillStyle = '#fff';
+      bCtx.font = '700 8px JetBrains Mono';
+      bCtx.textAlign = 'center';
+      bCtx.fillText(u.name.slice(0, 3).toUpperCase(), ux, uy + 3);
+
+      // HP Bar above unit
+      const bw = 22;
+      bCtx.fillStyle = '#000';
+      bCtx.fillRect(ux - bw/2, uy - u.r - 7, bw, 4);
+      bCtx.fillStyle = col;
+      bCtx.fillRect(ux - bw/2, uy - u.r - 7, bw * u.hp, 4);
+    });
+
+    // 7. Render Active Spell Projectiles
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+      const p = projectiles[i];
+      p.t += 0.04;
+      const px = p.sx + (p.tx - p.sx) * p.t;
+      const py = p.sy + (p.ty - p.sy) * p.t - Math.sin(p.t * Math.PI) * 45;
+
+      bCtx.fillStyle = '#fbbf24';
+      bCtx.shadowColor = '#f97316';
+      bCtx.shadowBlur = 12;
+      bCtx.beginPath();
+      bCtx.arc(px, py, 7, 0, Math.PI * 2);
+      bCtx.fill();
+      bCtx.shadowBlur = 0;
+
+      if (p.t >= 1) projectiles.splice(i, 1);
+    }
+
+    requestAnimationFrame(renderBattleground);
+  }
+
+  function triggerFireball() {
+    projectiles.push({ sx: gx(9.0), sy: gy(29.0), tx: gx(3.5), ty: gy(6.5), t: 0 });
+  }
+  function toggleIso() {
+    bCanvas.classList.toggle('iso-tilt');
+    document.getElementById('btnIso').classList.toggle('active');
+  }
+  function toggleHeatmap() {
+    showHeat = !showHeat;
+    document.getElementById('btnHeat').classList.toggle('active', showHeat);
+  }
+  function toggleVectors() {
+    showVec = !showVec;
+    document.getElementById('btnVectors').classList.toggle('active', showVec);
+  }
+
+  // 3. MULTI-CHART RENDERERS (CRITIC V(S), DUAL ELIXIR, RADAR, MINI HEATMAP)
+  const cChart = document.getElementById('criticChart');
+  const eChart = document.getElementById('elixirChart');
+  const rChart = document.getElementById('radarChart');
+  const mHeat = document.getElementById('miniHeatCanvas');
+
+  const criticHistory = [0.05, 0.12, -0.08, -0.22, -0.15, 0.08, 0.25, 0.42, 0.38, 0.51, 0.48, 0.62];
+  const blueElixirHist = [5, 6.5, 3.5, 5.2, 7.8, 3.8, 6.0, 8.2, 4.5, 6.8, 7.2, 6.8];
+  const redElixirHist  = [5, 7.0, 2.0, 4.5, 6.0, 2.5, 4.8, 6.2, 3.0, 4.2, 5.1, 4.2];
+
+  function drawTelemetryCharts() {
+    // A. Bipolar Critic V(s) Chart
+    cChart.width = cChart.offsetWidth;
+    cChart.height = cChart.offsetHeight;
+    const cw = cChart.width, ch = cChart.height, c mid = ch / 2;
+    const cCtx = cChart.getContext('2d');
+
+    // Zero baseline
+    cCtx.strokeStyle = '#2e364a';
+    cCtx.setLineDash([4, 4]);
+    cCtx.beginPath(); cCtx.moveTo(0, ch/2); cCtx.lineTo(cw, ch/2); cCtx.stroke();
+    cCtx.setLineDash([]);
+
+    // Area gradient
+    const grad = cCtx.createLinearGradient(0, 0, 0, ch);
+    grad.addColorStop(0, 'rgba(56, 189, 248, 0.35)');
+    grad.addColorStop(0.5, 'rgba(56, 189, 248, 0.0)');
+    grad.addColorStop(1, 'rgba(251, 113, 133, 0.35)');
+
+    cCtx.beginPath();
+    cCtx.moveTo(0, ch/2);
+    criticHistory.forEach((v, i) => {
+      const x = (i / (criticHistory.length - 1)) * cw;
+      const y = (ch / 2) - v * (ch * 0.42);
+      cCtx.lineTo(x, y);
+    });
+    cCtx.lineTo(cw, ch/2);
+    cCtx.closePath();
+    cCtx.fillStyle = grad;
+    cCtx.fill();
+
+    // Stroke curve
+    cCtx.strokeStyle = '#38bdf8';
+    cCtx.lineWidth = 2;
+    cCtx.beginPath();
+    criticHistory.forEach((v, i) => {
+      const x = (i / (criticHistory.length - 1)) * cw;
+      const y = (ch / 2) - v * (ch * 0.42);
+      if (i === 0) cCtx.moveTo(x, y); else cCtx.lineTo(x, y);
+    });
+    cCtx.stroke();
+
+    // B. Dual Elixir Curve
+    eChart.width = eChart.offsetWidth;
+    eChart.height = eChart.offsetHeight;
+    const ew = eChart.width, eh = eChart.height;
+    const eCtx = eChart.getContext('2d');
+
+    [ { data: blueElixirHist, col: '#38bdf8' }, { data: redElixirHist, col: '#fb7185' } ].forEach(s => {
+      eCtx.strokeStyle = s.col;
+      eCtx.lineWidth = 2;
+      eCtx.beginPath();
+      s.data.forEach((v, i) => {
+        const x = (i / (s.data.length - 1)) * ew;
+        const y = eh - (v / 10) * (eh - 12) - 6;
+        if (i === 0) eCtx.moveTo(x, y); else eCtx.lineTo(x, y);
+      });
+      eCtx.stroke();
+    });
+
+    // C. 6-Axis Tactical Radar Spider Chart
+    rChart.width = rChart.offsetWidth;
+    rChart.height = rChart.offsetHeight;
+    const rw = rChart.width, rh = rChart.height;
+    const rCtx = rChart.getContext('2d');
+    const rcx = rw / 2, rcy = rh / 2, rRad = Math.min(rw, rh) * 0.36;
+    const labels = ['AGGRO', 'BANK', 'LEFT', 'RIGHT', 'SPELL', 'DEF'];
+    const vals = [0.68, 0.72, 0.85, 0.45, 0.60, 0.92];
+
+    rCtx.strokeStyle = '#1e2330';
+    [0.5, 1.0].forEach(scale => {
+      rCtx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (i * Math.PI) / 3 - Math.PI / 2;
+        const px = rcx + Math.cos(a) * rRad * scale;
+        const py = rcy + Math.sin(a) * rRad * scale;
+        if (i === 0) rCtx.moveTo(px, py); else rCtx.lineTo(px, py);
+      }
+      rCtx.closePath();
+      rCtx.stroke();
+    });
+
+    rCtx.fillStyle = 'rgba(56, 189, 248, 0.22)';
+    rCtx.strokeStyle = '#38bdf8';
+    rCtx.lineWidth = 1.5;
+    rCtx.beginPath();
+    vals.forEach((v, i) => {
+      const a = (i * Math.PI) / 3 - Math.PI / 2;
+      const px = rcx + Math.cos(a) * rRad * v;
+      const py = rcy + Math.sin(a) * rRad * v;
+      if (i === 0) rCtx.moveTo(px, py); else rCtx.lineTo(px, py);
+
+      // Axis label
+      rCtx.fillStyle = '#94a3b8';
+      rCtx.font = '600 8px JetBrains Mono';
+      rCtx.textAlign = 'center';
+      rCtx.fillText(labels[i], rcx + Math.cos(a) * (rRad + 12), rcy + Math.sin(a) * (rRad + 12) + 3);
+    });
+    rCtx.closePath();
+    rCtx.fillStyle = 'rgba(56, 189, 248, 0.22)';
+    rCtx.fill();
+    rCtx.stroke();
+
+    // D. Mini 18x32 Spatial Density Map
+    const mCtx = mHeat.getContext('2d');
+    mCtx.clearRect(0, 0, mHeat.width, mHeat.height);
+    mCtx.strokeStyle = '#1e293b';
+    mCtx.strokeRect(0, mHeat.height/2 - 3, mHeat.width, 6);
+    const mGrad = mCtx.createRadialGradient(48, 98, 2, 48, 98, 28);
+    mGrad.addColorStop(0, '#38bdf8');
+    mGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.35)');
+    mGrad.addColorStop(1, 'transparent');
+    mCtx.fillStyle = mGrad;
+    mCtx.fillRect(0, 0, mHeat.width, mHeat.height);
+  }
+
+  // Live Liveness Ticker
+  setInterval(() => {
+    for (let l = 0; l < 5; l++) {
+      for (let b = 0; b < 8; b++) {
+        const el = document.getElementById(`lbar_${l}_${b}`);
+        if (el) el.style.height = `${15 + Math.random() * 85}%`;
+      }
+    }
+    if (Math.random() < 0.35) triggerFireball();
+  }, 600);
+
+  window.addEventListener('resize', drawTelemetryCharts);
+  renderBattleground();
+  setTimeout(drawTelemetryCharts, 50);
+</script>
+</body>
+</html>
+Upgrade `tools/ui.py` to match the procedural battleground renderer and multi-chart telemetry suite, and fix the 3 telemetry bugs visible in our current UI:
+
+### 1. Fix Telemetry Bugs from Current UI
+1. **Fix Value Critic V(s) Flatline & Sign Inversion**:
+   - Currently, the Critic wave displays a flat line and reads `+0.54 ADV` even when Red wins `0 : 1`. Ensure `ui.py` appends the live scalar `value.item()` from `AlphaStarCRNet` on every decision step (4 ticks) into a rolling 120-step history array, and pushes `-1.0` / `+1.0` on terminal match completion.
+2. **Gate Spatial Target Highlighting on `Wait` (Slot 4)**:
+   - When `chosen_card_slot == 4` (Wait / Bank Elixir), do not draw a fake `TARGET [24%]` box on the arena. Dim the spatial heatmap and display `HOLDING // BANKING ELIXIR` in the top status pill.
+3. **Remove Blocking Victory Modal**:
+   - Remove the centered `Red Victory!` popup that covers the bridges. Display match completion in the non-blocking top status banner so the final board state stays 100% inspectable.
+
+### 2. Upgrade the Arena Renderer (No Solid Boxes)
+- Replace the flat rectangular boxes for `KING`, `TOWER`, and units on the arena canvas:
+  - **Fortifications**: Render octagonal castle keeps with inner armor plates, rotating cannon barrels that point toward the unit's current `target_id`, radial HP shield arcs, and rubble craters when a tower is destroyed.
+  - **Environment**: Render turf checkerboard tiles, engraved lane paths, animated water ripples across the river, and planked suspension bridges at `x = 3.5` and `x = 14.5`.
+  - **2.5D Isometric Toggle**: Add a `2.5D TILT` button that applies `transform: perspective(1100px) rotateX(24deg)` to the arena canvas, plus toggles for `CONTOUR MAP` (Gaussian probability rings) and `VECTORS` (attack range rings and dashed aggro laser lines).
+
+### 3. Add the 4 Multi-Dimensional Telemetry Charts
+- Replace the static `ALPHASTAR CR-NET TOPOLOGY` node box with:
+  1. **Live Layer Activation Strip**: 5 compact cards (`ENTITY_TF`, `SPATIAL_CNN`, `FUSION_CORE`, `HEAD1_CARD`, `HEAD2_TILE`) with animated mini-histograms driven by the L2 norm / entropy of each module.
+  2. **Bipolar Critic V(s) Horizon Graph**: Dual-shaded canvas area chart (Cyan above `0.0` for Blue advantage, Rose below `0.0` for Red advantage).
+  3. **Dual-Elixir Economy Curve**: Overlapping time-series chart tracking Blue Elixir vs. Red Elixir and net Elixir Differential (`ΔE`).
+  4. **6-Axis Tactical Posture Radar**: Spider chart plotting `AGGRO`, `BANK`, `LEFT`, `RIGHT`, `SPELL`, and `DEF` computed from recent deployment history. 
+USE DIFF COLOR RATHER THAN JUST BLUE DONT MAKE IT AI GENERIC /impeccable use all skills to improve it 
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-11-08T13:40:30+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\varun\Projects\clashbot\cr_alphastar_agent\training\obsidian_sync.py (LANGUAGE_UNSPECIFIED)
+Cursor is on line: 1
+Other open documents:
+- c:\Users\varun\Projects\clashbot\tools\ui.py (LANGUAGE_UNSPECIFIED)
+- c:\Users\varun\OneDrive\Desktop\obsidian\v\ClashBot - AlphaStar RL Agent.md (LANGUAGE_UNSPECIFIED)
+- c:\Users\varun\Projects\clashbot\train.py (LANGUAGE_UNSPECIFIED)
+- c:\Users\varun\Projects\clashbot\warmstart_bc.py (LANGUAGE_UNSPECIFIED)
+- c:\Users\varun\Projects\clashbot\cr_alphastar_agent\config.py (LANGUAGE_UNSPECIFIED)
+
+The user has mentioned some items in the form @[ITEM]. Here is extra information about the items that were mentioned by the user, in the order that they appear:
+
+/impeccable is a [Slash Command]:
+<SKILL>The user requested you read and use the "impeccable" skill. The path to the skill file is:
+C:\Users\varun\.gemini\config\skills\impeccable\SKILL.md</SKILL>
+</ADDITIONAL_METADATA>
