@@ -28,9 +28,19 @@ from deploy_bluestacks import (
 from evaluate_visual import classify_tactical_zone
 
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.02
+
+
 def attach_desktop():
     try:
         user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()
         hdesk = user32.OpenDesktopW("Default", 0, False, 0x10000000)
         if hdesk:
             user32.SetThreadDesktop(hdesk)
@@ -265,9 +275,30 @@ def run_5_games(checkpoint: str = "checkpoints/latest.pt", target_matches: int =
                 tile_x = chosen_tile % ARENA_WIDTH
                 tile_y = chosen_tile // ARENA_WIDTH
 
+                # Elixir banking override: Never leak elixir if >= 6.5
+                if chosen_card == 4 and perception.current_elixir >= 6.5:
+                    for slot in range(4):
+                        cname = perception.tracked_hand[slot]
+                        cid = CRSIM_NAME_TO_ID.get(cname, 1)
+                        cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
+                        if perception.current_elixir >= cost:
+                            chosen_card = slot
+                            tile_y = 12
+                            tile_x = 4 if tile_x < 9 else 13
+                            break
+
                 # Execute action via direct OS mouse clicks
                 if chosen_card != 4:
                     card_name = perception.tracked_hand[chosen_card] if chosen_card < len(perception.tracked_hand) else f"Card {chosen_card}"
+                    card_id = CRSIM_NAME_TO_ID.get(card_name, 1)
+                    is_spell = card_id in (CARDS_CATALOG.get("SPELL_CARD_IDS", [1, 2, 7]))  # Fireball, Arrows, etc.
+
+                    # Troops MUST be placed on friendly territory (y <= 14) and clear of King Tower backline
+                    if not is_spell and tile_y > 14:
+                        tile_y = 12
+                        tile_x = 4 if tile_x < 9 else 13
+                    tile_y = max(2, tile_y)
+
                     zone = classify_tactical_zone(float(tile_x), float(tile_y))
                     deployed = controller.deploy_card(
                         card_slot=chosen_card,

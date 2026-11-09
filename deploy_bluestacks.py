@@ -97,6 +97,7 @@ class WindowCapture:
         try:
             import ctypes
             user32 = ctypes.windll.user32
+            user32.SetProcessDPIAware()
             hdesk = user32.OpenDesktopW("Default", 0, False, 0x10000000)
             if hdesk:
                 user32.SetThreadDesktop(hdesk)
@@ -489,10 +490,24 @@ class WindowsMouseController:
         py = int(norm_y * self.screen_h)
         return px, py
 
+    def ensure_foreground(self):
+        """Brings the Clash Royale window to foreground so input is received."""
+        if self.hwnd and HAS_WIN32:
+            try:
+                import win32gui
+                fg = win32gui.GetForegroundWindow()
+                if fg != self.hwnd:
+                    win32gui.ShowWindow(self.hwnd, 5)  # SW_SHOW
+                    win32gui.SetForegroundWindow(self.hwnd)
+            except Exception:
+                pass
+
     def deploy_card(self, card_slot: int, tile_x: int, tile_y: int,
                     arena_box: dict, hand_xs: List[float], hand_box_y: float) -> bool:
         if card_slot == 4:
             return True
+
+        self.ensure_foreground()
 
         card_rel_x, card_rel_y = self.card_slot_to_screen_pixel(card_slot, hand_xs, hand_box_y)
         arena_rel_x, arena_rel_y = self.grid_to_screen_pixel(tile_x, tile_y, arena_box)
@@ -511,16 +526,17 @@ class WindowsMouseController:
         try:
             import pyautogui
             pyautogui.FAILSAFE = False
+            pyautogui.PAUSE = 0.02
             # 1. Drag-and-Drop: Hold down on card in hand, drag smoothly to arena tile, release
             pyautogui.moveTo(abs_card_x, abs_card_y)
             pyautogui.mouseDown(button="left")
-            time.sleep(0.05)
+            time.sleep(0.06)
             pyautogui.moveTo(abs_arena_x, abs_arena_y, duration=0.15)
-            time.sleep(0.05)
+            time.sleep(0.06)
             pyautogui.mouseUp(button="left")
 
             # 2. Tap-to-Place Confirmation Fallback: Click arena target to confirm placement
-            time.sleep(0.06)
+            time.sleep(0.08)
             pyautogui.click(abs_arena_x, abs_arena_y)
 
             print(f"[MOUSE EXEC] {action_desc} (Drag & Confirm Tap)")
