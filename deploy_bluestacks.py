@@ -510,10 +510,20 @@ class WindowsMouseController:
 
         try:
             import pyautogui
-            pyautogui.click(abs_card_x, abs_card_y)
-            time.sleep(0.04)
+            pyautogui.FAILSAFE = False
+            # 1. Drag-and-Drop: Hold down on card in hand, drag smoothly to arena tile, release
+            pyautogui.moveTo(abs_card_x, abs_card_y)
+            pyautogui.mouseDown(button="left")
+            time.sleep(0.05)
+            pyautogui.moveTo(abs_arena_x, abs_arena_y, duration=0.15)
+            time.sleep(0.05)
+            pyautogui.mouseUp(button="left")
+
+            # 2. Tap-to-Place Confirmation Fallback: Click arena target to confirm placement
+            time.sleep(0.06)
             pyautogui.click(abs_arena_x, abs_arena_y)
-            print(f"[MOUSE EXEC] {action_desc}")
+
+            print(f"[MOUSE EXEC] {action_desc} (Drag & Confirm Tap)")
             return True
         except Exception as e:
             print(f"[MOUSE Error] Failed to execute click: {e}")
@@ -619,11 +629,12 @@ class ADBController:
 
         if self.process and self.process.stdin:
             try:
-                # Write instant tap commands
-                self.process.stdin.write(f"input tap {card_px} {card_py}\n")
+                # 1. Drag & drop swipe: card to arena
+                self.process.stdin.write(f"input swipe {card_px} {card_py} {arena_px} {arena_py} 150\n")
+                # 2. Tap confirmation
                 self.process.stdin.write(f"input tap {arena_px} {arena_py}\n")
                 self.process.stdin.flush()
-                print(f"[ADB EXEC] {action_desc}")
+                print(f"[ADB EXEC] {action_desc} (Swipe & Tap)")
                 return True
             except Exception as e:
                 print(f"[ADB Error] Failed to write tap command: {e}")
