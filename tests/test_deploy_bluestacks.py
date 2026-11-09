@@ -9,7 +9,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from deploy_bluestacks import ADBController, WindowsMouseController, PerceptionAdapter  # noqa: E402
+from deploy_bluestacks import ADBController, WindowsMouseController, PerceptionAdapter, draw_hud  # noqa: E402
 from cr_alphastar_agent.config import CARDS_CATALOG  # noqa: E402
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID  # noqa: E402
 
@@ -115,3 +115,21 @@ def test_perception_calibrates_widescreen_letterboxing():
     # Left ratio ~ 656/1920 = 0.34
     assert adapter.arena_box["left"] > 0.20
     assert adapter.arena_box["right"] < 0.80
+
+
+def test_draw_hud_renders_without_error():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    mouse = WindowsMouseController(bbox={"left": 0, "top": 0, "width": 544, "height": 1016}, dry_run=True)
+    frame = np.zeros((1016, 544, 3), dtype=np.uint8)
+    hud = draw_hud(
+        frame=frame,
+        perception=adapter,
+        controller=mouse,
+        action=(0, 100),
+        value_est=0.42,
+        fps=60.0
+    )
+    assert hud is not None
+    assert hud.shape == frame.shape
+    assert hud.dtype == np.uint8
+

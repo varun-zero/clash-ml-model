@@ -78,7 +78,7 @@ class WindowCapture:
         self.title_substr = title_substr
         self.hwnd = None
         self.bbox = None  # {"left": x, "top": y, "width": w, "height": h}
-        self.sct = mss.mss() if HAS_MSS else None
+        self.sct = mss.MSS() if HAS_MSS else None
         self.detected_mode = "mouse"  # "mouse" (Google Play Games PC) or "adb" (BlueStacks)
 
         if bbox is not None:
@@ -93,6 +93,15 @@ class WindowCapture:
             if self.sct:
                 self.bbox = self.sct.monitors[1]
             return False
+
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hdesk = user32.OpenDesktopW("Default", 0, False, 0x10000000)
+            if hdesk:
+                user32.SetThreadDesktop(hdesk)
+        except Exception:
+            pass
 
         search_titles = [self.title_substr] if self.title_substr else DEFAULT_WINDOW_CANDIDATES
 
@@ -147,6 +156,15 @@ class WindowCapture:
 
         # Re-verify bounding box periodically if hooked to a window
         if self.hwnd and HAS_WIN32:
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                hdesk = user32.OpenDesktopW("Default", 0, False, 0x10000000)
+                if hdesk:
+                    user32.SetThreadDesktop(hdesk)
+            except Exception:
+                pass
+
             try:
                 if not win32gui.IsWindow(self.hwnd):
                     print("[WindowCapture] Window closed, re-locating...")
@@ -707,6 +725,8 @@ def main():
                         help="Dry-run mode: Visualize decisions without sending mouse clicks or ADB taps")
     parser.add_argument("--visualize", action="store_true",
                         help="Display real-time OpenCV HUD overlay window")
+    parser.add_argument("--no-gui", action="store_true",
+                        help="Disable OpenCV HUD window and run headless in terminal")
     parser.add_argument("--cadence-hz", type=float, default=2.5,
                         help="Decision sampling frequency (default: 2.5 Hz / 0.4s interval)")
     parser.add_argument("--device", type=str, default=None,
@@ -799,6 +819,8 @@ def main():
             if capture.bbox and hasattr(controller, "update_bbox"):
                 controller.update_bbox(capture.bbox)
 
+            perception.calibrate_game_column(frame)
+
             # 2. Perception: Transform frame into canonical observation batch
             obs = perception.frame_to_obs(frame)
 
@@ -826,19 +848,24 @@ def main():
                 perception.update_hand_on_play(chosen_card)
 
             # 5. Optional Visualization Overlay
-            if args.visualize or args.dry_run:
-                hud_frame = draw_hud(
-                    frame=frame,
-                    perception=perception,
-                    controller=controller,
-                    action=(chosen_card, chosen_tile),
-                    value_est=value_est,
-                    fps=fps
-                )
-                cv2.imshow("AlphaStar Clash Royale - Live Bridge", hud_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
+            if not args.no_gui and (args.visualize or args.dry_run):
+                try:
+                    hud_frame = draw_hud(
+                        frame=frame,
+                        perception=perception,
+                        controller=controller,
+                        action=(chosen_card, chosen_tile),
+                        value_est=value_est,
+                        fps=fps
+                    )
+                    cv2.imshow("AlphaStar Clash Royale - Live Bridge", hud_frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
+                except (cv2.error, Exception) as gui_err:
+                    if not getattr(main, "_gui_warned", False):
+                        print(f"[HUD GUI Notice] GUI overlay disabled ({gui_err}). Continuing live actions via console.")
+                        main._gui_warned = True
 
             # Rate Limiting: 2.5 Hz cadence (~0.4s interval)
             elapsed = time.time() - t_start
@@ -855,7 +882,10 @@ def main():
         print("\nStopping live deployment bridge...")
     finally:
         controller.close()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("[Bridge Closed] Clean shutdown complete.")
 
 
