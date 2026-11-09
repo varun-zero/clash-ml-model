@@ -10,6 +10,12 @@ Hardware-level Win32 SendInput controller with:
 import os
 import sys
 import time
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 import argparse
 import ctypes
 from ctypes import wintypes
@@ -461,6 +467,7 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
 
     completed = 0
     in_battle = False
+    match_start_time = 0.0
     last_action_time = 0.0
     action_interval = 0.40  # 2.5 Hz cadence
 
@@ -481,43 +488,109 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
         h, w = frame.shape[:2]
         vp = controller.viewport
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        now = time.time()
 
-        # 1. Detect Post-Match Play Again (Yellow) and OK (Blue) in bottom 25% of viewport
-        bot_crop = hsv[int(h * 0.78):, :]
-        yellow_mask = cv2.inRange(bot_crop, np.array([15, 170, 170]), np.array([35, 255, 255]))
-        blue_mask = cv2.inRange(bot_crop, np.array([95, 140, 140]), np.array([125, 255, 255]))
+        # 1. Detect Post-Match Play Again (Yellow) and OK (Blue) in bottom region
+        # GATED: In Clash Royale, matches NEVER conclude in < 30 seconds.
+        battle_duration = (now - match_start_time) if in_battle else 999.0
+        if battle_duration >= 25.0:
+            bot_crop = hsv[int(h * 0.88):int(h * 0.98), :]
+            yellow_mask = cv2.inRange(bot_crop, np.array([15, 170, 170]), np.array([35, 255, 255]))
+            blue_mask = cv2.inRange(bot_crop, np.array([95, 140, 140]), np.array([125, 255, 255]))
 
-        # Play Again Check
-        y_cnts, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        found_play_again = False
-        for c in y_cnts:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bw > 60 and bh > 25:
-                # Play Again button sits in bottom center-left
-                cx = vp["win_left"] + bx + bw // 2
-                cy = vp["win_top"] + int(h * 0.78) + by + bh // 2
-                if by > int(h * 0.08):
+            # Play Again Check (Yellow Button on bottom left)
+            y_cnts, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            found_play_again = False
+            for c in y_cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                cx = bx + bw // 2
+                # Target Play Again is in center-left region (x in 0.35..0.52 of window)
+                if bw > 50 and bh > 20 and int(w * 0.30) < cx < int(w * 0.55):
                     found_play_again = True
+                    abs_cx = vp["win_left"] + cx
+                    abs_cy = vp["win_top"] + int(h * 0.88) + by + bh // 2
+
                     if in_battle:
                         completed += 1
-                        print(f"\n🏁 MATCH {completed}/{matches} FINISHED! Cards deployed: {len(match_deployments)}")
+                        print(f"\n=======================================================")
+                        print(f"🏁 MATCH {completed}/{matches} FINISHED!")
+                        print(f"   Duration: {battle_duration:.1f}s | Cards Deployed: {len(match_deployments)}")
+                        print(f"=======================================================\n")
                         in_battle = False
                         match_deployments = []
 
                     if completed < matches:
-                        print(f"[Autopilot] Clicking 'Play Again' at ({cx}, {cy}) for Match {completed + 1}...")
-                        controller.hardware_tap(cx, cy)
+                        print(f"[Autopilot] Clicking 'Play Again' at ({abs_cx}, {abs_cy}) for Match {completed + 1}...")
+                        controller.hardware_tap(abs_cx, abs_cy)
                         time.sleep(2.5)
                     break
 
-        if found_play_again:
-            continue
+            if found_play_again:
+                time.sleep(0.5)
+                continue
 
-        # 2. Live Battle Loop
+            # OK Check (Blue Button on bottom right)
+            b_cnts, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            found_ok = False
+            for c in b_cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                cx = bx + bw // 2
+                # Target OK is in center-right region (x in 0.70..0.85 of window)
+                if bw > 50 and bh > 20 and int(w * 0.65) < cx < int(w * 0.88):
+                    found_ok = True
+                    abs_cx = vp["win_left"] + cx
+                    abs_cy = vp["win_top"] + int(h * 0.88) + by + bh // 2
+
+                    if in_battle:
+                        completed += 1
+                        print(f"\n=======================================================")
+                        print(f"🏁 MATCH {completed}/{matches} FINISHED!")
+                        print(f"   Duration: {battle_duration:.1f}s | Cards Deployed: {len(match_deployments)}")
+                        print(f"=======================================================\n")
+                        in_battle = False
+                        match_deployments = []
+
+                    if completed < matches:
+                        print(f"[Autopilot] Clicking 'OK' at ({abs_cx}, {abs_cy}) to return to Home...")
+                        controller.hardware_tap(abs_cx, abs_cy)
+                        time.sleep(2.5)
+                    break
+
+            if found_ok:
+                time.sleep(0.5)
+                continue
+
+        # 2. Check for Home Screen 'Battle' Button (Center Yellow Button)
+        if not in_battle:
+            mid_bot = hsv[int(h * 0.60):int(h * 0.85), int(w * 0.30):int(w * 0.70)]
+            home_y_mask = cv2.inRange(mid_bot, np.array([15, 140, 140]), np.array([35, 255, 255]))
+            hy_cnts, _ = cv2.findContours(home_y_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            found_home_battle = False
+            for c in hy_cnts:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                if bw > 140 and bh > 45:
+                    found_home_battle = True
+                    cx = vp["win_left"] + int(w * 0.30) + bx + bw // 2
+                    cy = vp["win_top"] + int(h * 0.60) + by + bh // 2
+                    print(f"[Autopilot] On Home Screen. Clicking 'Battle' at ({cx}, {cy}) to launch Match {completed + 1}...")
+                    controller.hardware_tap(cx, cy)
+                    time.sleep(3.0)
+                    break
+
+            if found_home_battle:
+                time.sleep(0.5)
+                continue
+
+        # 3. Live Battle Loop
         if not in_battle:
             in_battle = True
+            match_start_time = time.time()
             current_elixir = 5.0
             tracked_hand = list(DEFAULT_DECK[:4])
+            match_deployments = []
+            print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} IN PROGRESS!")
+            match_deployments = []
+            print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} IN PROGRESS!")
             match_deployments = []
             print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} STARTED!")
 
