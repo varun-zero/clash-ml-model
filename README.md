@@ -2,6 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.6](https://img.shields.io/badge/PyTorch-2.6-EE4C2C.svg)](https://pytorch.org/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/varun-zero/clash-ml-model/blob/main/ClashBot_Colab_Training.ipynb)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests Passing](https://img.shields.io/badge/tests-18%2F18%20passed-brightgreen.svg)]()
 
@@ -163,8 +164,10 @@ python train.py --total-updates 1000 --num-envs 4 --rollout-steps 256
 
 ### 2. Google Colab Cloud Training
 Run accelerated self-play training on a free Tesla T4 GPU in Google Colab:
-* Open [`ClashBot_Colab_Training.ipynb`](ClashBot_Colab_Training.ipynb) in Google Colab.
-* Mount Google Drive to persist checkpoints (`latest.pt`) and telemetry automatically.
+* Click the badge to launch directly in your browser:  
+  [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/varun-zero/clash-ml-model/blob/main/ClashBot_Colab_Training.ipynb)
+* Under the Colab menu, select **Runtime > Change runtime type > T4 GPU**.
+* Select **Runtime > Run all** to mount Google Drive, clone the repository, and train with automatic checkpoints.
 
 ### 3. Run Benchmark Evaluation
 Evaluate the trained agent against rule-based and tactical pro sparring bots:
