@@ -325,36 +325,82 @@ class PerceptionAdapter:
             friendly_mask = cv2.inRange(hsv, np.array([40, 100, 100]), np.array([85, 255, 255]))
 
             slot_idx = 6
-            # Extract detected enemy contours
+            # Tower exclusion locations to prevent tower health badges from being detected as moving units
+            tower_coords = [
+                (3.5 / 18.0, 6.5 / 32.0),
+                (14.5 / 18.0, 6.5 / 32.0),
+                (9.0 / 18.0, 3.0 / 32.0),
+                (3.5 / 18.0, 25.5 / 32.0),
+                (14.5 / 18.0, 25.5 / 32.0),
+                (9.0 / 18.0, 31.0 / 32.0),
+            ]
+
+            # A. Extract detected enemy contours (both Level Badges for 100% HP units and Damaged HP Bars)
             contours, _ = cv2.findContours(enemy_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for cnt in contours:
                 if slot_idx >= MAX_ENTITIES:
                     break
-                area = cv2.contourArea(cnt)
-                if 15 < area < 1500:  # Valid HP bar profile
-                    M = cv2.moments(cnt)
-                    if M["m00"] > 0:
-                        cx = M["m10"] / M["m00"]
-                        cy = M["m01"] / M["m00"]
-                        # Map to normalized arena coordinates (0..1)
-                        norm_x = float(cx / arena_crop.shape[1])
-                        # Invert Y to match canonical bottom-up frame
-                        norm_y = float(1.0 - (cy / arena_crop.shape[0]))
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                is_level_badge = (10 <= bw <= 32 and 8 <= bh <= 26)
+                is_hp_bar = (14 <= bw <= 80 and 3 <= bh <= 16)
 
-                        entities[slot_idx] = [
-                            5.0 / NUM_CARDS,  # Default troop proxy
-                            -1.0,              # Enemy
-                            norm_x, norm_y,
-                            1.0,              # HP ratio
-                            0.0,              # Ground
-                            1.0               # Alive
-                        ]
-                        entity_mask[slot_idx] = False
+                if is_level_badge or is_hp_bar:
+                    cx = bx + bw // 2
+                    cy = by + bh // 2
+                    # Map to normalized arena coordinates (0..1)
+                    norm_x = float(cx / arena_crop.shape[1])
+                    # Invert Y to match canonical bottom-up frame
+                    norm_y = float(1.0 - (cy / arena_crop.shape[0]))
 
-                        gx = int(np.clip(norm_x * ARENA_WIDTH, 0, ARENA_WIDTH - 1))
-                        gy = int(np.clip(norm_y * ARENA_HEIGHT, 0, ARENA_HEIGHT - 1))
-                        arena_grid[2, gy, gx] = 1.0  # opp_ground
-                        slot_idx += 1
+                    # Exclude tower HP badges and boundary noise
+                    if norm_y < 0.05 or norm_y > 0.98 or norm_x < 0.03 or norm_x > 0.97:
+                        continue
+                    if any(np.hypot(norm_x - tx, norm_y - ty) < 0.075 for tx, ty in tower_coords):
+                        continue
+
+                    entities[slot_idx] = [
+                        5.0 / NUM_CARDS,  # Default troop proxy
+                        -1.0,              # Enemy
+                        norm_x, norm_y,
+                        1.0 if is_level_badge else 0.6,  # HP ratio
+                        0.0,              # Ground
+                        1.0               # Alive
+                    ]
+                    entity_mask[slot_idx] = False
+
+                    gx = int(np.clip(norm_x * ARENA_WIDTH, 0, ARENA_WIDTH - 1))
+                    gy = int(np.clip(norm_y * ARENA_HEIGHT, 0, ARENA_HEIGHT - 1))
+                    arena_grid[2, gy, gx] = 1.0  # opp_ground
+                    slot_idx += 1
+
+            # B. Extract friendly unit contours (Blue/Green level badges and HP bars)
+            f_contours, _ = cv2.findContours(friendly_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in f_contours:
+                if slot_idx >= MAX_ENTITIES:
+                    break
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if (10 <= bw <= 32 and 8 <= bh <= 26) or (14 <= bw <= 80 and 3 <= bh <= 16):
+                    cx = bx + bw // 2
+                    cy = by + bh // 2
+                    norm_x = float(cx / arena_crop.shape[1])
+                    norm_y = float(1.0 - (cy / arena_crop.shape[0]))
+
+                    if norm_y < 0.05 or norm_y > 0.98 or norm_x < 0.03 or norm_x > 0.97:
+                        continue
+                    if any(np.hypot(norm_x - tx, norm_y - ty) < 0.075 for tx, ty in tower_coords):
+                        continue
+
+                    entities[slot_idx] = [
+                        5.0 / NUM_CARDS,
+                        1.0,  # Friendly
+                        norm_x, norm_y,
+                        1.0, 0.0, 1.0
+                    ]
+                    entity_mask[slot_idx] = False
+                    gx = int(np.clip(norm_x * ARENA_WIDTH, 0, ARENA_WIDTH - 1))
+                    gy = int(np.clip(norm_y * ARENA_HEIGHT, 0, ARENA_HEIGHT - 1))
+                    arena_grid[0, gy, gx] = 1.0  # own_ground
+                    slot_idx += 1
 
         return entities, entity_mask, arena_grid
 

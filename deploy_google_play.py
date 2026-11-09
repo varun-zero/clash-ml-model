@@ -611,8 +611,9 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
             tile_x = chosen_tile % ARENA_WIDTH
             tile_y = chosen_tile // ARENA_WIDTH
 
-            # 3. Reactive Tower Defense Reflex:
-            # Detect any incoming enemy troops on our side of the river (ey < 16.0)
+            # 3. Decision Source Tagging & Fallback Defense
+            source = "[ALPHASTAR]"
+            # Detect incoming enemy troops on our side of the river (canonical y < 15.0)
             entities_np = obs["entities"][0].cpu().numpy()
             entity_mask_np = obs["entity_mask"][0].cpu().numpy()
             enemy_threat = None
@@ -622,7 +623,7 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
                     if ent[1] < 0:  # Enemy side
                         ey = ent[3] * 32.0  # Canonical y (0..31)
                         ex = ent[2] * 18.0  # Canonical x (0..17)
-                        if ey < 15.0:  # Pushing on our side of the river
+                        if ey < 15.0:  # Threatening our territory
                             enemy_threat = (ex, ey)
                             break
 
@@ -634,14 +635,13 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
                     cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
                     if elixir >= cost:
                         chosen_card = slot
-                        # Intercept in front of our Princess Tower / pull to center
                         tile_x = int(np.clip(ex, 3, 14))
                         tile_y = int(np.clip(ey - 2.0, 3, 12))
-                        print(f"  [DEFENSE TRIGGER] Intercepting enemy at ({ex:.1f}, {ey:.1f}) with {perception.tracked_hand[slot]} at ({tile_x}, {tile_y})")
+                        source = "[FALLBACK DEFENSE]"
                         break
 
-            # 4. Elixir Banking Override: Never leak elixir when near cap (>= 8.0)
-            if chosen_card == 4 and elixir >= 8.0:
+            # 4. Elixir Banking Override: Never leak elixir when near cap (>= 8.5)
+            if chosen_card == 4 and elixir >= 8.5:
                 for slot in range(4):
                     cid = CRSIM_NAME_TO_ID.get(perception.tracked_hand[slot], 1)
                     cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
@@ -649,13 +649,15 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
                         chosen_card = slot
                         tile_y = 4  # Behind King Tower cycle
                         tile_x = 4 if slot % 2 == 0 else 13
+                        source = "[CYCLE OVERRIDE]"
                         break
 
-            # 5. Execute Action via Hardware Win32 SendInput
+            # 5. Execute Action via Hardware Win32 SendInput with Desync Guard
             if chosen_card != 4:
                 card_name = perception.tracked_hand[chosen_card]
                 cid = CRSIM_NAME_TO_ID.get(card_name, 1)
                 is_spell = cid in SPELL_CARD_IDS
+                pre_elixir = elixir
 
                 deployed = controller.deploy_card(
                     card_slot=chosen_card,
@@ -664,10 +666,24 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
                     is_spell=is_spell
                 )
                 if deployed:
-                    perception.update_hand_on_play(chosen_card)
-                    zone = classify_tactical_zone(float(tile_x), float(tile_y))
-                    match_deployments.append((card_name, (tile_x, tile_y)))
-                    print(f"  [Play] {card_name:<12} -> ({tile_x:2d}, {tile_y:2d}) [{zone:<20}] | V(s): {val:+.2f} | Elixir: {elixir:.1f}")
+                    # Visual & Elixir Hand-Desync Guard: verify the card was accepted by the client
+                    time.sleep(0.22)
+                    post_frame = capture.capture_frame()
+                    post_elixir = perception.read_elixir(post_frame) if post_frame is not None else (pre_elixir - 2.0)
+                    cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
+
+                    # Hand rotation ONLY triggers when placement confirmed in-game
+                    if post_elixir <= pre_elixir - max(1.0, cost - 1.5) or post_elixir < pre_elixir:
+                        perception.update_hand_on_play(chosen_card)
+                        zone = classify_tactical_zone(float(tile_x), float(tile_y))
+                        match_deployments.append((card_name, (tile_x, tile_y), source))
+                        print(f"  {source:<18} Slot {chosen_card} ({card_name:<10}) -> Tile ({tile_x:2d}, {tile_y:2d}) [{zone:<16}] | V(s): {val:+.2f} | Elixir: {pre_elixir:.1f}->{post_elixir:.1f}")
+                    else:
+                        print(f"  [DESYNC GUARD] Placement not registered in-game (Elixir remained {post_elixir:.1f}). Hand cycle preserved.")
+            else:
+                # Log banking state periodically
+                if int(now * 2) % 6 == 0:
+                    print(f"  [WAIT / BANK]       Elixir: {elixir:.1f} | Board V(s): {val:+.2f} | Opponent Threats: {1 if enemy_threat else 0}")
                     print(f"  [Play] {card_name:<12} -> ({tile_x:2d}, {tile_y:2d}) [{zone:<20}] | V(s): {val:+.2f} | Elixir: {current_elixir:.1f}")
 
         time.sleep(0.05)
