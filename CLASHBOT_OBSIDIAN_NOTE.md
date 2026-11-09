@@ -7,9 +7,9 @@ tags:
   - deep-learning/transformers
   - gaming/clash-royale
   - self-play
-status: stopped (idle - saved at Step 1,480,192)
-latest_checkpoint: "Step 1,480,192 (Update 973)"
-win_rate: "71.7% vs AI Self-Play"
+status: training (live - 2026-11-09 15:38:26)
+latest_checkpoint: "Step 1,731,072 (Update 1218)"
+win_rate: "68.2% vs AI Self-Play"
 draw_rate: "0.0%"
 ---
 
@@ -145,47 +145,47 @@ python deploy_bluestacks.py --checkpoint checkpoints/latest.pt
 ## 📊 Self-Play Performance Graph
 
 > [!summary] Genuine Head-to-Head Telemetry
-> **Total Matches:** 835 | **Wins:** 599 (71.7%) | **Losses:** 236 | **Draws:** 0
+> **Total Matches:** 1,316 | **Wins:** 898 (68.2%) | **Losses:** 416 | **Draws:** 2
 
 ![[clashbot_training_curve.png]]
 
 ## 🎯 Tactical Placement Zone Telemetry
 
-> [!abstract] Spatial Deployment Breakdown (10 Verified Evaluation Matches | **Win Rate:** 40.0% vs TacticalProBot)
-> **Total Cards Deployed:** 1,214 | **Last Evaluated:** 2026-11-08 22:07:57
+> [!abstract] Live Spatial Deployment Distribution (Batch Telemetry)
+> **Last Evaluated Batch:** Update 1218 (Step 1,731,072) | **Time:** 2026-11-09 15:38:26
 
-| Tactical Zone | Canonical Coordinates | Deployed Cards | Percentage | Strategic Tactical Role |
-| :--- | :--- | :---: | :---: | :--- |
-| **Back-of-King Slow-Roll** | `y <= 4.0` | 3 | **0.2%** | Banking elixir & starting slow beatdown tanks |
-| **Center Split** | `7.5 <= x <= 10.5, 4 < y <= 8` | 257 | **21.2%** | Splitting dual-lane swarms behind King Tower |
-| **Center Kill-Zone / Kite** | `7.0 <= x <= 11.0, 8 < y <= 13` | 0 | **0.0%** | Opposite-lane troop kiting & dual-tower crossfire |
-| **Bridge / Tank-Trick** | `13.0 < y <= 15.5` | 0 | **0.0%** | River pressure & meat-shielding glass cannons |
-| **Deep Enemy Spell** | `y > 16.0` | 247 | **20.3%** | Direct Crown Tower damage & enemy troop snipes |
-| **Flank Lane Defense** | `x < 7.0` or `x > 11.0`, `4 < y <= 13` | 707 | **58.2%** | Direct defensive reactions against lane pushes |
+| Tactical Zone | Canonical Coordinates | Deployment % | Micro Role |
+| :--- | :--- | :---: | :--- |
+| **Back-of-King Slow-Roll** | `y <= 4.0` | **0.0%** | Banking elixir, slow beatdown investment |
+| **Center Split** | `7.5 <= x <= 10.5, 4 < y <= 8` | **26.3%** | Dual-lane pressure & splitting swarms |
+| **Center Kill-Zone / Kite** | `7.0 <= x <= 11.0, 8 < y <= 13` | **0.0%** | Opposite-lane kiting & dual-tower crossfire |
+| **Bridge / Tank-Trick** | `13.0 < y <= 15.5` | **0.0%** | River pressure & meat-shielding glass cannons |
+| **Deep Enemy Spell** | `y > 16.0` | **32.6%** | Direct tower damage & defensive troop snipes |
+| **Flank Lane Defense** | `x < 7.0` or `x > 11.0`, `4 < y <= 13` | **41.1%** | Direct lane response against incoming troops |
 
 ## 📈 Live Training Telemetry
 
 > [!tip] Live Training Status
-> **Active Checkpoint:** Update 0973 (Step 1,480,192) | **Speed:** 42 FPS | **Cadence:** 24.09s/batch | **Last Synced:** 2026-11-08 21:53:29
-> **AI vs AI Record:** **599 Wins** • **236 Losses** • **0 Draws** (71.7% Win Rate)
+> **Active Checkpoint:** Update 1218 (Step 1,731,072) | **Speed:** 33 FPS | **Cadence:** 30.17s/batch | **Last Synced:** 2026-11-09 15:38:26
+> **AI vs AI Record:** **898 Wins** • **416 Losses** • **2 Draws** (68.2% Win Rate)
 
 | Update | Step | Policy Loss | Value Loss | Entropy (Card/Tile) | KL Div | Record & Win % | Speed | Curriculum |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Update 0973 | 1,480,192 | -0.0007 | 0.0382 | 5.366 (0.64/5.31) | 0.00009 | 71.7% (599W-236L-0D) | 42 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0972 | 1,479,168 | 0.0000 | 0.0535 | 5.491 (0.66/5.44) | 0.00008 | 71.7% (599W-236L-0D) | 37 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0971 | 1,478,144 | -0.0013 | 0.1302 | 5.420 (0.73/5.36) | 0.00045 | 71.8% (598W-235L-0D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0970 | 1,477,120 | -0.0015 | 0.0700 | 5.291 (0.65/5.21) | 0.00033 | 71.7% (595W-235L-0D) | 39 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0969 | 1,476,096 | -0.0018 | 0.0549 | 5.428 (0.70/5.35) | 0.00287 | 71.7% (594W-235L-0D) | 57 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0968 | 1,475,072 | -0.0003 | 0.0925 | 5.435 (0.67/5.37) | 0.00094 | 71.7% (594W-234L-0D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0967 | 1,474,048 | -0.0010 | 0.0541 | 5.497 (0.53/5.46) | 0.00064 | 71.7% (592W-234L-0D) | 35 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0966 | 1,473,024 | -0.0004 | 0.1524 | 5.514 (0.69/5.47) | 0.00009 | 71.7% (592W-234L-0D) | 27 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0965 | 1,472,000 | -0.0001 | 0.0556 | 5.441 (0.69/5.39) | 0.00001 | 71.6% (589W-234L-0D) | 36 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0964 | 1,470,976 | -0.0001 | 0.0827 | 5.416 (0.68/5.36) | 0.00003 | 71.5% (588W-234L-0D) | 41 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0963 | 1,469,952 | -0.0004 | 0.0848 | 5.432 (0.71/5.37) | 0.00021 | 71.4% (585W-234L-0D) | 38 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0962 | 1,468,928 | -0.0007 | 0.0935 | 5.466 (0.64/5.40) | 0.00014 | 71.4% (583W-234L-0D) | 30 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0961 | 1,467,904 | -0.0004 | 0.1071 | 5.399 (0.70/5.34) | 0.00009 | 71.3% (582W-234L-0D) | 25 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0960 | 1,466,880 | -0.0002 | 0.0587 | 5.398 (0.63/5.33) | 0.00003 | 71.3% (579W-233L-0D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 0959 | 1,465,856 | -0.0014 | 0.0912 | 5.414 (0.67/5.33) | 0.00044 | 71.3% (578W-233L-0D) | 20 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1218 | 1,731,072 | -0.0006 | 0.0440 | 5.854 (0.66/5.78) | 0.00024 | 68.2% (898W-416L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1217 | 1,730,048 | -0.0011 | 0.1553 | 5.904 (0.62/5.84) | 0.00016 | 68.3% (897W-415L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1216 | 1,729,024 | -0.0003 | 0.1209 | 5.938 (0.73/5.87) | 0.00058 | 68.2% (896W-415L-2D) | 35 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1215 | 1,728,000 | -0.0003 | 0.0824 | 5.988 (0.79/5.91) | 0.00034 | 68.2% (894W-415L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1214 | 1,726,976 | -0.0005 | 0.0656 | 5.922 (0.76/5.84) | 0.00033 | 68.2% (893W-415L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1213 | 1,725,952 | -0.0003 | 0.0664 | 5.881 (0.58/5.82) | 0.00017 | 68.3% (893W-412L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1212 | 1,724,928 | -0.0003 | 0.1315 | 6.005 (0.55/5.96) | 0.00005 | 68.3% (892W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1211 | 1,723,904 | -0.0009 | 0.1417 | 5.916 (0.68/5.85) | 0.00025 | 68.3% (891W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1210 | 1,722,880 | -0.0005 | 0.1060 | 6.018 (0.74/5.94) | 0.00010 | 68.2% (887W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1209 | 1,721,856 | -0.0015 | 0.0603 | 5.938 (0.87/5.85) | 0.00116 | 68.2% (886W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1208 | 1,720,832 | -0.0006 | 0.0619 | 6.023 (0.75/5.96) | 0.00058 | 68.2% (884W-411L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1207 | 1,719,808 | 0.0000 | 0.0878 | 5.979 (0.69/5.92) | 0.00019 | 68.1% (883W-411L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1206 | 1,718,784 | -0.0001 | 0.1558 | 5.956 (0.61/5.90) | 0.00021 | 68.2% (882W-410L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1205 | 1,717,760 | -0.0010 | 0.0775 | 5.801 (0.63/5.72) | 0.00033 | 68.2% (881W-408L-2D) | 37 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 1204 | 1,716,736 | -0.0002 | 0.0778 | 6.007 (0.62/5.95) | 0.00007 | 68.2% (880W-408L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
 
 
 ---

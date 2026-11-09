@@ -567,12 +567,46 @@ class HybridPPOTrainer:
             "total_p2_wins": self.total_p2_wins,
             "total_draws": self.total_draws,
         }
-        torch.save(state, latest_path)
+
+        # Robust atomic save with retries to withstand Windows file locking
+        tmp_path = os.path.join(self.checkpoint_dir, f"latest_{os.getpid()}_{int(time.time()*1000)}.tmp")
+        for attempt in range(5):
+            try:
+                torch.save(state, tmp_path)
+                os.replace(tmp_path, latest_path)
+                break
+            except Exception as e:
+                if attempt == 4:
+                    print(f"[HybridPPOTrainer] Warning: could not save latest.pt after 5 attempts: {e}")
+                else:
+                    time.sleep(0.15 * (attempt + 1))
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
         # Periodic numbered checkpoint
         if self.update_count % 10 == 0:
             num_path = os.path.join(self.checkpoint_dir, f"ckpt_step_{self.global_step:08d}.pt")
-            torch.save(state, num_path)
+            num_tmp = os.path.join(self.checkpoint_dir, f"ckpt_{os.getpid()}_{int(time.time()*1000)}.tmp")
+            for attempt in range(3):
+                try:
+                    torch.save(state, num_tmp)
+                    os.replace(num_tmp, num_path)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"[HybridPPOTrainer] Warning: could not save {num_path}: {e}")
+                    else:
+                        time.sleep(0.15 * (attempt + 1))
+                finally:
+                    if os.path.exists(num_tmp):
+                        try:
+                            os.remove(num_tmp)
+                        except Exception:
+                            pass
 
     def load_latest_checkpoint(self):
         latest_path = os.path.join(self.checkpoint_dir, "latest.pt")

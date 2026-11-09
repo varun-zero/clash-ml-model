@@ -9,6 +9,7 @@ Manages opponent selection for Player 2 during parallel environment rollouts:
 import os
 import glob
 import copy
+import time
 import torch
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
@@ -65,10 +66,27 @@ class SelfPlayLeagueManager:
         snap_path = os.path.join(self.pool_dir, f"snapshot_{step:08d}.pt")
         # Detach and clone state dict to CPU
         cpu_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        torch.save({
+        state = {
             "step": step,
             "model_state_dict": cpu_state
-        }, snap_path)
+        }
+        snap_tmp = os.path.join(self.pool_dir, f"snap_{os.getpid()}_{int(time.time()*1000)}.tmp")
+        for attempt in range(3):
+            try:
+                torch.save(state, snap_tmp)
+                os.replace(snap_tmp, snap_path)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[SelfPlayLeague] Warning: could not save snapshot {snap_path}: {e}")
+                else:
+                    time.sleep(0.15 * (attempt + 1))
+            finally:
+                if os.path.exists(snap_tmp):
+                    try:
+                        os.remove(snap_tmp)
+                    except Exception:
+                        pass
         record = SnapshotRecord(step, snap_path, cpu_state)
         self.snapshots.append(record)
         print(f"[SelfPlayLeague] New historical snapshot saved: {snap_path} (Pool size: {len(self.snapshots)})")
