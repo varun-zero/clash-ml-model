@@ -40,6 +40,7 @@ from cr_alphastar_agent.config import (
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID
 from evaluate_visual import classify_tactical_zone
+from deploy_bluestacks import PerceptionAdapter
 
 
 # --- 1. Windows DPI Awareness & Process Setup ---
@@ -464,6 +465,7 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
 
     controller = GooglePlayController(window_title="Clash Royale", use_drag=use_drag)
     capture = GooglePlayCapture(hwnd=controller.hwnd)
+    perception = PerceptionAdapter(device=device)
 
     completed = 0
     in_battle = False
@@ -585,52 +587,21 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
         if not in_battle:
             in_battle = True
             match_start_time = time.time()
-            current_elixir = 5.0
-            tracked_hand = list(DEFAULT_DECK[:4])
             match_deployments = []
-            print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} IN PROGRESS!")
-            match_deployments = []
-            print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} IN PROGRESS!")
-            match_deployments = []
+            perception.calibrate_game_column(frame)
+            perception.match_time_elapsed = 0.0
             print(f"\n⚔️  LIVE BATTLE {completed + 1}/{matches} STARTED!")
 
         now = time.time()
         if now - last_action_time >= action_interval:
             last_action_time = now
-            current_elixir = min(10.0, current_elixir + 0.14)
+            perception.match_time_elapsed = now - match_start_time
 
-            # Build simple observation tensors for policy
-            scalars = torch.tensor([[current_elixir / 10.0, 0.5, 0.8, 0.0]], dtype=torch.float32, device=device)
-            hand_ids = [CRSIM_NAME_TO_ID.get(c, 1) for c in tracked_hand] + [CRSIM_NAME_TO_ID.get(tracked_next, 1)]
-            hand_tensor = torch.tensor([hand_ids], dtype=torch.int64, device=device)
-            entities = torch.zeros((1, 32, 7), dtype=torch.float32, device=device)
-            entity_mask = torch.ones((1, 32), dtype=torch.bool, device=device)
-            # Unmask crown towers (first 6 slots)
-            entity_mask[0, :6] = False
-            arena_grid = torch.zeros((1, 6, ARENA_HEIGHT, ARENA_WIDTH), dtype=torch.float32, device=device)
+            # 1. Full Computer Vision: Detects active units, towers, and reads real Elixir bar
+            obs = perception.frame_to_obs(frame)
+            elixir = perception.current_elixir
 
-            card_mask = torch.zeros((1, 5), dtype=torch.bool, device=device)
-            for i, cid in enumerate(hand_ids[:4]):
-                cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-                if current_elixir >= cost:
-                    card_mask[0, i] = True
-            card_mask[0, 4] = True  # Wait is legal
-
-            tile_mask = torch.zeros((1, TOTAL_TILES), dtype=torch.bool, device=device)
-            for y in range(15):
-                for x in range(ARENA_WIDTH):
-                    tile_mask[0, y * ARENA_WIDTH + x] = True
-
-            obs = {
-                "scalars": scalars,
-                "hand_cards": hand_tensor,
-                "entities": entities,
-                "entity_mask": entity_mask,
-                "arena_grid": arena_grid,
-                "card_mask": card_mask,
-                "tile_mask": tile_mask,
-            }
-
+            # 2. Neural Network Forward Pass
             with torch.no_grad():
                 actions, _, _, values = model.get_action_and_value(obs)
                 chosen_card = actions[0, 0].item()
@@ -640,19 +611,49 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
             tile_x = chosen_tile % ARENA_WIDTH
             tile_y = chosen_tile // ARENA_WIDTH
 
-            # Elixir Banking Override: Never sit at max elixir doing nothing
-            if chosen_card == 4 and current_elixir >= 6.5:
+            # 3. Reactive Tower Defense Reflex:
+            # Detect any incoming enemy troops on our side of the river (ey < 16.0)
+            entities_np = obs["entities"][0].cpu().numpy()
+            entity_mask_np = obs["entity_mask"][0].cpu().numpy()
+            enemy_threat = None
+            for idx in range(6, len(entities_np)):
+                if not entity_mask_np[idx]:
+                    ent = entities_np[idx]
+                    if ent[1] < 0:  # Enemy side
+                        ey = ent[3] * 32.0  # Canonical y (0..31)
+                        ex = ent[2] * 18.0  # Canonical x (0..17)
+                        if ey < 15.0:  # Pushing on our side of the river
+                            enemy_threat = (ex, ey)
+                            break
+
+            # If an enemy is threatening our territory and model is waiting/idling:
+            if enemy_threat is not None and chosen_card == 4 and elixir >= 2.5:
+                ex, ey = enemy_threat
                 for slot in range(4):
-                    cid = hand_ids[slot]
+                    cid = CRSIM_NAME_TO_ID.get(perception.tracked_hand[slot], 1)
                     cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-                    if current_elixir >= cost:
+                    if elixir >= cost:
                         chosen_card = slot
-                        tile_y = 12
-                        tile_x = 4 if tile_x < 9 else 13
+                        # Intercept in front of our Princess Tower / pull to center
+                        tile_x = int(np.clip(ex, 3, 14))
+                        tile_y = int(np.clip(ey - 2.0, 3, 12))
+                        print(f"  [DEFENSE TRIGGER] Intercepting enemy at ({ex:.1f}, {ey:.1f}) with {perception.tracked_hand[slot]} at ({tile_x}, {tile_y})")
                         break
 
+            # 4. Elixir Banking Override: Never leak elixir when near cap (>= 8.0)
+            if chosen_card == 4 and elixir >= 8.0:
+                for slot in range(4):
+                    cid = CRSIM_NAME_TO_ID.get(perception.tracked_hand[slot], 1)
+                    cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
+                    if elixir >= cost:
+                        chosen_card = slot
+                        tile_y = 4  # Behind King Tower cycle
+                        tile_x = 4 if slot % 2 == 0 else 13
+                        break
+
+            # 5. Execute Action via Hardware Win32 SendInput
             if chosen_card != 4:
-                card_name = tracked_hand[chosen_card]
+                card_name = perception.tracked_hand[chosen_card]
                 cid = CRSIM_NAME_TO_ID.get(card_name, 1)
                 is_spell = cid in SPELL_CARD_IDS
 
@@ -663,15 +664,10 @@ def run_live_matches(checkpoint: str, matches: int, use_drag: bool, device_str: 
                     is_spell=is_spell
                 )
                 if deployed:
-                    cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-                    current_elixir = max(0.0, current_elixir - cost)
-                    # Rotate hand
-                    tracked_hand[chosen_card] = tracked_next
-                    cycle = [c for c in DEFAULT_DECK if c not in tracked_hand]
-                    tracked_next = cycle[0] if cycle else DEFAULT_DECK[0]
-
+                    perception.update_hand_on_play(chosen_card)
                     zone = classify_tactical_zone(float(tile_x), float(tile_y))
                     match_deployments.append((card_name, (tile_x, tile_y)))
+                    print(f"  [Play] {card_name:<12} -> ({tile_x:2d}, {tile_y:2d}) [{zone:<20}] | V(s): {val:+.2f} | Elixir: {elixir:.1f}")
                     print(f"  [Play] {card_name:<12} -> ({tile_x:2d}, {tile_y:2d}) [{zone:<20}] | V(s): {val:+.2f} | Elixir: {current_elixir:.1f}")
 
         time.sleep(0.05)
