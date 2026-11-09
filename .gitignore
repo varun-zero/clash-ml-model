@@ -21,6 +21,7 @@ dist/
 # Intermediate training checkpoints (keep latest.pt and history)
 checkpoints/ckpt_step_*.pt
 checkpoints/pool/archive_pre_tactical/
+checkpoints/*.png
 
 # Local match replay recordings and temporary files
 replays/*.json
