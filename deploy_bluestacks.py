@@ -64,18 +64,22 @@ from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID, ID_TO_CRSIM_NAME
 
 
+DEFAULT_WINDOW_CANDIDATES = ["Clash Royale", "Google Play Games", "BlueStacks"]
+
+
 # ==============================================================================
 # 1. Low-Latency Screen Capture (MSS + Win32 Window Handle)
 # ==============================================================================
 
 class WindowCapture:
-    """Discovers BlueStacks window and captures low-latency frames via MSS."""
+    """Discovers Clash Royale / Google Play Games / BlueStacks window and captures low-latency frames via MSS."""
 
-    def __init__(self, title_substr: str = "BlueStacks", bbox: Optional[Tuple[int, int, int, int]] = None):
+    def __init__(self, title_substr: Optional[str] = None, bbox: Optional[Tuple[int, int, int, int]] = None):
         self.title_substr = title_substr
         self.hwnd = None
         self.bbox = None  # {"left": x, "top": y, "width": w, "height": h}
         self.sct = mss.mss() if HAS_MSS else None
+        self.detected_mode = "mouse"  # "mouse" (Google Play Games PC) or "adb" (BlueStacks)
 
         if bbox is not None:
             self.bbox = {"left": bbox[0], "top": bbox[1], "width": bbox[2], "height": bbox[3]}
@@ -90,43 +94,51 @@ class WindowCapture:
                 self.bbox = self.sct.monitors[1]
             return False
 
-        candidates = []
+        search_titles = [self.title_substr] if self.title_substr else DEFAULT_WINDOW_CANDIDATES
 
-        def enum_cb(hwnd, _):
-            if win32gui.IsWindowVisible(hwnd):
-                text = win32gui.GetWindowText(hwnd)
-                if self.title_substr.lower() in text.lower():
-                    rect = win32gui.GetWindowRect(hwnd)
-                    w = rect[2] - rect[0]
-                    h = rect[3] - rect[1]
-                    if w > 200 and h > 300:
-                        candidates.append((hwnd, text, rect, w * h))
+        for candidate_title in search_titles:
+            candidates = []
 
-        win32gui.EnumWindows(enum_cb, None)
+            def enum_cb(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    text = win32gui.GetWindowText(hwnd)
+                    if candidate_title.lower() in text.lower():
+                        rect = win32gui.GetWindowRect(hwnd)
+                        w = rect[2] - rect[0]
+                        h = rect[3] - rect[1]
+                        if w > 200 and h > 300:
+                            candidates.append((hwnd, text, rect, w * h))
 
-        if not candidates:
-            print(f"[WindowCapture] No window matching '{self.title_substr}' found.")
-            # Fallback to primary monitor
-            if self.sct:
-                self.bbox = self.sct.monitors[1]
-            return False
+            win32gui.EnumWindows(enum_cb, None)
 
-        # Pick largest matching window
-        candidates.sort(key=lambda x: x[3], reverse=True)
-        self.hwnd, title, rect, _ = candidates[0]
-        print(f"[WindowCapture] Hooked window: '{title}' (HWND: {self.hwnd})")
+            if candidates:
+                # Pick largest matching window
+                candidates.sort(key=lambda x: x[3], reverse=True)
+                self.hwnd, title, rect, _ = candidates[0]
+                if "bluestacks" in title.lower():
+                    self.detected_mode = "adb"
+                else:
+                    self.detected_mode = "mouse"
 
-        # Get client area (strips window chrome / title bar)
-        client_rect = win32gui.GetClientRect(self.hwnd)
-        p1 = win32gui.ClientToScreen(self.hwnd, (client_rect[0], client_rect[1]))
-        p2 = win32gui.ClientToScreen(self.hwnd, (client_rect[2], client_rect[3]))
-        left, top = p1
-        width = max(100, p2[0] - p1[0])
-        height = max(100, p2[1] - p1[1])
+                print(f"[WindowCapture] Hooked window: '{title}' (HWND: {self.hwnd}, Mode: {self.detected_mode})")
 
-        self.bbox = {"left": left, "top": top, "width": width, "height": height}
-        print(f"[WindowCapture] Active client area: {self.bbox}")
-        return True
+                # Get client area (strips window chrome / title bar)
+                client_rect = win32gui.GetClientRect(self.hwnd)
+                p1 = win32gui.ClientToScreen(self.hwnd, (client_rect[0], client_rect[1]))
+                p2 = win32gui.ClientToScreen(self.hwnd, (client_rect[2], client_rect[3]))
+                left, top = p1
+                width = max(100, p2[0] - p1[0])
+                height = max(100, p2[1] - p1[1])
+
+                self.bbox = {"left": left, "top": top, "width": width, "height": height}
+                print(f"[WindowCapture] Active client area: {self.bbox}")
+                return True
+
+        print(f"[WindowCapture] No window matching {search_titles} found.")
+        # Fallback to primary monitor
+        if self.sct:
+            self.bbox = self.sct.monitors[1]
+        return False
 
     def capture_frame(self) -> Optional[np.ndarray]:
         """Captures frame as BGR uint8 numpy array."""
@@ -327,8 +339,40 @@ class PerceptionAdapter:
 
         return entities, entity_mask, arena_grid
 
+    def calibrate_game_column(self, frame: np.ndarray):
+        """
+        Dynamically adjusts bounding boxes if game runs in widescreen with black pillar letterboxes.
+        """
+        h, w = frame.shape[:2]
+        aspect = w / max(1, h)
+        if aspect > 0.65:
+            # Widescreen with letterbox pillars: center 9:16 game column
+            target_w = int(h * (9.0 / 16.0))
+            pad = max(0, (w - target_w) // 2)
+            col_left = pad / w
+            col_right = (w - pad) / w
+            col_w = col_right - col_left
+            self.arena_box = {
+                "top": 0.05,
+                "bottom": 0.78,
+                "left": col_left + 0.03 * col_w,
+                "right": col_left + 0.97 * col_w,
+            }
+            self.hand_xs = [col_left + x * col_w for x in [0.22, 0.41, 0.60, 0.79]]
+            self.elixir_box = {
+                "top": 0.965,
+                "bottom": 0.985,
+                "left": col_left + 0.20 * col_w,
+                "right": col_left + 0.80 * col_w,
+            }
+        else:
+            self.arena_box = {"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97}
+            self.hand_xs = [0.22, 0.41, 0.60, 0.79]
+            self.elixir_box = {"top": 0.965, "bottom": 0.985, "left": 0.20, "right": 0.80}
+
     def frame_to_obs(self, frame: np.ndarray) -> Dict[str, torch.Tensor]:
         """Constructs full 7-tensor observation batch ready for AlphaStarCRNet."""
+        self.calibrate_game_column(frame)
         elixir = self.read_elixir(frame)
         hand_cards, next_card = self.read_hand(frame)
         entities, entity_mask, arena_grid = self.detect_entities(frame)
@@ -384,19 +428,94 @@ class PerceptionAdapter:
 
 
 # ==============================================================================
-# 3. Persistent ADB Command Pipe (ADBController)
+# 3. Input Controllers (Windows Native Mouse & Persistent ADB Pipe)
 # ==============================================================================
+
+class WindowsMouseController:
+    """
+    Direct Windows mouse click controller for Google Play Games for PC.
+    Executes card selection and arena tile deployment using native OS events with <1ms latency.
+    """
+
+    def __init__(self, hwnd: Optional[int] = None, bbox: Optional[dict] = None, dry_run: bool = False):
+        self.hwnd = hwnd
+        self.bbox = bbox or {"left": 0, "top": 0, "width": 720, "height": 1280}
+        self.dry_run = dry_run
+        self.screen_w = max(100, self.bbox.get("width", 720))
+        self.screen_h = max(100, self.bbox.get("height", 1280))
+        self.mode_name = "LIVE MOUSE (PC)"
+
+    def set_screen_dimensions(self, width: int, height: int):
+        self.screen_w = max(100, width)
+        self.screen_h = max(100, height)
+
+    def update_bbox(self, bbox: dict):
+        self.bbox = bbox
+        self.screen_w = max(100, bbox.get("width", self.screen_w))
+        self.screen_h = max(100, bbox.get("height", self.screen_h))
+
+    def grid_to_screen_pixel(self, tile_x: float, tile_y: float, arena_box: dict) -> Tuple[int, int]:
+        norm_x = (tile_x + 0.5) / ARENA_WIDTH
+        norm_y = (tile_y + 0.5) / ARENA_HEIGHT
+        screen_norm_y = arena_box["bottom"] - norm_y * (arena_box["bottom"] - arena_box["top"])
+        screen_norm_x = arena_box["left"] + norm_x * (arena_box["right"] - arena_box["left"])
+        px = int(np.clip(screen_norm_x * self.screen_w, 0, self.screen_w - 1))
+        py = int(np.clip(screen_norm_y * self.screen_h, 0, self.screen_h - 1))
+        return px, py
+
+    def card_slot_to_screen_pixel(self, slot_idx: int, hand_xs: List[float], hand_box_y: float) -> Tuple[int, int]:
+        slot_idx = max(0, min(3, slot_idx))
+        norm_x = hand_xs[slot_idx]
+        norm_y = hand_box_y
+        px = int(norm_x * self.screen_w)
+        py = int(norm_y * self.screen_h)
+        return px, py
+
+    def deploy_card(self, card_slot: int, tile_x: int, tile_y: int,
+                    arena_box: dict, hand_xs: List[float], hand_box_y: float) -> bool:
+        if card_slot == 4:
+            return True
+
+        card_rel_x, card_rel_y = self.card_slot_to_screen_pixel(card_slot, hand_xs, hand_box_y)
+        arena_rel_x, arena_rel_y = self.grid_to_screen_pixel(tile_x, tile_y, arena_box)
+
+        abs_card_x = self.bbox.get("left", 0) + card_rel_x
+        abs_card_y = self.bbox.get("top", 0) + card_rel_y
+        abs_arena_x = self.bbox.get("left", 0) + arena_rel_x
+        abs_arena_y = self.bbox.get("top", 0) + arena_rel_y
+
+        action_desc = f"Slot {card_slot} -> Tile ({tile_x}, {tile_y}) | Mouse: ({abs_card_x}, {abs_card_y}) -> ({abs_arena_x}, {abs_arena_y})"
+
+        if self.dry_run:
+            print(f"[MOUSE DRY-RUN] {action_desc}")
+            return True
+
+        try:
+            import pyautogui
+            pyautogui.click(abs_card_x, abs_card_y)
+            time.sleep(0.04)
+            pyautogui.click(abs_arena_x, abs_arena_y)
+            print(f"[MOUSE EXEC] {action_desc}")
+            return True
+        except Exception as e:
+            print(f"[MOUSE Error] Failed to execute click: {e}")
+            return False
+
+    def close(self):
+        pass
+
 
 class ADBController:
     """
     Maintains a persistent interactive ADB shell pipe (`adb shell`)
-    for zero-latency card deployment taps.
+    for zero-latency card deployment taps on BlueStacks.
     """
 
     def __init__(self, device_serial: Optional[str] = None, dry_run: bool = False):
         self.device_serial = device_serial
         self.dry_run = dry_run
         self.process: Optional[subprocess.Popen] = None
+        self.mode_name = "LIVE ADB"
 
         # Pixel mapping calibration (default normalized coordinates)
         # Emulator resolution will scale these to actual screen taps
@@ -405,6 +524,9 @@ class ADBController:
 
         if not self.dry_run:
             self._connect()
+
+    def update_bbox(self, bbox: dict):
+        pass
 
     def _connect(self):
         cmd = ["adb"]
@@ -502,7 +624,7 @@ class ADBController:
 # 4. Live Deployment Runner & Visualization HUD
 # ==============================================================================
 
-def draw_hud(frame: np.ndarray, perception: PerceptionAdapter, adb: ADBController,
+def draw_hud(frame: np.ndarray, perception: PerceptionAdapter, controller: Any,
              action: Optional[Tuple[int, int]], value_est: float, fps: float) -> np.ndarray:
     """Draws real-time tactical overlay on the captured emulator frame."""
     viz = frame.copy()
@@ -553,7 +675,7 @@ def draw_hud(frame: np.ndarray, perception: PerceptionAdapter, adb: ADBControlle
         else:
             tx = tile % ARENA_WIDTH
             ty = tile // ARENA_WIDTH
-            tpx, tpy = adb.grid_to_screen_pixel(tx, ty, perception.arena_box)
+            tpx, tpy = controller.grid_to_screen_pixel(tx, ty, perception.arena_box)
             # Reticle
             cv2.circle(viz, (tpx, tpy), 16, (0, 0, 255), 2)
             cv2.line(viz, (tpx - 22, tpy), (tpx + 22, tpy), (0, 0, 255), 2)
@@ -562,24 +684,27 @@ def draw_hud(frame: np.ndarray, perception: PerceptionAdapter, adb: ADBControlle
 
     # 6. Status Banner
     cv2.rectangle(viz, (0, 0), (w, 35), (20, 20, 20), -1)
-    status_text = f"AlphaStar Live Agent | V(s): {value_est:+.2f} | FPS: {fps:.1f} | {'DRY-RUN' if adb.dry_run else 'LIVE ADB'}"
+    mode_label = getattr(controller, "mode_name", "LIVE")
+    status_text = f"AlphaStar Live Agent | V(s): {value_est:+.2f} | FPS: {fps:.1f} | {'DRY-RUN' if controller.dry_run else mode_label}"
     cv2.putText(viz, status_text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 120), 1)
 
     return viz
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AlphaStar Clash Royale - BlueStacks Live Deployment Bridge")
+    parser = argparse.ArgumentParser(description="AlphaStar Clash Royale - PC & Emulator Live Deployment Bridge")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/latest.pt",
                         help="Path to trained model checkpoint")
-    parser.add_argument("--window-title", type=str, default="BlueStacks",
-                        help="Window title search substring (default: BlueStacks)")
+    parser.add_argument("--window-title", type=str, default=None,
+                        help="Window title search substring (default: auto-detect 'Clash Royale', 'Google Play Games', or 'BlueStacks')")
+    parser.add_argument("--input-mode", type=str, default="auto", choices=["auto", "mouse", "adb"],
+                        help="Input dispatch method: mouse (for Google Play Games PC), adb (for BlueStacks), or auto")
     parser.add_argument("--bbox", type=str, default=None,
                         help="Manual capture bounding box as left,top,width,height")
     parser.add_argument("--adb-device", type=str, default=None,
                         help="Specific ADB device serial (optional)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Dry-run mode: Visualize decisions without sending ADB taps")
+                        help="Dry-run mode: Visualize decisions without sending mouse clicks or ADB taps")
     parser.add_argument("--visualize", action="store_true",
                         help="Display real-time OpenCV HUD overlay window")
     parser.add_argument("--cadence-hz", type=float, default=2.5,
@@ -596,11 +721,11 @@ def main():
         device = torch.device(args.device)
 
     print("=" * 75)
-    print("      AlphaStar Clash Royale - Live BlueStacks Deployment Bridge")
+    print("      AlphaStar Clash Royale - Live PC & Emulator Bridge")
     print("=" * 75)
     print(f"[Device]       {device}")
     print(f"[Checkpoint]   {os.path.abspath(args.checkpoint)}")
-    print(f"[Mode]         {'DRY-RUN (Simulated Actions)' if args.dry_run else 'LIVE (ADB Tap Execution)'}")
+    print(f"[Mode]         {'DRY-RUN (Simulated Actions)' if args.dry_run else 'LIVE Execution'}")
     print(f"[Cadence]      {args.cadence_hz:.1f} Hz (Period: {1.0 / args.cadence_hz:.3f}s)")
 
     # Load Model
@@ -629,7 +754,25 @@ def main():
     # Initialize Screen Capture & Adapters
     capture = WindowCapture(title_substr=args.window_title, bbox=bbox)
     perception = PerceptionAdapter(device=device)
-    adb = ADBController(device_serial=args.adb_device, dry_run=args.dry_run)
+
+    # Determine Input Controller
+    input_mode = args.input_mode
+    if input_mode == "auto":
+        input_mode = getattr(capture, "detected_mode", "mouse")
+
+    if input_mode == "mouse":
+        controller = WindowsMouseController(
+            hwnd=capture.hwnd,
+            bbox=capture.bbox,
+            dry_run=args.dry_run
+        )
+        print(f"[Input Mode]   Windows Native Mouse (Google Play Games PC) - Direct OS clicks")
+    else:
+        controller = ADBController(
+            device_serial=args.adb_device,
+            dry_run=args.dry_run
+        )
+        print(f"[Input Mode]   ADB Shell Pipe (BlueStacks Emulator)")
 
     step_interval = 1.0 / max(0.5, args.cadence_hz)
     t_prev = time.time()
@@ -648,11 +791,13 @@ def main():
             # If no frame captured (e.g., emulator minimized or testing), generate placeholder frame
             if frame is None:
                 frame = np.zeros((1280, 720, 3), dtype=np.uint8)
-                cv2.putText(frame, "Waiting for BlueStacks Window...", (120, 640),
+                cv2.putText(frame, "Waiting for Clash Royale Window...", (120, 640),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
 
             h, w, _ = frame.shape
-            adb.set_screen_dimensions(w, h)
+            controller.set_screen_dimensions(w, h)
+            if capture.bbox and hasattr(controller, "update_bbox"):
+                controller.update_bbox(capture.bbox)
 
             # 2. Perception: Transform frame into canonical observation batch
             obs = perception.frame_to_obs(frame)
@@ -667,8 +812,8 @@ def main():
             tile_x = chosen_tile % ARENA_WIDTH
             tile_y = chosen_tile // ARENA_WIDTH
 
-            # 4. Action Execution via ADB Command Pipe
-            adb.deploy_card(
+            # 4. Action Execution via Controller
+            controller.deploy_card(
                 card_slot=chosen_card,
                 tile_x=tile_x,
                 tile_y=tile_y,
@@ -685,7 +830,7 @@ def main():
                 hud_frame = draw_hud(
                     frame=frame,
                     perception=perception,
-                    adb=adb,
+                    controller=controller,
                     action=(chosen_card, chosen_tile),
                     value_est=value_est,
                     fps=fps
@@ -707,9 +852,9 @@ def main():
                 t_prev = time.time()
 
     except KeyboardInterrupt:
-        print("\nStopping BlueStacks deployment bridge...")
+        print("\nStopping live deployment bridge...")
     finally:
-        adb.close()
+        controller.close()
         cv2.destroyAllWindows()
         print("[Bridge Closed] Clean shutdown complete.")
 

@@ -9,7 +9,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from deploy_bluestacks import ADBController, PerceptionAdapter  # noqa: E402
+from deploy_bluestacks import ADBController, WindowsMouseController, PerceptionAdapter  # noqa: E402
 from cr_alphastar_agent.config import CARDS_CATALOG  # noqa: E402
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID  # noqa: E402
 
@@ -77,3 +77,41 @@ def test_adb_controller_dry_run_never_needs_a_device():
         )
     finally:
         adb.close()
+
+
+def test_mouse_controller_dry_run_never_needs_a_window():
+    mouse = WindowsMouseController(bbox={"left": 100, "top": 50, "width": 720, "height": 1280}, dry_run=True)
+    try:
+        mouse.set_screen_dimensions(720, 1280)
+        assert mouse.deploy_card(
+            card_slot=1,
+            tile_x=4,
+            tile_y=12,
+            arena_box={"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97},
+            hand_xs=[0.22, 0.41, 0.60, 0.79],
+            hand_box_y=0.88,
+        )
+        # Test wait action
+        assert mouse.deploy_card(
+            card_slot=4,
+            tile_x=0,
+            tile_y=0,
+            arena_box={"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97},
+            hand_xs=[0.22, 0.41, 0.60, 0.79],
+            hand_box_y=0.88,
+        )
+    finally:
+        mouse.close()
+
+
+def test_perception_calibrates_widescreen_letterboxing():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # Widescreen frame 1920x1080 (aspect ratio 1.77 > 0.65)
+    widescreen_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    adapter.calibrate_game_column(widescreen_frame)
+
+    # In 1080p, 9:16 column is target_w = 1080 * 9/16 = 607 pixels
+    # Padding on each side is (1920 - 607) / 2 = 656 pixels
+    # Left ratio ~ 656/1920 = 0.34
+    assert adapter.arena_box["left"] > 0.20
+    assert adapter.arena_box["right"] < 0.80

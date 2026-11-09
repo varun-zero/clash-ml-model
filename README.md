@@ -185,6 +185,19 @@ Run the automated test suite covering rules, card cycle, model heads, and UI ada
 pytest -v
 ```
 
+### 5. Live PC & Emulator Deployment (Google Play Games & BlueStacks)
+Deploy the trained AlphaStar agent directly into live matches:
+```powershell
+# Auto-detects Google Play Games PC (native mouse clicks) or BlueStacks (ADB)
+python deploy_bluestacks.py --checkpoint checkpoints/latest.pt --visualize
+
+# Safe dry-run mode with tactical OpenCV HUD overlay (no clicks sent)
+python deploy_bluestacks.py --checkpoint checkpoints/latest.pt --dry-run --visualize
+
+# Or double-click the one-click Windows launcher:
+.\run_agent_pc.bat
+```
+
 ---
 
 ## 📁 Repository Layout
