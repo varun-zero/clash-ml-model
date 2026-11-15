@@ -213,5 +213,56 @@
     "cards_deployed": 66,
     "notes": "Result: DRAW (0-0). Cards deployed: 66 (Minionsx19, Knightx14, Archersx14). AI inputs clean.",
     "timestamp": "2026-11-14 19:11:40"
+  },
+  {
+    "match": 19,
+    "opponent": "Ladder Opponent 19",
+    "result": "DRAW",
+    "score": "0 - 0",
+    "delta": 0,
+    "trophies": 139,
+    "duration_s": 87.6,
+    "cards_deployed": 64,
+    "notes": "Result: DRAW (0-0). Cards deployed: 64 (Archersx61, Knightx3). AI inputs clean.",
+    "timestamp": "2026-11-15 11:50:07"
+  },
+  {
+    "match": 20,
+    "opponent": "Ladder Opponent 20",
+    "result": "WIN",
+    "score": "2 - 0",
+    "delta": 30,
+    "trophies": 169,
+    "duration_s": 222.5,
+    "cards_deployed": 117,
+    "video": "match_recordings\\match_020_20261115_121422.mp4",
+    "notes": "Result: WIN (2-0). Cards deployed: 117 (Fireballx54, Musketeerx18, Minionsx14). AI inputs clean.",
+    "timestamp": "2026-11-15 12:18:09"
+  },
+  {
+    "match": 21,
+    "opponent": "Ladder Opponent 21",
+    "result": "WIN",
+    "score": "1 - 0",
+    "delta": 30,
+    "trophies": 199,
+    "duration_s": 177.3,
+    "cards_deployed": 31,
+    "video": "match_recordings\\match_021_20261115_132231.mp4",
+    "notes": "Result: WIN (1-0). Cards deployed: 31 (Arrowsx9, Archersx7, Giantx4). AI inputs clean.",
+    "timestamp": "2026-11-15 13:25:31"
+  },
+  {
+    "match": 22,
+    "opponent": "Ladder Opponent 22",
+    "result": "DRAW",
+    "score": "1 - 1",
+    "delta": 0,
+    "trophies": 199,
+    "duration_s": 45.4,
+    "cards_deployed": 3,
+    "video": "match_recordings\\match_022_20261115_132537.mp4",
+    "notes": "Result: DRAW (1-1). Cards deployed: 3 (Knightx2, Musketeerx1). AI inputs clean.",
+    "timestamp": "2026-11-15 13:26:24"
   }
 ]
