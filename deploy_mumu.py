@@ -570,11 +570,11 @@ class PerceptionAdapter:
         # Arena layout normalization ratios (based on Clash Royale vertical phone layout)
         # Arena bounds (top, bottom, left, right in normalized 0.0 - 1.0 coords)
         self.arena_box = {"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97}
-        # Hand slots (normalized center locations)
-        self.hand_box_y = 0.88
-        self.hand_xs = [0.22, 0.41, 0.60, 0.79]
+        # Hand slots (calibrated centers for Clash Royale hand tray)
+        self.hand_box_y = 0.888
+        self.hand_xs = [0.305, 0.500, 0.695, 0.890]
         # Elixir bar region
-        self.elixir_box = {"top": 0.965, "bottom": 0.985, "left": 0.20, "right": 0.80}
+        self.elixir_box = {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
 
         # Tracked internal game state
         self.tracked_hand = list(self.active_deck[:4])
@@ -583,6 +583,7 @@ class PerceptionAdapter:
         self.match_time_elapsed = 0.0
         self.last_card_play_time = 0.0
         self.classifier = VisualCardClassifier(active_deck=self.active_deck)
+        self.last_hand_scores = [1.0, 1.0, 1.0, 1.0]
 
     def read_elixir(self, frame: np.ndarray) -> float:
         """
@@ -608,9 +609,9 @@ class PerceptionAdapter:
         filled_cols = np.where(col_sums > (crop.shape[0] * 0.3))[0]
 
         if len(filled_cols) == 0:
-            # Fallback heuristic: gentle tick accumulation
-            self.current_elixir = min(10.0, self.current_elixir + 0.14)
-            return round(self.current_elixir, 1)
+            # Empty purple bar corresponds to drained (0.0) elixir
+            self.current_elixir = 0.0
+            return 0.0
 
         fill_ratio = (filled_cols[-1] + 1) / max(1, crop.shape[1])
         est_elixir = float(np.clip(fill_ratio * 10.0, 0.0, 10.0))
@@ -622,16 +623,17 @@ class PerceptionAdapter:
         self.current_elixir = est_elixir
         return round(est_elixir, 1)
 
-    def read_hand(self, frame: np.ndarray) -> Tuple[List[int], int]:
+    def read_hand(self, frame: np.ndarray, force_refresh: bool = False) -> Tuple[List[int], int]:
         """
         Return policy card IDs for the four-card hand and next card.
-        Uses real visual classification on hand slot crops every frame.
+        Refreshes card slots via VisualCardClassifier when force_refresh=True.
         """
-        if frame is not None and frame.size > 0:
+        if force_refresh and frame is not None and frame.size > 0:
             try:
-                classified = self.classifier.classify_hand(frame, self.active_deck)
+                classified, scores = self.classifier.classify_hand(frame, self.active_deck, return_scores=True)
                 if len(classified) == 4:
                     self.tracked_hand = list(classified)
+                    self.last_hand_scores = [float(s) for s in scores]
                     rem = [c for c in self.active_deck if c not in self.tracked_hand]
                     if rem:
                         self.tracked_next = rem[0]
@@ -842,17 +844,17 @@ class PerceptionAdapter:
                 "left": col_left + 0.03 * col_w,
                 "right": col_left + 0.97 * col_w,
             }
-            self.hand_xs = [col_left + x * col_w for x in [0.22, 0.41, 0.60, 0.79]]
+            self.hand_xs = [col_left + x * col_w for x in [0.305, 0.500, 0.695, 0.890]]
             self.elixir_box = {
                 "top": 0.965,
-                "bottom": 0.985,
-                "left": col_left + 0.20 * col_w,
-                "right": col_left + 0.80 * col_w,
+                "bottom": 0.988,
+                "left": col_left + 0.207 * col_w,
+                "right": col_left + 0.961 * col_w,
             }
         else:
             self.arena_box = {"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97}
-            self.hand_xs = [0.22, 0.41, 0.60, 0.79]
-            self.elixir_box = {"top": 0.965, "bottom": 0.985, "left": 0.20, "right": 0.80}
+            self.hand_xs = [0.305, 0.500, 0.695, 0.890]
+            self.elixir_box = {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
 
     def frame_to_obs(self, frame: np.ndarray) -> Dict[str, torch.Tensor]:
         """Constructs full 7-tensor observation batch ready for AlphaStarCRNet."""
@@ -980,13 +982,14 @@ class PerceptionAdapter:
         }
         return obs
 
-    def update_hand_on_play(self, played_slot: int):
+    def update_hand_on_play(self, played_slot: int, deduct_elixir: bool = True):
         """Updates internal hand cycle when a card is deployed."""
         if 0 <= played_slot < 4:
             played_card = self.tracked_hand[played_slot]
             card_id = CRSIM_NAME_TO_ID.get(played_card, 1)
             cost = CARDS_CATALOG.get(card_id, {}).get("cost", 3)
-            self.current_elixir = max(0.0, self.current_elixir - cost)
+            if deduct_elixir:
+                self.current_elixir = max(0.0, self.current_elixir - cost)
             self.last_card_play_time = time.time()
 
             # Draw next card
@@ -1191,7 +1194,7 @@ class ADBController:
     """
 
     def __init__(self, device_serial: Optional[str] = None, dry_run: bool = False,
-                 use_swipe: bool = True):
+                 use_swipe: bool = False):
         self.device_serial = device_serial or find_adb_serial()
         self.dry_run = dry_run
         self.use_swipe = use_swipe
@@ -1301,14 +1304,14 @@ class ADBController:
             return
         # Tap bottom OK multiple times (match exit confirmation)
         for _ in range(3):
-            self.tap_pixel(451, 1455)
+            self.tap_pixel(450, 1450)
             time.sleep(0.35)
         # Tap center multiple times to open and dismiss chest cards
         for _ in range(6):
             self.tap_pixel(450, 800)
             time.sleep(0.35)
         # Tap bottom OK again in case an 'Open Later' or chest summary OK appeared
-        self.tap_pixel(451, 1455)
+        self.tap_pixel(450, 1450)
         time.sleep(0.35)
         # Tap Battle tab icon at bottom center to ensure on Home Battle tab
         for _ in range(2):
@@ -1363,13 +1366,11 @@ class ADBController:
         if self.process and self.process.stdin:
             try:
                 if self.use_swipe:
-                    # Native drag-and-drop: drag card to arena tile in 150ms
-                    self.process.stdin.write(f"input swipe {card_px} {card_py} {arena_px} {arena_py} 150\n")
+                    # Native drag-and-drop: drag card to arena tile with 350ms duration
+                    self.process.stdin.write(f"input swipe {card_px} {card_py} {arena_px} {arena_py} 350\n")
                 else:
                     # Two-stage tap with dwell delay to ensure card selection animation completes
-                    self.process.stdin.write(f"input tap {card_px} {card_py}\n")
-                    self.process.stdin.write("sleep 0.12\n")
-                    self.process.stdin.write(f"input tap {arena_px} {arena_py}\n")
+                    self.process.stdin.write(f"input tap {card_px} {card_py} && sleep 0.15 && input tap {arena_px} {arena_py}\n")
                 self.process.stdin.flush()
                 print(f"[ADB EXEC] {action_desc}")
                 return True
@@ -1385,6 +1386,91 @@ class ADBController:
             except Exception:
                 pass
             self.process = None
+
+
+class MatchVideoRecorder:
+    """
+    Records in-game match video via ADB shell screenrecord and pulls it locally upon match end.
+    Runs completely in Android background; does not slow down model inference.
+    """
+
+    def __init__(self, serial: Optional[str] = None, output_dir: str = "match_recordings", enabled: bool = True):
+        self.serial = serial
+        self.output_dir = output_dir
+        self.enabled = enabled
+        self.remote_path = "/sdcard/clash_match.mp4"
+        self.proc: Optional[subprocess.Popen] = None
+        self.active_local_path: Optional[str] = None
+        if self.enabled:
+            os.makedirs(self.output_dir, exist_ok=True)
+            os.makedirs(".tmp", exist_ok=True)
+
+    def start_recording(self, match_idx: int) -> None:
+        if not self.enabled:
+            return
+        if self.proc is not None:
+            self.stop_recording()
+        if not self.serial:
+            self.serial = find_adb_serial()
+        if not self.serial:
+            print("[Video Recording] No ADB device available to record.")
+            return
+
+        try:
+            subprocess.run(
+                [_adb_path(), "-s", self.serial, "shell", f"rm -f {self.remote_path}"],
+                capture_output=True, timeout=5, creationflags=CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.active_local_path = os.path.join(self.output_dir, f"match_{match_idx:03d}_{timestamp}.mp4")
+
+        cmd = [
+            _adb_path(), "-s", self.serial, "shell",
+            f"screenrecord --size 450x800 --bit-rate 4000000 --time-limit 240 {self.remote_path}"
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW
+            )
+            print(f"[Video Recording] 🎥 Started match recording -> {self.active_local_path}")
+        except Exception as e:
+            print(f"[Video Recording] Failed to start screenrecord: {e}")
+            self.proc = None
+
+    def stop_recording(self) -> Optional[str]:
+        if not self.enabled or self.proc is None:
+            return None
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=3)
+        except Exception:
+            pass
+        self.proc = None
+
+        time.sleep(1.2)  # Wait for Android to flush MP4 headers
+
+        if self.serial and self.active_local_path:
+            cmd_pull = [_adb_path(), "-s", self.serial, "pull", self.remote_path, self.active_local_path]
+            try:
+                res = subprocess.run(cmd_pull, capture_output=True, timeout=20, creationflags=CREATE_NO_WINDOW)
+                if res.returncode == 0 and os.path.exists(self.active_local_path):
+                    sz = os.path.getsize(self.active_local_path)
+                    print(f"[Video Recording] 💾 Saved match video: {self.active_local_path} ({sz / (1024*1024):.2f} MB)")
+                    try:
+                        import shutil
+                        shutil.copyfile(self.active_local_path, ".tmp/latest_match.mp4")
+                    except Exception:
+                        pass
+                    return self.active_local_path
+            except Exception as e:
+                print(f"[Video Recording] Failed to pull video: {e}")
+        return None
 
 # ==============================================================================
 # 4. Live Deployment Runner & Visualization HUD
@@ -1538,8 +1624,12 @@ def main():
                         help="Automatically queue battles and exit post-match screens (default: True)")
     parser.add_argument("--no-auto-battle", dest="auto_battle", action="store_false",
                         help="Disable automatic matchmaking; only play when already inside a match")
-    parser.add_argument("--input-method", type=str, default="swipe", choices=["swipe", "tap"],
-                        help="Card deployment method: 'swipe' (drag-and-drop) or 'tap' (two-stage tap with dwell delay)")
+    parser.add_argument("--input-method", type=str, default="tap", choices=["tap", "swipe"],
+                        help="Card deployment method: 'tap' (two-stage tap with dwell delay) or 'swipe' (drag-and-drop)")
+    parser.add_argument("--record-video", dest="record_video", action="store_true", default=True,
+                        help="Record in-game video via ADB screenrecord and save locally upon match completion (default: True)")
+    parser.add_argument("--no-record-video", dest="record_video", action="store_false",
+                        help="Disable match video recording")
     parser.add_argument("--window-title", type=str, default=None,
                         help="Window title search substring for the PrintWindow fallback (default: MuMu/BlueStacks)")
     parser.add_argument("--input-mode", type=str, default="adb", choices=["auto", "mouse", "adb"],
@@ -1551,8 +1641,12 @@ def main():
                         help="Manual capture bounding box as left,top,width,height")
     parser.add_argument("--adb-device", type=str, default=None,
                         help="Specific ADB device serial (optional)")
+    parser.add_argument("--live", action="store_true", default=True,
+                        help="Live mode (default: True, inverse of --dry-run)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Dry-run mode: Visualize decisions without sending ADB taps")
+    parser.add_argument("--telemetry-file", type=str, default=".tmp/match_telemetry.jsonl",
+                        help="Path to write per-tick forensic telemetry JSONL logs")
     parser.add_argument("--record-matches", type=str, default=None,
                         help="Record live decisions to this JSONL file so real matches can be "
                              "used for behaviour cloning (see tools/train_live_bc.py)")
@@ -1666,6 +1760,11 @@ def main():
     )
     print(f"[Input Mode]     ADB shell pipe on {controller.device_serial or 'pending device'} (background-safe)")
 
+    video_recorder = MatchVideoRecorder(
+        serial=capture.serial or args.adb_device,
+        enabled=(args.record_video and not args.dry_run),
+    )
+
     step_interval = 1.0 / max(0.5, args.cadence_hz)
     t_prev = time.time()
     frame_count = 0
@@ -1689,6 +1788,8 @@ def main():
         current_trophies = args.starting_trophies
         completed_matches = 0
 
+    session_matches_played = 0
+
     print(f"[Trophy Target]  Current: {current_trophies} | Target: {args.target_trophies} (Remaining: {max(0, args.target_trophies - current_trophies)})")
 
     # Autonomous Battle Management State
@@ -1699,7 +1800,8 @@ def main():
     last_action_time = 0.0
     last_deploy_time = 0.0
     last_dismiss_tap_time = 0.0
-    min_deploy_cooldown = 1.0  # seconds between card placements
+    min_deploy_cooldown = 1.2  # 1.2s post-deployment animation duration (R2)
+    pending_hand_resync = False
     post_match_cooldown = 0.0
 
     print("\n[Bridge Running] Press Ctrl+C in terminal (or 'q' in OpenCV window) to stop.\n")
@@ -1749,7 +1851,9 @@ def main():
                         battle_ended_by_timeout = True
 
                 if in_battle and (post_btn is not None or battle_ended_by_timeout):
+                    saved_video = video_recorder.stop_recording()
                     completed_matches += 1
+                    session_matches_played += 1
                     result, p_crowns, o_crowns, delta = perception.score_match(frame)
                     current_trophies = max(0, current_trophies + delta)
 
@@ -1768,6 +1872,7 @@ def main():
                         "trophies": current_trophies,
                         "duration_s": round(battle_duration, 1),
                         "cards_deployed": len(match_deployments),
+                        "video": saved_video or "",
                         "notes": note_str,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
@@ -1789,14 +1894,15 @@ def main():
                     in_battle = False
                     match_deployments = []
                     post_match_cooldown = now
+                    pending_hand_resync = False
 
                     controller.dismiss_post_match_popups()
 
                     if args.target_trophies > 0 and current_trophies >= args.target_trophies:
                         print(f"\n🎉 [TARGET ACHIEVED] Reached {current_trophies} Trophies (Target: {args.target_trophies})! Stopping.")
                         break
-                    if args.matches > 0 and completed_matches >= args.matches:
-                        print(f"\n[Completed] Reached match limit of {args.matches}. Stopping.")
+                    if args.matches > 0 and session_matches_played >= args.matches:
+                        print(f"\n[Completed] Reached session match limit of {args.matches}. Stopping.")
                         break
                     continue
 
@@ -1807,7 +1913,7 @@ def main():
                         if args.target_trophies > 0 and current_trophies >= args.target_trophies:
                             print(f"\n🎉 [TARGET ACHIEVED] Current trophies {current_trophies} >= Target {args.target_trophies}! Stopping.")
                             break
-                        if args.matches > 0 and completed_matches >= args.matches:
+                        if args.matches > 0 and session_matches_played >= args.matches:
                             print(f"\n[Completed] Reached target of {args.matches} match(es). Stopping.")
                             break
                         bx, by = home_btn
@@ -1831,7 +1937,7 @@ def main():
                         print("[Autopilot] Modal/Reward active. Tapping center (450, 800) and Battle tab (450, 1550)...")
                         controller.tap_pixel(450, 800)
                         time.sleep(0.35)
-                        controller.tap_pixel(451, 1455)
+                        controller.tap_pixel(450, 1450)
                         time.sleep(0.35)
                         controller.tap_pixel(450, 1550)
                         time.sleep(0.5)
@@ -1845,6 +1951,14 @@ def main():
                     last_in_battle_time = now
                     match_deployments = []
                     perception.match_time_elapsed = 0.0
+                    pending_hand_resync = False
+                    perception.read_hand(frame, force_refresh=True)
+                    video_recorder.start_recording(completed_matches + 1)
+                    if args.telemetry_file and os.path.exists(args.telemetry_file):
+                        try:
+                            os.remove(args.telemetry_file)
+                        except Exception:
+                            pass
                     print(f"\n⚔️  LIVE BATTLE {completed_matches + 1} STARTED! (Current Trophies: {current_trophies})")
 
             # 3. In-Battle Perception and Action (Rate Limited at cadence_hz)
@@ -1858,60 +1972,126 @@ def main():
                 if in_battle:
                     perception.match_time_elapsed = now - match_start_time
 
+                cooldown_active = (now - last_deploy_time < min_deploy_cooldown)
+
+                # Post-cooldown fresh frame hand re-sync
+                if (not cooldown_active) and pending_hand_resync:
+                    perception.read_hand(frame, force_refresh=True)
+                    pending_hand_resync = False
+
                 # Transform frame into canonical observation batch
                 obs = perception.frame_to_obs(frame)
                 elixir = perception.current_elixir
 
-                # Model Inference: Autoregressive Action & Value Prediction (Deterministic argmax)
-                with torch.no_grad():
-                    actions, _, _, values = model.get_action_and_value(obs, deterministic=True)
-                    chosen_card = actions[0, 0].item()
-                    chosen_tile = actions[0, 1].item()
-                    value_est = values[0].item() if values.dim() == 1 else values[0, 0].item()
+                if cooldown_active:
+                    # Enforce strict 1.2s post-deploy cooldown: mask cards 0..3, force Wait (slot 4)
+                    obs["card_mask"][:, :4] = False
+                    obs["card_mask"][:, 4] = True
+                    chosen_card = 4
+                    chosen_tile = 0
+                    tile_x = 0
+                    tile_y = 0
+                    value_est = 0.0
+                    card_probs_np = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+                    source = "[COOLDOWN WAIT]"
+                else:
+                    # Model Inference: Autoregressive Action & Value Prediction (Deterministic argmax)
+                    with torch.no_grad():
+                        core = model.forward_core(obs["scalars"], obs["hand_cards"], obs["entities"], obs["entity_mask"], obs["arena_grid"])
+                        card_logits = model.card_head(core).float()
+                        card_mask_t = obs["card_mask"].bool()
+                        card_probs_np = torch.softmax(card_logits.masked_fill(~card_mask_t, -1e9), dim=-1)[0].cpu().numpy()
+                        actions, _, _, values = model.get_action_and_value(obs, deterministic=True)
+                        chosen_card = actions[0, 0].item()
+                        chosen_tile = actions[0, 1].item()
+                        value_est = values[0].item() if values.dim() == 1 else values[0, 0].item()
 
-                tile_x = chosen_tile % ARENA_WIDTH
-                tile_y = chosen_tile // ARENA_WIDTH
-                source = "[ALPHASTAR]"
+                    tile_x = chosen_tile % ARENA_WIDTH
+                    tile_y = chosen_tile // ARENA_WIDTH
+                    source = "[ALPHASTAR]"
 
-                # Strategic Guardrail 1: Reactive Defense against Threats crossing river
-                entities_np = obs["entities"][0].cpu().numpy()
-                entity_mask_np = obs["entity_mask"][0].cpu().numpy()
-                enemy_threat = None
+                    # Strategic Guardrail 1: Reactive Defense against Threats crossing river
+                    entities_np = obs["entities"][0].cpu().numpy()
+                    entity_mask_np = obs["entity_mask"][0].cpu().numpy()
+                    enemy_threat = None
+                    for idx in range(6, len(entities_np)):
+                        if not entity_mask_np[idx]:
+                            ent = entities_np[idx]
+                            if ent[1] < 0:  # Enemy unit
+                                ey = ent[3] * 32.0  # Canonical Y (0..31)
+                                ex = ent[2] * 18.0  # Canonical X (0..17)
+                                if ey < 15.0:  # Threatening friendly territory
+                                    enemy_threat = (ex, ey)
+                                    break
+
+                    if enemy_threat is not None and chosen_card == 4 and elixir >= 2.5:
+                        ex, ey = enemy_threat
+                        defensive_slots = [
+                            s for s in range(4)
+                            if CRSIM_NAME_TO_ID.get(perception.tracked_hand[s], 1) not in WIN_CONDITION_IDS
+                            and elixir >= CARDS_CATALOG.get(CRSIM_NAME_TO_ID.get(perception.tracked_hand[s], 1), {}).get("cost", 3)
+                        ]
+                        eval_slots = defensive_slots if defensive_slots else range(4)
+                        for slot in eval_slots:
+                            cid = CRSIM_NAME_TO_ID.get(perception.tracked_hand[slot], 1)
+                            cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
+                            if elixir >= cost:
+                                chosen_card = slot
+                                # In front of towers at y in 9..13, center-pulled for buildings/interceptors
+                                if cid in (13,):  # Cannon
+                                    tile_x = 9 if ex < 9.0 else 8
+                                    tile_y = 11
+                                else:  # Troop defenders deploy directly in the SAME LANE as the threat
+                                    tile_x = int(np.clip(round(ex), max(1, int(ex - 2)), min(16, int(ex + 2))))
+                                    tile_y = int(np.clip(round(ey - 2.0), 8, 12))
+                                source = "[FALLBACK DEFENSE]"
+                                break
+
+                # Extract detected units for forensics
+                enemy_units = []
+                friendly_units = []
                 for idx in range(6, len(entities_np)):
                     if not entity_mask_np[idx]:
                         ent = entities_np[idx]
-                        if ent[1] < 0:  # Enemy unit
-                            ey = ent[3] * 32.0  # Canonical Y (0..31)
-                            ex = ent[2] * 18.0  # Canonical X (0..17)
-                            if ey < 15.0:  # Threatening friendly territory
-                                enemy_threat = (ex, ey)
-                                break
+                        tx_u = int(round(ent[2] * ARENA_WIDTH))
+                        ty_u = int(round(ent[3] * ARENA_HEIGHT))
+                        if ent[1] < 0:
+                            enemy_units.append({"tile_x": tx_u, "tile_y": ty_u, "norm_x": float(ent[2]), "norm_y": float(ent[3])})
+                        else:
+                            friendly_units.append({"tile_x": tx_u, "tile_y": ty_u, "norm_x": float(ent[2]), "norm_y": float(ent[3])})
 
-                if enemy_threat is not None and chosen_card == 4 and elixir >= 2.5:
-                    ex, ey = enemy_threat
-                    defensive_slots = [
-                        s for s in range(4)
-                        if CRSIM_NAME_TO_ID.get(perception.tracked_hand[s], 1) not in WIN_CONDITION_IDS
-                        and elixir >= CARDS_CATALOG.get(CRSIM_NAME_TO_ID.get(perception.tracked_hand[s], 1), {}).get("cost", 3)
-                    ]
-                    eval_slots = defensive_slots if defensive_slots else range(4)
-                    for slot in eval_slots:
-                        cid = CRSIM_NAME_TO_ID.get(perception.tracked_hand[slot], 1)
-                        cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-                        if elixir >= cost:
-                            chosen_card = slot
-                            # In front of towers at y in 9..13, center-pulled for buildings/interceptors
-                            if cid in (13,):  # Cannon
-                                tile_x = 9 if ex < 9.0 else 8
-                                tile_y = 11
-                            else:  # Troop defenders deploy directly in the SAME LANE as the threat
-                                tile_x = int(np.clip(round(ex), max(1, int(ex - 2)), min(16, int(ex + 2))))
-                                tile_y = int(np.clip(round(ey - 2.0), 8, 12))
-                            source = "[FALLBACK DEFENSE]"
-                            break
+                screen_px, screen_py = controller.grid_to_screen_pixel(tile_x, tile_y, perception.arena_box) if chosen_card != 4 else (0, 0)
+                t_el = perception.match_time_elapsed
+                phase = "Regulation (1x Elixir)" if t_el < 120.0 else ("Double Elixir (2x)" if t_el < 180.0 else "Overtime")
+
+                if args.telemetry_file and in_battle:
+                    tick_entry = {
+                        "t_s": round(t_el, 2),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "phase": phase,
+                        "raw_elixir": round(float(elixir), 2),
+                        "hand_cards": list(perception.tracked_hand),
+                        "hand_scores": [round(float(s), 3) for s in perception.last_hand_scores],
+                        "enemy_units": enemy_units,
+                        "friendly_units": friendly_units,
+                        "card_mask": [bool(b) for b in obs["card_mask"][0].cpu().numpy()],
+                        "source": source,
+                        "card_probs": [round(float(p), 4) for p in card_probs_np],
+                        "chosen_card": int(chosen_card),
+                        "chosen_card_name": perception.tracked_hand[chosen_card] if chosen_card < 4 else "Wait/NoOp",
+                        "chosen_tile": [int(tile_x), int(tile_y)],
+                        "screen_tap": [int(screen_px), int(screen_py)],
+                        "value_est": round(float(value_est), 3),
+                    }
+                    try:
+                        os.makedirs(os.path.dirname(os.path.abspath(args.telemetry_file)), exist_ok=True)
+                        with open(args.telemetry_file, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(tick_entry) + "\n")
+                    except Exception:
+                        pass
 
                 # Action Execution via background ADB pipe
-                if chosen_card != 4 and (now - last_deploy_time >= min_deploy_cooldown):
+                if chosen_card != 4 and not cooldown_active and (now - last_deploy_time >= min_deploy_cooldown):
                     cname = perception.tracked_hand[chosen_card]
                     cid = CRSIM_NAME_TO_ID.get(cname, 1)
                     cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
@@ -1926,9 +2106,12 @@ def main():
                         )
                         if deployed:
                             last_deploy_time = now
-                            perception.update_hand_on_play(chosen_card)
+                            perception.current_elixir = max(0.0, perception.current_elixir - cost)
+                            perception.last_card_play_time = now
+                            pending_hand_resync = True
+                            perception.update_hand_on_play(chosen_card, deduct_elixir=False)
                             match_deployments.append((cname, (tile_x, tile_y), source))
-                            print(f"{source} Deployed {cname} (Slot {chosen_card}) -> Tile ({tile_x}, {tile_y}) [Elixir: {elixir:.1f}]")
+                            print(f"{source} Deployed {cname} (Slot {chosen_card}) -> Tile ({tile_x}, {tile_y}) [Elixir: {perception.current_elixir:.1f}]")
 
                 # Record the decision so real matches can be used for
                 # behaviour cloning (tools/train_live_bc.py).
@@ -1976,6 +2159,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping background deployment bridge...")
     finally:
+        video_recorder.stop_recording()
         controller.close()
         capture.close()
         if recorder is not None:

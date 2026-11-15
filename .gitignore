@@ -34,6 +34,8 @@ checkpoints/*.png
 
 # Local match replay recordings and temporary files
 replays/*.json
+match_recordings/
+*.mp4
 *.log
 task-*.log
 *.tmp

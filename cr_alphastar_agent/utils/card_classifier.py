@@ -106,13 +106,13 @@ class VisualCardClassifier:
             if deck_img is not None:
                 card_coords = {
                     "Knight": (60, 415, 150, 210),
-                    "MiniPekka": (275, 415, 150, 210),
+                    "Archers": (275, 415, 150, 210),
                     "Minions": (490, 415, 150, 210),
                     "Arrows": (700, 415, 150, 210),
                     "Fireball": (60, 760, 150, 210),
                     "Giant": (275, 760, 150, 210),
                     "Musketeer": (490, 760, 150, 210),
-                    "Archers": (700, 760, 150, 210)
+                    "MiniPekka": (700, 760, 150, 210)
                 }
                 for cname, (x, y, w, h) in card_coords.items():
                     crop = deck_img[y:y+h, x:x+w]
@@ -134,12 +134,12 @@ class VisualCardClassifier:
                         self.templates["Archer"] = img
 
     def crop_slots(self, frame: np.ndarray,
-                   y_range: Tuple[float, float] = (0.83, 0.94),
+                   y_range: Tuple[float, float] = (0.835, 0.945),
                    x_slots: Optional[List[Tuple[float, float]]] = None) -> List[np.ndarray]:
         """Crops the 4 hand card slots from a vertical frame."""
         h, w = frame.shape[:2]
         if x_slots is None:
-            x_slots = [(0.22, 0.32), (0.40, 0.50), (0.58, 0.68), (0.76, 0.86)]
+            x_slots = [(0.24, 0.38), (0.43, 0.57), (0.62, 0.76), (0.81, 0.95)]
             
         y1, y2 = int(y_range[0] * h), int(y_range[1] * h)
         crops = []
@@ -193,14 +193,15 @@ class VisualCardClassifier:
         match_pixels = np.sum(h_mask & s_mask & v_mask)
         color_score = float(match_pixels / max(1, crop.shape[0] * crop.shape[1]))
         
-        # Combined score: if template exists, 60% template + 40% color; else 100% color
+        # Combined score: if template exists, 85% template + 15% color; else 100% color
         if tmpl is not None:
-            return 0.6 * template_score + 0.4 * min(1.0, color_score * 3.0)
+            return 0.85 * template_score + 0.15 * min(1.0, color_score * 2.0)
         else:
             return float(np.clip(color_score * 3.5, 0.0, 1.0))
 
     def classify_hand(self, frame: np.ndarray,
-                      candidate_deck: Optional[List[str]] = None) -> List[str]:
+                      candidate_deck: Optional[List[str]] = None,
+                      return_scores: bool = False):
         """Classifies the 4 slots and ensures 4 distinct cards strictly from active_deck are chosen."""
         # Strictly restrict candidate deck to active_deck
         allowed_deck = list(self.active_deck)
@@ -220,6 +221,8 @@ class VisualCardClassifier:
             
         crops = self.crop_slots(frame)
         if len(crops) != 4:
+            if return_scores:
+                return candidate_deck[:4], [1.0] * 4
             return candidate_deck[:4]
             
         # Build score matrix: [4 slots, len(candidate_deck)]
@@ -230,6 +233,7 @@ class VisualCardClassifier:
                 
         # Greedy assignment to enforce 4 distinct cards
         chosen = [None] * 4
+        chosen_scores = [0.0] * 4
         used_cards = set()
         
         # Sort all (score, slot, card) tuples descending
@@ -242,6 +246,7 @@ class VisualCardClassifier:
         for score, s, cname in pairs:
             if chosen[s] is None and cname not in used_cards:
                 chosen[s] = cname
+                chosen_scores[s] = float(score)
                 used_cards.add(cname)
                 
         # Fill any unassigned slots
@@ -249,5 +254,9 @@ class VisualCardClassifier:
         for s in range(4):
             if chosen[s] is None:
                 chosen[s] = rem.pop(0) if rem else candidate_deck[s]
+                chosen_scores[s] = 0.5
                 
+        self.last_scores = chosen_scores
+        if return_scores:
+            return chosen, chosen_scores
         return chosen

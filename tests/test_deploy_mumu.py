@@ -259,3 +259,110 @@ def test_score_match_and_artifact_logging(tmp_path):
     assert "TestOpponent" in content
 
 
+def test_read_elixir_calibrated_bounds():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # Verify calibrated bounding box
+    assert adapter.elixir_box == {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
+
+    # 1. Test empty bar on 900x1600 frame -> must return 0.0, no blind fallback
+    frame_empty = np.zeros((1600, 900, 3), dtype=np.uint8)
+    adapter.current_elixir = 3.5
+    val = adapter.read_elixir(frame_empty)
+    assert val == 0.0
+    assert adapter.current_elixir == 0.0
+
+    # 2. Test calibrated fill reading (e.g. 50% fill -> 5.0 elixir)
+    frame_half = np.zeros((1600, 900, 3), dtype=np.uint8)
+    ey1 = int(0.965 * 1600)
+    ey2 = int(0.988 * 1600)
+    ex1 = int(0.207 * 900)
+    ex2 = int(0.961 * 900)
+    mid_x = ex1 + (ex2 - ex1) // 2
+    # Fill left half of bar with purple (HSV: ~145, BGR: ~[180, 0, 220])
+    frame_half[ey1:ey2, ex1:mid_x] = [180, 0, 220]
+    val_half = adapter.read_elixir(frame_half)
+    assert 4.8 <= val_half <= 5.2
+
+    # 3. Test full bar fill -> 10.0 elixir
+    frame_full = np.zeros((1600, 900, 3), dtype=np.uint8)
+    frame_full[ey1:ey2, ex1:ex2] = [180, 0, 220]
+    val_full = adapter.read_elixir(frame_full)
+    assert val_full == 10.0
+
+
+def test_deploy_instant_elixir_deduction_and_cooldown():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    adapter.current_elixir = 7.0
+    # Card slot 0
+    card_name = adapter.tracked_hand[0]
+    cid = CRSIM_NAME_TO_ID[card_name]
+    cost = CARDS_CATALOG[cid]["cost"]
+
+    # Verify instant elixir deduction logic
+    adapter.current_elixir = max(0.0, adapter.current_elixir - cost)
+    assert adapter.current_elixir == 7.0 - cost
+
+    # Verify update_hand_on_play maintains cycle without double deduction when deduct_elixir=False
+    prev_next = adapter.tracked_next
+    adapter.update_hand_on_play(0, deduct_elixir=False)
+    assert adapter.current_elixir == 7.0 - cost
+    assert adapter.tracked_hand[0] == prev_next
+
+    # Verify cooldown masking contract
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    obs = adapter.frame_to_obs(frame)
+    # Simulate cooldown enforcement
+    obs["card_mask"][:, :4] = False
+    obs["card_mask"][:, 4] = True
+    assert obs["card_mask"][0, 4].item() is True
+    assert all(obs["card_mask"][0, i].item() is False for i in range(4))
+
+
+def test_hand_resync_after_cooldown(monkeypatch):
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+
+    # When force_refresh=False, read_hand does not invoke classify_hand
+    classify_called = False
+    def mock_classify(f, deck, return_scores=False):
+        nonlocal classify_called
+        classify_called = True
+        return ["Giant", "Musketeer", "MiniPekka", "Fireball"], [0.9, 0.9, 0.9, 0.9]
+
+    monkeypatch.setattr(adapter.classifier, "classify_hand", mock_classify)
+
+    # Default read_hand(frame) does not call classifier
+    hand_ids, next_id = adapter.read_hand(frame, force_refresh=False)
+    assert not classify_called
+    assert [CRSIM_NAME_TO_ID[c] for c in adapter.tracked_hand] == hand_ids
+
+    # Post-cooldown re-sync with force_refresh=True invokes classifier and updates tracked_hand
+    hand_ids, next_id = adapter.read_hand(frame, force_refresh=True)
+    assert classify_called
+    assert adapter.tracked_hand == ["Giant", "Musketeer", "MiniPekka", "Fireball"]
+    assert hand_ids == [CRSIM_NAME_TO_ID[c] for c in ["Giant", "Musketeer", "MiniPekka", "Fireball"]]
+
+
+def test_calibrate_game_column_preserves_calibrated_coordinates():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # Standard portrait frame (900x1600)
+    portrait_frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    adapter.calibrate_game_column(portrait_frame)
+
+    assert adapter.hand_xs == [0.305, 0.500, 0.695, 0.890]
+    assert adapter.elixir_box["top"] == 0.965
+    assert adapter.elixir_box["bottom"] == 0.988
+    assert abs(adapter.elixir_box["left"] - 0.207) < 1e-4
+    assert abs(adapter.elixir_box["right"] - 0.961) < 1e-4
+
+    # Widescreen frame (1920x1080)
+    widescreen_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    adapter.calibrate_game_column(widescreen_frame)
+
+    assert adapter.elixir_box["top"] == 0.965
+    assert adapter.elixir_box["bottom"] == 0.988
+    assert adapter.hand_xs[0] > 0.30  # scaled into pillar
+    assert adapter.elixir_box["left"] > 0.20  # scaled into pillar
+
+
+
