@@ -998,10 +998,10 @@ class PerceptionAdapter:
             cycle = [c for c in self.active_deck if c not in self.tracked_hand]
             self.tracked_next = cycle[0] if cycle else self.active_deck[0]
 
-    def detect_home_battle_button(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
+    def detect_home_battle_button(self, frame: np.ndarray, check_battle: bool = True) -> Optional[Tuple[int, int]]:
         """Detects the yellow 'Battle' button on the Clash Royale Home Screen."""
         # Never match on an active arena battle
-        if self.is_in_battle(frame):
+        if check_battle and self.is_in_battle(frame):
             return None
 
         h, w = frame.shape[:2]
@@ -1047,7 +1047,7 @@ class PerceptionAdapter:
         for c in b_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             cx = bx + bw // 2
-            if bw > 100 and bh > 40 and int(w * 0.35) <= cx <= int(w * 0.88):
+            if 120 <= bw <= 450 and 35 <= bh <= 140 and int(w * 0.35) <= cx <= int(w * 0.88):
                 cy = int(h * 0.80) + by + bh // 2
                 return "ok", cx, cy
 
@@ -1057,14 +1057,23 @@ class PerceptionAdapter:
         for c in y_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             cx = bx + bw // 2
-            if bw > 80 and bh > 35 and int(w * 0.15) <= cx <= int(w * 0.55):
+            if 80 <= bw <= 350 and 35 <= bh <= 120 and int(w * 0.15) <= cx <= int(w * 0.55):
                 cy = int(h * 0.80) + by + bh // 2
                 return "play_again", cx, cy
 
         return None
 
     def is_in_battle(self, frame: np.ndarray) -> bool:
-        """Determines if a match is actively in progress (solid purple elixir bar present)."""
+        """
+        Determines if a match is actively in progress.
+        Checks:
+        1. Aspect ratio is portrait.
+        2. Home screen 'Battle' button is NOT active.
+        3. Elixir bar container has solid purple fill (>= 30 columns).
+        4. Purple is strictly localized to the horizontal elixir bar container and not
+           predominantly distributed across arena, card tray, or full screen (rejects
+           full-screen purple modals like Mystery Box or Trophy Road animations).
+        """
         h, w = frame.shape[:2]
         if w > h:
             return False
@@ -1077,12 +1086,29 @@ class PerceptionAdapter:
         if crop.size == 0:
             return False
 
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        purple_mask = cv2.inRange(hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
+        crop_hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        purple_mask = cv2.inRange(crop_hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
         col_sums = np.sum(purple_mask > 0, axis=0)
         filled_cols = np.where(col_sums > (crop.shape[0] * 0.35))[0]
         # Real battle has 50 to 520 solid columns of purple. Home screen has at most 3.
-        return len(filled_cols) >= 30
+        if len(filled_cols) < 30:
+            return False
+
+        # Purple localization check: Ensure purple fill is strictly localized to the
+        # horizontal elixir bar container and that surrounding areas (arena, card tray, full screen)
+        # are not predominantly purple (full-screen purple modals have purple across multiple bands).
+        full_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        full_purple = cv2.inRange(full_hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
+
+        full_ratio = float(np.mean(full_purple > 0))
+        arena_ratio = float(np.mean(full_purple[int(h * 0.10):int(h * 0.70), :] > 0))
+        tray_ratio = float(np.mean(full_purple[int(h * 0.75):int(h * 0.94), :] > 0))
+        above_bar_ratio = float(np.mean(full_purple[int(h * 0.90):ey1, ex1:ex2] > 0))
+
+        if full_ratio > 0.15 or arena_ratio > 0.12 or tray_ratio > 0.20 or above_bar_ratio > 0.40:
+            return False
+
+        return True
 
     def score_match(self, frame: np.ndarray) -> Tuple[str, int, int, int]:
         """

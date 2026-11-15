@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 import sys
 
+import cv2
 import numpy as np
 import pytest
 import torch
@@ -363,6 +364,39 @@ def test_calibrate_game_column_preserves_calibrated_coordinates():
     assert adapter.elixir_box["bottom"] == 0.988
     assert adapter.hand_xs[0] > 0.30  # scaled into pillar
     assert adapter.elixir_box["left"] > 0.20  # scaled into pillar
+
+
+def test_is_in_battle_rejects_full_screen_purple_modals():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # 1. Full-screen purple modal frame (like Mystery Box chest opening animation)
+    modal_frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    modal_frame[:] = cv2.cvtColor(np.uint8([[[145, 180, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    adapter.calibrate_game_column(modal_frame)
+    assert not adapter.is_in_battle(modal_frame)
+
+    # 2. Modal with purple across arena and card tray bands
+    partially_purple_modal = np.zeros((1600, 900, 3), dtype=np.uint8)
+    partially_purple_modal[100:1500, :] = cv2.cvtColor(np.uint8([[[140, 160, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    assert not adapter.is_in_battle(partially_purple_modal)
+
+
+def test_is_in_battle_accepts_genuine_battle_frame():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # Genuine battle frame: green arena, dark card tray, localized purple elixir bar fill
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    frame[100:1150, :] = [45, 120, 45]  # Green arena grass
+    frame[1150:1540, :] = [30, 30, 35]  # Dark card tray
+
+    # Localized elixir fill in elixir container
+    adapter.calibrate_game_column(frame)
+    ey1 = int(adapter.elixir_box["top"] * frame.shape[0])
+    ey2 = int(adapter.elixir_box["bottom"] * frame.shape[0])
+    ex1 = int(adapter.elixir_box["left"] * frame.shape[1])
+    ex2 = int(adapter.elixir_box["right"] * frame.shape[1])
+    purple_bgr = cv2.cvtColor(np.uint8([[[145, 200, 220]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    frame[ey1:ey2, ex1:int(ex1 + (ex2 - ex1) * 0.6)] = purple_bgr
+
+    assert adapter.is_in_battle(frame)
 
 
 
