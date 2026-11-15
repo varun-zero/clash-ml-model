@@ -1,0 +1,85 @@
+# Competitive v2 training configuration.
+# Every key here is consumed by train_competitive.py; unknown keys are ignored
+# so older checkpoints keep loading after new keys are added.
+
+seed: 7
+output_dir: checkpoints/competitive
+
+env:
+  # 5 engine ticks of 100 ms = one 500 ms decision.
+  decision_ticks: 5
+  max_units: 192
+  n_particles: 128
+  tower_weight: 0.5
+  crown_weight: 0.15
+  start_elixir: 5.0
+
+model:
+  d_model: 192
+  layers: 4
+  heads: 4
+  dim_feedforward: 512
+  dropout: 0.0
+  d_card: 64
+  n_value_bins: 7
+
+train:
+  num_envs: 4
+  rollout_steps: 256
+  updates: 10000
+  group_size: 4              # match-LOO groups; ignored for gae
+  lr: 3.0e-4
+  weight_decay: 0.0001
+  gamma: 0.997
+  gae_lambda: 0.95
+  clip: 0.2
+  value_coef: 0.5
+  value_ce_coef: 0.25
+  entropy_coef: 0.01
+  aux_coef: 0.05
+  wait_coef: 0.02
+  kl_coef: 0.5
+  kl_target: 0.02
+  kl_adapt: 1.5
+  kl_min: 0.005
+  kl_max: 5.0
+  kl_leash: sum
+  advantage: gae             # gae | match_loo
+  shaping: potential         # potential | none
+  max_grad_norm: 1.0
+  ppo_epochs: 4
+  minibatch: 64
+  normalize_advantage: true
+  critic_warmup_updates: 0
+  save_every: 10
+  snapshot_every: 20
+  eval_every: 20
+  log_every: 1
+  eval_pairs: 8
+  eval_greedy: true
+
+league:
+  # Opponent decks.  Presets from tools/decks.py are always available; add
+  # extra full 8-card decks here, plus random decks from the supported pool.
+  include_presets: true
+  # 8 presets + 175 random = 183 decks, matching the deck-count scale of the
+  # reference multi-deck curriculum.  Add real meta decks under `decks:` when
+  # you have a ladder corpus; the random decks are a robustness curriculum.
+  random_decks: 175
+  # Optional extra 8-card decks, e.g.:
+  # decks:
+  #   - [HogRider, Musketeer, IceSpirits, Cannon, Fireball, Log, Skeletons, IceGolemite]
+  # Optional explicit learner deck whitelist.  Empty means use the whole pool.
+  learner_decks: []
+  # Optional held-out eval decks.  Empty means sample unseen random decks.
+  eval_decks: []
+  eval_random_decks: 4
+  scripted_ratio: 0.25
+  snapshot_ratio: 0.55
+  self_ratio: 0.20
+  random_ratio: 0.0
+  wait_ratio: 0.0
+  mirror_prob: 0.10
+  pfsp_power: 2.0
+  opponent_temperature: 1.0
+  snapshot_keep: 20

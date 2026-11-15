@@ -22,7 +22,7 @@ from cr_alphastar_agent.config import (
 )
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID
-from deploy_bluestacks import (
+from deploy_mumu import (
     WindowCapture, PerceptionAdapter, WindowsMouseController, draw_hud
 )
 from evaluate_visual import classify_tactical_zone

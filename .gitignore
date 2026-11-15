@@ -1,6 +1,7 @@
 # Python bytecode and test/linter caches
 __pycache__/
 *.py[cod]
+*.pyc
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -20,13 +21,26 @@ dist/
 
 # Intermediate training checkpoints (keep latest.pt and history)
 checkpoints/ckpt_step_*.pt
+checkpoints/**/ckpt_step_*.pt
 checkpoints/pool/archive_pre_tactical/
+checkpoints/competitive/
+checkpoints/current_deck/ckpt_step_*.pt
+checkpoints/current_deck/bc*.pt
+checkpoints/current_deck/*.log
+checkpoints/current_deck/*.png
+checkpoints/current_deck/match_log*.json
+checkpoints/current_deck/training_history*.json
 checkpoints/*.png
 
 # Local match replay recordings and temporary files
 replays/*.json
 *.log
+task-*.log
 *.tmp
+scratch/
+debug_*.png
+current_*_screen.png
+mumu_*_screen.png
 
 # Windows metadata
 Thumbs.db

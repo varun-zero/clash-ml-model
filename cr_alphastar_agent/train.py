@@ -20,7 +20,7 @@ import argparse
 import torch
 
 from cr_alphastar_agent.config import (
-    get_hardware_profile, PPO_LR, ROLLOUT_STEPS, NUM_ENVS
+    get_hardware_profile, PPO_LR, ROLLOUT_STEPS, NUM_ENVS, ELIXIR_LEAK_WEIGHT
 )
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.training.hybrid_ppo_trainer import HybridPPOTrainer
@@ -49,6 +49,17 @@ def main():
     )
     parser.add_argument("--env-backend", type=str, default="crsim", choices=["crsim", "replica"],
                         help="Physics engine backend (crsim = 100%% APK data-driven, replica = lightweight)")
+    parser.add_argument("--deck", type=str, default="current",
+                        help="Deck preset for the learner (current|starter|hog26|giant) or a "
+                             "comma-separated card list. Default: current (the account deck).")
+    parser.add_argument("--opponents", type=str, default="scripted",
+                        choices=["scripted", "mixed", "self_play"],
+                        help="Opponent source: scripted (rule bots), mixed (ramped), self_play (league)")
+    parser.add_argument("--init-bc", type=str, default=None,
+                        help="Behaviour-cloning checkpoint to initialise the policy from")
+    parser.add_argument("--elixir-leak-weight", type=float, default=ELIXIR_LEAK_WEIGHT,
+                        help="Penalty per elixir wasted at the 10-elixir cap.  Without it the "
+                             "agent learns to bank elixir and wait instead of cycling cards.")
     args = parser.parse_args()
 
     # Determine execution scale
@@ -78,12 +89,18 @@ def main():
         num_envs=num_envs,
         rollout_steps=rollout_steps,
         pure_self_play=args.pure_self_play,
-        env_backend=args.env_backend
+        env_backend=args.env_backend,
+        deck=args.deck,
+        opponent_mode=args.opponents,
+        init_checkpoint=args.init_bc,
+        elixir_leak_weight=args.elixir_leak_weight,
     )
 
     batch_samples = num_envs * rollout_steps
     print(f"\n[Trainer Initialized] Checkpoints: {os.path.abspath(args.checkpoint_dir)}")
     print(f"[Self-Play Mode] {'Pure Neural AI vs AI (0% Scripted Bots)' if args.pure_self_play else 'Curriculum'}")
+    print(f"[Deck] {trainer.deck_mode} -> {trainer.learner_deck_ids}")
+    print(f"[Opponents] {args.opponents}")
     print(f"[Training Plan] {total_updates} updates | {num_envs} parallel envs | {rollout_steps} steps/rollout")
     print(f"[Batch Size] {batch_samples} samples per update (Action Repeat: 4 ticks/step)\n")
 

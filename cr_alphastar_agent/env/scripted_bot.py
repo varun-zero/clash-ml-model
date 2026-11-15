@@ -7,7 +7,10 @@ Used for:
 
 import numpy as np
 from typing import Dict, Any
-from cr_alphastar_agent.config import ARENA_WIDTH, ARENA_HEIGHT, CARDS_CATALOG, SPELL_CARD_IDS
+from cr_alphastar_agent.config import (
+    ARENA_WIDTH, ARENA_HEIGHT, CARDS_CATALOG, SPELL_CARD_IDS,
+    WIN_CONDITION_IDS, DEFENSIVE_CARD_IDS
+)
 
 
 class ScriptedBot:
@@ -47,7 +50,9 @@ class ScriptedBot:
             tx = int(np.clip(primary_threat[2] * ARENA_WIDTH, 1, ARENA_WIDTH - 2))
             ty = int(np.clip(primary_threat[3] * ARENA_HEIGHT, 3, 14))
 
-            affordable_slots = [s for s in range(4) if card_mask[s]]
+            hand_cids = obs.get("hand_cards", [1, 1, 1, 1])[:4]
+            defensive_slots = [s for s in range(4) if card_mask[s] and hand_cids[s] not in WIN_CONDITION_IDS]
+            affordable_slots = defensive_slots if defensive_slots else [s for s in range(4) if card_mask[s]]
             if affordable_slots:
                 chosen_slot = int(np.random.choice(affordable_slots))
                 deploy_y = max(1, ty - 2)
@@ -161,11 +166,19 @@ class TacticalProBot:
         if threats:
             threats.sort(key=lambda t: t["y"])
             pri_threat = threats[0]
-            tx = int(np.clip(pri_threat["x"], 1, ARENA_WIDTH - 2))
-            ty = int(np.clip(pri_threat["y"], 3, 14))
-            chosen_slot = int(np.random.choice(affordable_slots))
-            deploy_y = max(1, ty - 2)
-            tile_idx = deploy_y * ARENA_WIDTH + tx
+            # Prioritize defensive cards; never use win condition (Giant/HogRider) to defend
+            defensive_slots = [s for s in affordable_slots if hand_cards[s] not in WIN_CONDITION_IDS]
+            eval_slots = defensive_slots if defensive_slots else affordable_slots
+            chosen_slot = int(np.random.choice(eval_slots))
+            chosen_cid = hand_cards[chosen_slot]
+            # Center pull for defensive buildings (Cannon=13) or kiting
+            if chosen_cid in (13,):
+                deploy_x = 9 if pri_threat["x"] < 9.0 else 8
+                deploy_y = 11
+            else:
+                deploy_x = int(np.clip(pri_threat["x"], 3, ARENA_WIDTH - 4))
+                deploy_y = int(np.clip(pri_threat["y"] - 2, 9, 13))
+            tile_idx = deploy_y * ARENA_WIDTH + deploy_x
             return np.array([chosen_slot, tile_idx], dtype=np.int64)
 
         # -------------------------------------------------------------

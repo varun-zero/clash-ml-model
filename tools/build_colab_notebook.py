@@ -1,0 +1,285 @@
+"""Generate the Colab notebook for current-deck BC + RL training.
+
+Keeps the notebook in sync with the trainer CLI instead of hand-editing JSON.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+NOTEBOOK = REPO / "ClashBot_Colab_Training.ipynb"
+
+CELLS = [
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# ClashBot: Current-Deck BC + RL Training on Google Colab\n",
+            "[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/varun-zero/clash-ml-model/blob/main/ClashBot_Colab_Training.ipynb)\n",
+            "\n",
+            "Trains the deployed agent on the deck the account actually plays:\n",
+            "\n",
+            "**Knight - Mini PEKKA - Archers - Musketeer - Arrows - Fireball - Giant - Minions**\n",
+            "\n",
+            "### Pipeline\n",
+            "1. **Behaviour cloning** on the tactical teacher (`TacticalCoachBot`): defence-first, spell-disciplined, placement-varied.\n",
+            "2. **PPO/GAE reinforcement learning** against scripted bots with the same deck.\n",
+            "3. **Public-information opponent elixir** via `OpponentElixirTracker` (no hidden-state leak).\n",
+            "4. Google Drive persistence for checkpoints, history and curves.\n",
+            "\n",
+            "### What changed vs. the old pipeline\n",
+            "| Problem in live play | Fix |\n",
+            "|---|---|\n",
+            "| Fireball thrown at our own tower / enemy king tower (activating it) | `tactics.evaluate_spell_cast` blocks own-half and king-tower casts, rewards value casts |\n",
+            "| Kept pushing while our towers were being destroyed | defence-priority shaping: pushing while threatened is penalised, defending is rewarded |\n",
+            "| Always deployed on the same 3-4 tiles | placement anchors + jitter in the teacher, placement-variety shaping, tile entropy in PPO |\n",
+            "| Opponent elixir read from the simulator's private counter | explicit `OpponentElixirTracker` built from public plays only |"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": ["## 1. Verify Tesla T4 GPU & CUDA Acceleration"]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!nvidia-smi\n",
+            "import torch\n",
+            "print(f\"CUDA Available: {torch.cuda.is_available()}\")\n",
+            "if torch.cuda.is_available():\n",
+            "    print(f\"Device: {torch.cuda.get_device_name(0)}\")\n",
+            "    print(f\"VRAM: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB\")"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": ["## 2. Mount Google Drive for Continuous Persistence"]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "from google.colab import drive\n",
+            "import os\n",
+            "\n",
+            "drive.mount('/content/drive')\n",
+            "DRIVE_DIR = '/content/drive/MyDrive/clashbot_training'\n",
+            "os.makedirs(DRIVE_DIR, exist_ok=True)\n",
+            "print(f\"Google Drive Mounted! Checkpoint sync path: {DRIVE_DIR}\")"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": ["## 3. Clone Repository & Install Dependencies"]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!git clone https://github.com/varun-zero/clash-ml-model.git /content/clashbot\n",
+            "%cd /content/clashbot\n",
+            "!pip install -q -r requirements.txt\n",
+            "\n",
+            "import os, sys\n",
+            "cwd = os.getcwd()\n",
+            "if cwd not in sys.path:\n",
+            "    sys.path.insert(0, cwd)\n",
+            "print(f\"Working Directory: {cwd}\")"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": ["## 4. Confirm the Deck & Sanity-Check the Trainer"]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "from cr_alphastar_agent.config import CURRENT_DECK, CURRENT_DECK_IDS, CARDS_CATALOG, resolve_deck_ids\n",
+            "from cr_alphastar_agent.env.opponent_elixir import OpponentElixirTracker\n",
+            "\n",
+            "print(\"Deck:\", CURRENT_DECK)\n",
+            "print(\"Policy IDs:\", CURRENT_DECK_IDS, \"->\", [CARDS_CATALOG[c][\"name\"] for c in CURRENT_DECK_IDS])\n",
+            "assert resolve_deck_ids('current') == CURRENT_DECK_IDS\n",
+            "assert len(set(CURRENT_DECK_IDS)) == 8\n",
+            "\n",
+            "# Opponent elixir tracker sanity check (public information only).\n",
+            "t = OpponentElixirTracker()\n",
+            "t.observe_play(cost=4, t_s=30.0)\n",
+            "print(\"Tracker estimate:\", t.estimate(30.0).to_dict())"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## 5. Behaviour Cloning on the Current Deck\n",
+            "\n",
+            "Clones `TacticalCoachBot` (defence-first, spell-disciplined, placement-varied) and writes `checkpoints/bc.pt`.\n",
+            "\n",
+            "Useful knobs: `--num-matches` (more = more diverse data), `--teacher coach|tactical|scripted`, `--epochs`."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!python warmstart_bc.py \\\n",
+            "    --deck current \\\n",
+            "    --teacher coach \\\n",
+            "    --num-matches 60 \\\n",
+            "    --epochs 4 \\\n",
+            "    --lr 1e-3 \\\n",
+            "    --checkpoint-dir ./checkpoints \\\n",
+            "    --out-name bc.pt"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## 6. Reinforcement Learning (PPO + GAE) vs Scripted Bots\n",
+            "\n",
+            "The learner keeps the current deck; the opponent draws varied decks so the policy does not overfit a single matchup.\n",
+            "\n",
+            "`--opponents scripted` trains against the rule bots first. Switch to `mixed` (ramps into the PFSP league) or `self_play` for league-only training."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!python train_colab.py \\\n",
+            "    --total-updates 1000 \\\n",
+            "    --num-envs 8 \\\n",
+            "    --rollout-steps 256 \\\n",
+            "    --deck current \\\n",
+            "    --opponents scripted \\\n",
+            "    --init-bc ./checkpoints/bc.pt \\\n",
+            "    --checkpoint-dir ./checkpoints \\\n",
+            "    --drive-dir /content/drive/MyDrive/clashbot_training"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## 7. Continue Against the League (Optional)\n",
+            "\n",
+            "After the scripted-bot stage, continue with the PFSP league (historical snapshots + mirror self-play) on the same deck."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "!python train_colab.py \\\n",
+            "    --total-updates 500 \\\n",
+            "    --num-envs 8 \\\n",
+            "    --rollout-steps 256 \\\n",
+            "    --deck current \\\n",
+            "    --opponents self_play \\\n",
+            "    --checkpoint-dir ./checkpoints \\\n",
+            "    --drive-dir /content/drive/MyDrive/clashbot_training"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": ["## 8. View Real-Time Improvement & Telemetry Curves"]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "from IPython.display import Image, display\n",
+            "import os, json\n",
+            "\n",
+            "plot_path = \"checkpoints/clashbot_training_curve.png\"\n",
+            "if not os.path.exists(plot_path):\n",
+            "    plot_path = \"/content/drive/MyDrive/clashbot_training/clashbot_training_curve.png\"\n",
+            "if os.path.exists(plot_path):\n",
+            "    display(Image(plot_path))\n",
+            "else:\n",
+            "    print(\"Training plot will be generated after the first PPO batch!\")\n",
+            "\n",
+            "hist_path = \"checkpoints/training_history.json\"\n",
+            "if os.path.exists(hist_path):\n",
+            "    hist = json.load(open(hist_path))\n",
+            "    if hist:\n",
+            "        last = hist[-1]\n",
+            "        print(f\"step={last['step']} update={last['update']} win_rate={last['win_rate']:.1f}% \")\n",
+            "        print(f\"record: {last['total_wins']}W-{last['total_losses']}L-{last['total_draws']}D over {last['total_matches']} matches\")"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## 9. Download the Final Checkpoint\n",
+            "\n",
+            "`latest.pt` is the deployable checkpoint (same format as `deploy_mumu.py` expects)."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "import shutil, os\n",
+            "if os.path.exists(\"checkpoints/latest.pt\"):\n",
+            "    shutil.copy2(\"checkpoints/latest.pt\", \"/content/drive/MyDrive/clashbot_training/latest.pt\")\n",
+            "    print(\"Saved latest.pt to Google Drive\")\n",
+            "else:\n",
+            "    print(\"No latest.pt yet - run the training cell first.\")"
+        ]
+    },
+]
+
+
+def main() -> None:
+    notebook = {
+        "cells": CELLS,
+        "metadata": {
+            "accelerator": "GPU",
+            "colab": {"provenance": []},
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 0,
+    }
+    NOTEBOOK.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n",
+                        encoding="utf-8")
+    print(f"Wrote {NOTEBOOK} ({len(CELLS)} cells)")
+
+
+if __name__ == "__main__":
+    main()

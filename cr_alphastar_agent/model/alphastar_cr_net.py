@@ -19,13 +19,21 @@ from cr_alphastar_agent.config import (
     ENTITY_FEATURES, SPATIAL_CHANNELS, NUM_CARDS, SPELL_CARD_IDS
 )
 
+# Nucleus (top-p) sampling threshold for the tile head.
+TOP_P_NUCLEUS = 0.85
+
 
 class AlphaStarCRNet(nn.Module):
-    def __init__(self, num_cards: int = NUM_CARDS, max_entities: int = MAX_ENTITIES, d_model: int = D_MODEL):
+    def __init__(self, num_cards: int = NUM_CARDS, max_entities: int = MAX_ENTITIES,
+                 d_model: int = D_MODEL, top_p: float = TOP_P_NUCLEUS):
         super().__init__()
         self.d_model = d_model
         self.max_entities = max_entities
         self.num_cards = num_cards
+        # Nucleus sampling threshold for the tile head.  Sampling uniformly
+        # over the 576 tiles kept picking low-probability tail tiles, so the
+        # bottom (1 - top_p) of the cumulative probability is truncated.
+        self.top_p = float(top_p)
 
         # Register spell card IDs buffer for card-conditioned tile masking
         spell_tensor = torch.tensor(list(SPELL_CARD_IDS), dtype=torch.long)
@@ -141,12 +149,50 @@ class AlphaStarCRNet(nn.Module):
         core_state = self.core_fusion(torch.cat([s_feat, e_feat, sp_feat], dim=-1))
         return core_state
 
+    @staticmethod
+    def _top_p_filter(logits: torch.Tensor, valid_mask: torch.Tensor, p: float) -> torch.Tensor:
+        """Nucleus (top-p) truncation of a masked categorical distribution.
+
+        ``logits`` are already masked with -1e9 on illegal entries and
+        ``valid_mask`` marks the legal ones.  The returned mask keeps the
+        smallest set of legal entries whose cumulative probability reaches
+        ``p``, so the low-probability tail is never sampled.
+
+        The filter is applied to the *distribution*, not only to the sample:
+        the log-probability of the taken action has to be computed under the
+        same distribution that produced it, otherwise the PPO importance
+        ratio would be corrupted.
+        """
+        neg_inf = torch.finfo(logits.dtype).min
+        safe_logits = torch.where(valid_mask, logits, torch.full_like(logits, neg_inf))
+        probs = torch.softmax(safe_logits, dim=-1)
+
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        # Keep the entries whose cumulative probability *before* them is
+        # below p - that is the nucleus.
+        keep_sorted = (cumulative - sorted_probs) < p
+
+        keep = torch.zeros_like(valid_mask)
+        keep.scatter_(1, sorted_idx, keep_sorted)
+        keep = keep & valid_mask
+
+        # Safety net: a row without a single surviving entry would make the
+        # distribution undefined, so fall back to the legal set.
+        empty = ~keep.any(dim=-1, keepdim=True)
+        if bool(empty.any()):
+            keep = torch.where(empty, valid_mask, keep)
+        return keep
+
     def get_action_and_value(self, obs: dict, action: torch.Tensor = None, deterministic: bool = False,
-                             return_entropy_breakdown: bool = False):
+                             return_entropy_breakdown: bool = False, temperature: float = 1.0,
+                             nucleus_mask: torch.Tensor = None, return_nucleus: bool = False):
         """
         Autoregressive action sampling & value estimation with:
         - FP16-safe logit masking (FP32 cast before -1e9 mask)
         - Card-conditioned tile masking (spells get full arena mask; troops get restricted deployment mask)
+        - Top-p (nucleus) truncation of the tile distribution
+        - Optional sampling temperature applied to both heads (exploitation)
         - Separated card and tile entropy metrics to prevent No-Op exploration collapse
         """
         core = self.forward_core(
@@ -162,8 +208,12 @@ class AlphaStarCRNet(nn.Module):
 
         # Step 1: Predict Card Slot (0..3 hand cards, 4 No-Op)
         # FP16-safe: Cast logits to FP32 before applying -1e9 mask
+        temp = max(1e-3, float(temperature))
+
         card_logits = self.card_head(core).float()
         masked_card_logits = card_logits.masked_fill(~card_mask, -1e9)
+        if temp != 1.0:
+            masked_card_logits = masked_card_logits / temp
         card_dist = Categorical(logits=masked_card_logits)
 
         if action is None:
@@ -194,6 +244,28 @@ class AlphaStarCRNet(nn.Module):
         tile_logits = self.tile_head(tile_input).float()  # FP16-safe FP32 cast
 
         masked_tile_logits = tile_logits.masked_fill(~effective_tile_mask, -1e9)
+        if temp != 1.0:
+            masked_tile_logits = masked_tile_logits / temp
+
+        # Top-p nucleus truncation: only the high-probability tactical tiles
+        # stay in the support, so the policy never samples a low-probability
+        # tail tile.
+        #
+        # `nucleus_mask` replays the nucleus that was used when the action was
+        # *sampled*.  The nucleus shrinks as the tile head learns, so
+        # recomputing it during the PPO update would make the sampled tile
+        # impossible and hand it a -1e9 log-probability, which blows the KL
+        # metric up to ~1e7 and destroys the importance ratio.  Replaying the
+        # stored nucleus keeps the behaviour policy and the evaluated policy
+        # identical.
+        if nucleus_mask is not None:
+            nucleus = nucleus_mask.bool() & effective_tile_mask
+        elif self.top_p is not None and 0.0 < self.top_p < 1.0:
+            nucleus = self._top_p_filter(masked_tile_logits, effective_tile_mask, self.top_p)
+        else:
+            nucleus = effective_tile_mask
+        masked_tile_logits = masked_tile_logits.masked_fill(~nucleus, -1e9)
+
         tile_dist = Categorical(logits=masked_tile_logits)
 
         if action is None:
@@ -216,7 +288,11 @@ class AlphaStarCRNet(nn.Module):
         total_entropy = card_entropy + tile_entropy
 
         if return_entropy_breakdown:
+            if return_nucleus:
+                return action, total_log_prob, (card_entropy, tile_entropy), value, nucleus
             return action, total_log_prob, (card_entropy, tile_entropy), value
+        if return_nucleus:
+            return action, total_log_prob, total_entropy, value, nucleus
         return action, total_log_prob, total_entropy, value
 
     def get_value(self, obs: dict) -> torch.Tensor:

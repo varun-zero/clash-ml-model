@@ -185,18 +185,299 @@ Run the automated test suite covering rules, card cycle, model heads, and UI ada
 pytest -v
 ```
 
-### 5. Live PC & Emulator Deployment (Google Play Games & BlueStacks)
-Deploy the trained AlphaStar agent directly into live matches:
+### 5. Background BlueStacks Deployment (ADB-only)
+Deploy the trained AlphaStar agent into a live BlueStacks match without taking
+over your desktop:
 ```powershell
-# Auto-detects Google Play Games PC (native mouse clicks) or BlueStacks (ADB)
-python deploy_bluestacks.py --checkpoint checkpoints/latest.pt --visualize
+# Captures via `adb exec-out screencap` and taps via `adb shell input tap`.
+# MuMu Player may be covered, minimized, or unfocused; your mouse stays free.
+python deploy_mumu.py --checkpoint checkpoints/latest.pt --visualize
 
-# Safe dry-run mode with tactical OpenCV HUD overlay (no clicks sent)
-python deploy_bluestacks.py --checkpoint checkpoints/latest.pt --dry-run --visualize
+# Safe dry-run mode with tactical OpenCV HUD overlay (no taps sent)
+python deploy_mumu.py --checkpoint checkpoints/latest.pt --dry-run --visualize
 
-# Or double-click the one-click Windows launcher:
-.\run_agent_pc.bat
+# Explicit capture backend (auto = ADB raw, PrintWindow fallback)
+python deploy_mumu.py --capture-backend adb-raw
 ```
+
+`deploy_mumu.py` never calls `SetForegroundWindow`, `SendInput`,
+`pyautogui`, or moves the Windows cursor. Host mouse injection was removed;
+`--input-mode mouse` now fails with an explanation. `WindowsMouseController`
+remains only as a dry-run compatibility shim for the HUD and tests.
+
+---
+
+## Competitive v2 (additive, public-information agent)
+
+The v1 stack and its checkpoints are unchanged. `cr_alphastar_agent/competitive/`
+adds a separate competitive stack that removes the v1 observation leak and
+implements the stronger techniques:
+
+| Component | v2 behaviour |
+|---|---|
+| Observation | Own hand/deck/elixir plus the public board only. Opponent elixir, hand and cycle are **not** policy inputs. |
+| Opponent model | Deterministic elixir accounting + particle filter over a public meta-deck prior. |
+| Actions | Gate -> hand card -> 2,304 half-tile cell pointer, plus wait-for-card pointer. Legal masks are vectorised and audited against `Battle.legal_action`. |
+| Network | Entity + 2-tile patch + global tokens -> transformer -> factored heads and auxiliary opponent heads. |
+| Learner | PPO clip, GAE or match leave-one-out advantages, potential shaping, KL leash to a frozen prior, adaptive beta. |
+| League | PFSP over frozen snapshots, scripted baselines, random decks and deck-pool sampling. |
+| Data | Replay -> BC bootstrap from local JSON replays or HuggingFace parquet. |
+| Evaluation | Paired seat-swapped matches with Wilson 95% confidence intervals. |
+
+Quick start:
+
+```bash
+# 1. Verify the public-observation contract (no hidden-state leakage)
+python tools/audit_obs.py
+
+# 2. One-update smoke run
+python train_competitive.py --config configs/competitive.yaml --smoke-test
+
+# 3. Full v2 training (separate output directory / checkpoints)
+python train_competitive.py --config configs/competitive.yaml
+
+# 4. Resume
+python train_competitive.py --config configs/competitive.yaml --resume latest
+
+# 5. Paired evaluation against a scripted baseline
+python tools/eval_paired.py --checkpoint checkpoints/competitive/latest.pt \
+    --vs scripted --pairs 20
+
+# 6. Optional behaviour-cloning warm start
+python tools/build_pro_dataset.py --replays replays --out data/pro_bc.npz
+python tools/train_bc.py --dataset data/pro_bc.npz \
+    --out checkpoints/competitive/bc_init.pt --epochs 3
+python train_competitive.py --config configs/competitive.yaml \
+    --init-bc checkpoints/competitive/bc_init.pt
+```
+
+Replay ingestion also accepts the public HF parquet schema:
+
+```bash
+pip install pyarrow    # optional, only needed for parquet input
+python tools/build_pro_dataset.py --hf-parquet data/part_0.parquet \
+    --limit 2000 --out data/hf_bc.npz
+```
+
+Notes:
+
+* v2 checkpoints live under `checkpoints/competitive/` and never overwrite
+  `checkpoints/latest.pt`, so v1 deployment keeps working.
+* The belief prior uses `tools/decks.py` presets plus extra decks listed in
+  `configs/competitive.yaml`; add your own meta decks there for stronger
+  opponent modelling.
+* The default league pool is 183 decks (8 presets + 175 sampled), matching the
+  reference curriculum's deck scale. On the local CUDA box one update
+  (4 envs x 256 decisions) takes roughly 35-45 s, so lower `updates` or
+  `rollout_steps` for quick experiments.
+* Full ladder-scale training still needs a large replay/deck corpus and
+  compute. The code paths are complete, but no pro dataset ships with the
+  repository.
+
+---
+
+## 🎯 Current-Deck Training (BC + RL)
+
+The agent is trained on the deck the account actually plays:
+
+**Knight - Mini PEKKA - Archers - Musketeer - Arrows - Fireball - Giant - Minions**
+
+`cr_alphastar_agent/config.py` exposes it as `CURRENT_DECK` / `CURRENT_DECK_IDS`
+and every entry point defaults to it (`--deck current`).
+
+### BC-to-RL stabilisation
+
+The clone is only a starting point - PPO has to improve on it, not destroy it.
+Four mechanisms keep the transition stable:
+
+| Mechanism | What it prevents |
+|---|---|
+| **Value-head calibration in BC** | The clone regresses `value_head` onto the discounted return-to-go `G_t = Σ γ^k r_{t+k}` (γ = 0.995) with `0.5 * MSE`, so the critic is calibrated before the first RL step. Without it the value loss spikes to ~0.175 and the GAE advantages are pure noise. |
+| **Critic warmup (8 updates)** | After a fresh clone only `value_head` is updated (`pg_loss = 0`, `entropy = 0`); the actor is released once the critic loss settles below 0.04. |
+| **Hinge-clamped entropy** | `clamp(card_entropy, max=0.90)` and `clamp(tile_entropy, max=2.80)`: the bonus only pays out when entropy falls *below* the floor, so PPO can never push entropy above the level the clone produced (it used to climb 4.25 → 6.20). |
+| **BC anchor KL leash** | A frozen copy of the clone acts as a reference; `β · KL(π_BC ‖ π_θ)` penalises drift away from the cloned behaviour. |
+
+### Progressive KL expansion
+
+A fixed leash target of 0.02 acts as a bungee cord - the policy can never
+outgrow the teacher and the win rate freezes. The target is therefore
+expanded on a schedule:
+
+| Update | KL target | Beta cap |
+|---|---|---|
+| 0 - 50 | 0.02 (tight, critic still settling) | 20.0 |
+| 50 - 250 | linear 0.02 → 0.25 | `20.0 × 0.992^update` |
+| 250+ | 0.25 (free optimisation) | continues to decay |
+
+### Top-p tile sampling
+
+Sampling uniformly over the 576 tiles kept picking low-probability tail
+tiles. The tile head now uses nucleus sampling (`p = 0.85`): the bottom 15%
+of the cumulative probability is truncated from the support, so the agent
+only explores high-leverage tactical anchors.
+
+The filter is applied to the *distribution* in both the sampling and the
+evaluation path, so the PPO log-probabilities stay consistent with the
+behaviour policy - otherwise the importance ratio would be corrupted.
+
+### Exploitation benchmark
+
+```bash
+python tools/eval_temperature.py --checkpoint checkpoints/current_deck/latest.pt \
+    --temperature 0.35 --matches 50 --opponent coach
+```
+
+Measures the win rate the agent achieves playing its *best* moves (T = 0.35
+on both heads) instead of exploring, which is the number that matters for
+ladder play. `--top-p 0` disables the nucleus so the two effects can be
+separated.
+
+### Reading the numbers honestly
+
+A distribution shift applied at inference to a policy that was not trained
+under it *costs* accuracy, and the benchmark shows this clearly:
+
+| Condition (vs `TacticalCoachBot`, current deck) | Win rate |
+|---|---|
+| Trained policy, T = 1.0, no nucleus | **59.8 %** (204 training matches) |
+| T = 1.0 **with** nucleus applied post-hoc | 43.0 % |
+| T = 0.35 with nucleus | 23.0 % |
+
+So the nucleus must be active *during* training (it is, in the current
+pipeline) rather than being bolted onto an existing checkpoint.
+
+### Why the agent "waits" so much
+
+It does not. Only ~8 % of the decisions have an affordable card - a match
+gives ~90 elixir and the average card costs ~3.1, so ~29 cards per match is
+the hard ceiling and the agent plays essentially all of them. When a card
+*is* affordable it plays it 71 % of the time (P(wait) > 0.9 in 0 % of
+states).
+
+### Keeping the placements diverse
+
+The "always the same three places" behaviour is what the *old* v1 checkpoint
+showed in live matches - it was cloned from a teacher that only ever used
+three tiles. The current teacher uses 16 anchors with jitter, and the
+trained policy keeps ~30 distinct tiles per match at ~4.6 bits of tile
+entropy (measured over 25-update buckets: tiles-per-deployment 0.637 →
+0.734, entropy 4.61 → 4.56 bits).
+
+A stronger preset is provided as insurance, because the hinge-clamped bonus
+at `0.0005 x 2.04` would be ~20x too weak to stop a collapse against a
+policy gradient of O(0.01):
+
+```bash
+python train_colab.py --entropy-preset diverse ...
+```
+
+| Preset | card coef | card ceiling | tile coef | tile ceiling |
+|---|---|---|---|---|
+| `spec` (default) | 0.015 | 0.90 | 0.0005 | 2.80 |
+| `diverse` | 0.015 | 0.90 | 0.010 | 4.00 |
+
+### Reading the telemetry correctly
+
+The trainer writes `training_history.json` and `match_log.json` **atomically**
+(temp file + rename) and the monitor retries on a transient parse failure.
+Without that, a reader that catches the file half-written silently reports
+wrong statistics - that is how a bogus "placement collapse" (30.4 → 4.0
+tiles) was reported once. Bucket the data by update and compare
+*tiles per deployment* (not tiles per match) to avoid confounding diversity
+with match length.
+
+### The pipeline
+
+```bash
+# 1. Behaviour cloning on the tactical teacher (defence-first,
+#    spell-disciplined, placement-varied)
+python warmstart_bc.py --deck current --teacher coach \
+    --num-matches 60 --epochs 4 --checkpoint-dir ./checkpoints --out-name bc.pt
+
+# 2. PPO + GAE reinforcement learning against scripted bots
+python train_colab.py --deck current --opponents scripted \
+    --init-bc ./checkpoints/bc.pt --total-updates 1000
+
+# 3. Optional: continue against the PFSP league
+python train_colab.py --deck current --opponents self_play --total-updates 500
+```
+
+`ClashBot_Colab_Training.ipynb` runs exactly this sequence on Colab and syncs
+the checkpoint to Drive. Regenerate it with
+`python tools/build_colab_notebook.py`.
+
+### What was fixed for the live-match failures
+
+| Failure in live play | Fix |
+|---|---|
+| Fireball/Arrows thrown at our own tower | `tactics.evaluate_spell_cast` rejects own-half casts; the per-card action mask forbids them entirely |
+| Fireball on the enemy king tower (activating it) | same helper rejects king-tower casts; masked out of the action space |
+| Kept pushing on the other lane while our towers were destroyed | defence-priority shaping: pushing while threatened is penalised, defending is rewarded |
+| Every troop went to the same 3-4 tiles | the teacher samples from 16 logical anchors with jitter; placement-variety shaping; per-card tile masks used during BC |
+| Opponent elixir read from the simulator's private counter | `OpponentElixirTracker` reconstructs it from public plays only (card cost + clock + regeneration schedule) and exposes an interval, not a point value |
+
+### Training + monitoring on a local GPU
+
+One command trains the current deck on the local GPU and prints a live report
+(learning curve, win-rate trend, first-match vs last-match comparison):
+
+```bash
+python tools/run_current_deck.py --updates 200 --envs 4 --rollout-steps 256 \
+    --bc-matches 40 --bc-epochs 3 --teacher coach --opponents scripted \
+    --dir checkpoints/current_deck --watch 60
+```
+
+The monitor can also be run against an existing run:
+
+```bash
+python tools/monitor_training.py --dir checkpoints/current_deck --watch 30
+```
+
+Artefacts written to the run directory:
+
+| File | Contents |
+|---|---|
+| `training_history.json` | Per-update metrics (win rate, losses, entropy, KL) |
+| `match_log.json` | Per-match behavioural telemetry (see below) |
+| `learning_curve.png` | Six-panel learning curve |
+| `latest.pt` | The trained checkpoint |
+| `training.log` | Full training output |
+
+The per-match telemetry is what makes "what did it learn?" answerable:
+
+| Field | Meaning |
+|---|---|
+| `spells_own_half` | Spells cast at our own towers (should fall to 0) |
+| `spells_king_tower` | Spells cast at the enemy king tower, activating it (should fall to 0) |
+| `pushes_while_threatened` | Deployments deep in the enemy half while our towers were under attack (should fall) |
+| `defensive_responses` | Deployments on our own half while threatened (should rise) |
+| `distinct_tiles` / `tile_entropy` | Placement spread - the old policy used ~3 tiles (1.6 bits), a healthy one uses 30+ (5-6 bits) |
+
+### Learning from real matches
+
+Real ladder matches can be recorded and turned into supervision, so every
+played match improves the model:
+
+```bash
+# Record live decisions while playing
+python deploy_mumu.py --checkpoint checkpoints/latest.pt \
+    --deck current --record-matches data/live/session.jsonl
+
+# Fine-tune the policy on the recorded matches
+python tools/train_live_bc.py --replays data/live \
+    --checkpoint checkpoints/latest.pt --out checkpoints/live_bc.pt --epochs 2
+```
+
+### Key modules
+
+| Module | Purpose |
+|---|---|
+| `cr_alphastar_agent/env/opponent_elixir.py` | Explicit public-information opponent elixir tracker |
+| `cr_alphastar_agent/env/tactics.py` | Spell discipline, threat detection, placement anchors, perspective-aware geometry |
+| `cr_alphastar_agent/env/tactical_coach.py` | `TacticalCoachBot` - the behaviour-cloning teacher |
+| `cr_alphastar_agent/env/live_recorder.py` | Records live decisions for later supervised training |
+| `tools/train_live_bc.py` | Fine-tunes the policy on recorded real matches |
+| `tools/build_colab_notebook.py` | Regenerates the Colab notebook |
 
 ---
 
@@ -212,7 +493,11 @@ clash-ml-model/
 │   │   └── alphastar_cr_net.py     # Transformer + Spatial CNN + Autoregressive heads
 │   ├── env/                        # Environment adapters & bots
 │   │   ├── crsim_replica_env.py    # Gym observation builder, micro shaping rewards, 8-card cycle
-│   │   └── scripted_bot.py         # TacticalProBot, ScriptedBot, RushExploiterBot
+│   │   ├── scripted_bot.py         # TacticalProBot, ScriptedBot, RushExploiterBot
+│   │   ├── tactical_coach.py       # TacticalCoachBot: BC teacher (defence-first, varied placement)
+│   │   ├── tactics.py              # Spell discipline, threat detection, placement anchors
+│   │   ├── opponent_elixir.py      # Public-information opponent elixir tracker
+│   │   └── live_recorder.py        # Records live matches for later supervised training
 │   ├── training/                   # Self-play league & training algorithms
 │   │   ├── hybrid_ppo_trainer.py   # PPO, GAE, clipped surrogate objective, entropy annealing
 │   │   ├── self_play_pool.py       # Prioritized Fictitious Self-Play (PFSP) pool
@@ -222,8 +507,16 @@ clash-ml-model/
 ├── tools/                          # Dashboard, visualizers, and utilities
 │   ├── ui.py                       # REST API & WebSocket simulation server
 │   ├── ui_template.html            # Canvas visualizer & neural activation diagnostics
-│   └── fidelity.py                 # Engine fidelity verification
-├── tests/                          # Automated pytest suite (18 test cases)
+│   ├── fidelity.py                 # Engine fidelity verification
+│   ├── run_current_deck.py         # Train the current deck + live monitoring on the local GPU
+│   ├── monitor_training.py         # Learning curve + first-vs-last match comparison
+│   ├── eval_temperature.py         # Low-temperature exploitation benchmark
+│   ├── train_live_bc.py            # Fine-tune the policy on recorded real matches
+│   ├── audit_obs.py                # Public-information observation audit (v2)
+│   ├── eval_paired.py              # Paired seat-swapped evaluation (v2)
+│   ├── build_pro_dataset.py        # Replay -> BC dataset (v2)
+│   └── build_colab_notebook.py     # Regenerates the Colab notebook
+├── tests/                          # Automated pytest suite (66 test cases)
 ├── data/
 │   └── logic.json                  # Engine parameter definitions & spell metadata
 ├── checkpoints/

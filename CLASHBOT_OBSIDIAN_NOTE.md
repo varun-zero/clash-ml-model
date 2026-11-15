@@ -7,9 +7,9 @@ tags:
   - deep-learning/transformers
   - gaming/clash-royale
   - self-play
-status: training (live - 2026-11-09 15:38:26)
-latest_checkpoint: "Step 1,731,072 (Update 1218)"
-win_rate: "68.2% vs AI Self-Play"
+status: training (live - 2026-11-14 17:58:20)
+latest_checkpoint: "Step 256 (Update 2)"
+win_rate: "0.0% vs AI Self-Play"
 draw_rate: "0.0%"
 ---
 
@@ -118,9 +118,9 @@ To avoid catastrophic forgetting across diverse deck archetypes:
 
 ---
 
-## 📱 Live BlueStacks Deployment Bridge (`deploy_bluestacks.py`)
+## 📱 Live MuMu Player Deployment Bridge (`deploy_mumu.py`)
 
-A zero-latency bridge connecting `AlphaStarCRNet` to a live BlueStacks emulator instance:
+A zero-latency bridge connecting `AlphaStarCRNet` to a live MuMu Player emulator instance:
 
 1. **Screen Capture:** Auto-hooks window via `win32gui` and samples frames with `mss` at 2.5 Hz (every 0.4s matching `action_repeat = 4`).
 2. **Perception Adapter (`frame_to_obs`):**
@@ -135,57 +135,57 @@ A zero-latency bridge connecting `AlphaStarCRNet` to a live BlueStacks emulator 
 
 ```bash
 # Test with visual HUD and simulated taps (no ADB commands sent):
-python deploy_bluestacks.py --dry-run --visualize
+python deploy_mumu.py --dry-run --visualize
 
-# Execute live on BlueStacks emulator:
-python deploy_bluestacks.py --checkpoint checkpoints/latest.pt
+# Execute live on MuMu Player emulator:
+python deploy_mumu.py --checkpoint checkpoints/latest.pt
 ```
 
 
 ## 📊 Self-Play Performance Graph
 
 > [!summary] Genuine Head-to-Head Telemetry
-> **Total Matches:** 1,316 | **Wins:** 898 (68.2%) | **Losses:** 416 | **Draws:** 2
+> **Total Matches:** 0 | **Wins:** 0 (0.0%) | **Losses:** 0 | **Draws:** 0
 
 ![[clashbot_training_curve.png]]
 
 ## 🎯 Tactical Placement Zone Telemetry
 
 > [!abstract] Live Spatial Deployment Distribution (Batch Telemetry)
-> **Last Evaluated Batch:** Update 1218 (Step 1,731,072) | **Time:** 2026-11-09 15:38:26
+> **Last Evaluated Batch:** Update 0002 (Step 256) | **Time:** 2026-11-14 17:58:20
 
 | Tactical Zone | Canonical Coordinates | Deployment % | Micro Role |
 | :--- | :--- | :---: | :--- |
-| **Back-of-King Slow-Roll** | `y <= 4.0` | **0.0%** | Banking elixir, slow beatdown investment |
-| **Center Split** | `7.5 <= x <= 10.5, 4 < y <= 8` | **26.3%** | Dual-lane pressure & splitting swarms |
-| **Center Kill-Zone / Kite** | `7.0 <= x <= 11.0, 8 < y <= 13` | **0.0%** | Opposite-lane kiting & dual-tower crossfire |
-| **Bridge / Tank-Trick** | `13.0 < y <= 15.5` | **0.0%** | River pressure & meat-shielding glass cannons |
-| **Deep Enemy Spell** | `y > 16.0` | **32.6%** | Direct tower damage & defensive troop snipes |
-| **Flank Lane Defense** | `x < 7.0` or `x > 11.0`, `4 < y <= 13` | **41.1%** | Direct lane response against incoming troops |
+| **Back-of-King Slow-Roll** | `y <= 4.0` | **20.0%** | Banking elixir, slow beatdown investment |
+| **Center Split** | `7.5 <= x <= 10.5, 4 < y <= 8` | **0.0%** | Dual-lane pressure & splitting swarms |
+| **Center Kill-Zone / Kite** | `7.0 <= x <= 11.0, 8 < y <= 13` | **20.0%** | Opposite-lane kiting & dual-tower crossfire |
+| **Bridge / Tank-Trick** | `13.0 < y <= 15.5` | **20.0%** | River pressure & meat-shielding glass cannons |
+| **Deep Enemy Spell** | `y > 16.0` | **20.0%** | Direct tower damage & defensive troop snipes |
+| **Flank Lane Defense** | `x < 7.0` or `x > 11.0`, `4 < y <= 13` | **20.0%** | Direct lane response against incoming troops |
 
 ## 📈 Live Training Telemetry
 
 > [!tip] Live Training Status
-> **Active Checkpoint:** Update 1218 (Step 1,731,072) | **Speed:** 33 FPS | **Cadence:** 30.17s/batch | **Last Synced:** 2026-11-09 15:38:26
-> **AI vs AI Record:** **898 Wins** • **416 Losses** • **2 Draws** (68.2% Win Rate)
+> **Active Checkpoint:** Update 0002 (Step 256) | **Speed:** 12 FPS | **Cadence:** 9.91s/batch | **Last Synced:** 2026-11-14 17:58:20
+> **AI vs AI Record:** **0 Wins** • **0 Losses** • **0 Draws** (0.0% Win Rate)
 
 | Update | Step | Policy Loss | Value Loss | Entropy (Card/Tile) | KL Div | Record & Win % | Speed | Curriculum |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Update 1218 | 1,731,072 | -0.0006 | 0.0440 | 5.854 (0.66/5.78) | 0.00024 | 68.2% (898W-416L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1217 | 1,730,048 | -0.0011 | 0.1553 | 5.904 (0.62/5.84) | 0.00016 | 68.3% (897W-415L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1216 | 1,729,024 | -0.0003 | 0.1209 | 5.938 (0.73/5.87) | 0.00058 | 68.2% (896W-415L-2D) | 35 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1215 | 1,728,000 | -0.0003 | 0.0824 | 5.988 (0.79/5.91) | 0.00034 | 68.2% (894W-415L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1214 | 1,726,976 | -0.0005 | 0.0656 | 5.922 (0.76/5.84) | 0.00033 | 68.2% (893W-415L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1213 | 1,725,952 | -0.0003 | 0.0664 | 5.881 (0.58/5.82) | 0.00017 | 68.3% (893W-412L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1212 | 1,724,928 | -0.0003 | 0.1315 | 6.005 (0.55/5.96) | 0.00005 | 68.3% (892W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1211 | 1,723,904 | -0.0009 | 0.1417 | 5.916 (0.68/5.85) | 0.00025 | 68.3% (891W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1210 | 1,722,880 | -0.0005 | 0.1060 | 6.018 (0.74/5.94) | 0.00010 | 68.2% (887W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1209 | 1,721,856 | -0.0015 | 0.0603 | 5.938 (0.87/5.85) | 0.00116 | 68.2% (886W-412L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1208 | 1,720,832 | -0.0006 | 0.0619 | 6.023 (0.75/5.96) | 0.00058 | 68.2% (884W-411L-2D) | 32 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1207 | 1,719,808 | 0.0000 | 0.0878 | 5.979 (0.69/5.92) | 0.00019 | 68.1% (883W-411L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1206 | 1,718,784 | -0.0001 | 0.1558 | 5.956 (0.61/5.90) | 0.00021 | 68.2% (882W-410L-2D) | 33 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1205 | 1,717,760 | -0.0010 | 0.0775 | 5.801 (0.63/5.72) | 0.00033 | 68.2% (881W-408L-2D) | 37 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
-| Update 1204 | 1,716,736 | -0.0002 | 0.0778 | 6.007 (0.62/5.95) | 0.00007 | 68.2% (880W-408L-2D) | 34 FPS | Stage 3: Pure AlphaStar Self-Play (Bot vs Bot) |
+| Update 0002 | 256 | -0.0014 | 0.0194 | 6.237 (0.69/6.08) | 0.00003 | 0.0% (0W-0L-0D) | 12 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0001 | 128 | -0.0018 | 0.2065 | 6.252 (0.90/6.05) | 0.00006 | 0.0% (0W-0L-0D) | 10 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0003 | 3,072 | -0.0037 | 0.0232 | 6.146 (0.74/5.93) | 0.00068 | 0.0% (0W-4L-0D) | 13 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0002 | 2,048 | -0.0025 | 0.1065 | 6.140 (0.70/5.97) | 0.00018 | 0.0% (0W-1L-0D) | 14 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0001 | 1,024 | -0.0029 | 0.1539 | 6.202 (0.74/6.07) | 0.00054 | 0.0% (0W-0L-0D) | 14 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0003 | 3,072 | -0.0030 | 0.0455 | 6.133 (0.74/5.95) | 19287109.37514 | 0.0% (0W-4L-0D) | 18 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0002 | 2,048 | -0.0032 | 0.0333 | 6.168 (0.70/5.98) | 13671875.00013 | 0.0% (0W-1L-0D) | 15 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0001 | 1,024 | -0.0015 | 0.1014 | 6.185 (0.77/6.07) | 12207031.25011 | 0.0% (0W-0L-0D) | 18 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0201 | 204,864 | -0.0044 | 0.2960 | 3.935 (0.84/3.67) | 0.00061 | 59.5% (234W-159L-0D) | 8 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0002 | 512 | 0.0000 | 0.0039 | 0.000 (0.68/3.91) | 0.00000 | 0.0% (0W-0L-0D) | 34 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0001 | 256 | 0.0000 | 0.0441 | 0.000 (0.94/3.86) | 0.00000 | 0.0% (0W-0L-0D) | 30 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0004 | 4,096 | -0.0025 | 0.1116 | 6.332 (0.77/6.26) | 0.00102 | 25.0% (1W-3L-0D) | 44 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0003 | 3,072 | -0.0083 | 0.0603 | 6.414 (0.81/6.13) | 0.00121 | 25.0% (1W-3L-0D) | 34 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0002 | 2,048 | -0.0020 | 0.0107 | 6.364 (0.71/6.15) | 0.00087 | 0.0% (0W-0L-0D) | 35 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
+| Update 0001 | 1,024 | -0.0012 | 0.0653 | 6.358 (0.74/6.23) | 0.00010 | 0.0% (0W-0L-0D) | 34 FPS | Current Deck Mastery ([1, 2, 7, 9, 8, 3, 4, 5]) vs scripted |
 
 
 ---

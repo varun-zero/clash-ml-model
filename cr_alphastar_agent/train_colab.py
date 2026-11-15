@@ -18,7 +18,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from cr_alphastar_agent.config import (
-    get_hardware_profile, PPO_LR, ROLLOUT_STEPS, NUM_ENVS, EFFECTIVE_BATCH_SIZE
+    get_hardware_profile, PPO_LR, ROLLOUT_STEPS, NUM_ENVS, EFFECTIVE_BATCH_SIZE,
+    resolve_deck_ids, resolve_deck_names, ELIXIR_LEAK_WEIGHT
+)
+from cr_alphastar_agent.training.hybrid_ppo_trainer import (
+    ENTROPY_PRESETS, SNAPSHOT_OPPONENT_RATE,
 )
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.training.hybrid_ppo_trainer import HybridPPOTrainer
@@ -53,16 +57,53 @@ def main():
                         help="Google Drive backup directory for checkpoints and curves")
     parser.add_argument("--lr", type=float, default=PPO_LR,
                         help="AdamW learning rate")
+    parser.add_argument("--deck", type=str, default="current",
+                        help="Deck preset for the learner (current|starter|hog26|giant) or a "
+                             "comma-separated card list. Default: current (the account deck).")
+    parser.add_argument("--opponents", type=str, default="scripted",
+                        choices=["scripted", "mixed", "self_play"],
+                        help="Opponent source: scripted (rule bots), mixed (ramped), self_play (league)")
+    parser.add_argument("--init-bc", type=str, default=None,
+                        help="Behaviour-cloning checkpoint to initialise the policy from "
+                             "(produced by warmstart_bc.py --out-name bc.pt)")
+    parser.add_argument("--bc-matches", type=int, default=0,
+                        help="If > 0, run behaviour cloning first (matches) and use the "
+                             "result as the RL initialisation")
+    parser.add_argument("--bc-epochs", type=int, default=3,
+                        help="Behaviour cloning epochs when --bc-matches > 0")
+    parser.add_argument("--bc-teacher", type=str, default="coach",
+                        choices=["coach", "tactical", "scripted"],
+                        help="Behaviour-cloning teacher bot")
+    parser.add_argument("--elixir-leak-weight", type=float, default=ELIXIR_LEAK_WEIGHT,
+                        help="Penalty per elixir wasted at the 10-elixir cap.  Without it the "
+                             "agent learns to bank elixir and wait instead of cycling cards.")
+    parser.add_argument("--entropy-preset", type=str, default="spec", choices=["spec", "diverse"],
+                        help="Entropy bonus preset: 'spec' (reference coefficients) or "
+                             "'diverse' (20x stronger tile bonus so the tile head cannot "
+                             "collapse onto a few anchors)")
+    parser.add_argument("--snapshot-opponent-rate", type=float, default=SNAPSHOT_OPPONENT_RATE,
+                        help="Share of the league that is a frozen snapshot of our own past "
+                             "policy (0 = scripted bots only).  Without it the league has no "
+                             "learning signal and the win rate stops improving.")
     args = parser.parse_args()
 
+    bc_checkpoint = args.init_bc
+    entropy_preset = ENTROPY_PRESETS[args.entropy_preset]
     env_info = detect_environment()
+    opponent_desc = {
+        "scripted": "Scripted Bots (TacticalCoach / TacticalPro / Rush)",
+        "mixed": "Mixed (scripted first, then PFSP league)",
+        "self_play": "100% Pure Neural Self-Play (League Snapshots + Mirror)",
+    }.get(args.opponents, args.opponents)
     print("=" * 80)
-    print("   ⚔️  CLASHBOT ALPHASTAR // GOOGLE COLAB PURE SELF-PLAY ENGINE  ⚔️")
+    print("   ⚔️  CLASHBOT ALPHASTAR // COLAB BC + RL TRAINING ENGINE  ⚔️")
     print("=" * 80)
     print(f" Environment : {'Google Colab' if env_info['is_colab'] else 'Local Machine'}")
     print(f" Accelerator : {env_info['gpu_name']} ({env_info['vram_gb']:.1f} GB VRAM)")
-    print(f" Mode        : 100% Pure Neural Self-Play (League Snapshots + Mirror)")
-    print(f" Opponents   : 0% Scripted Bots | Authentic Decks (Randomized & Top Archetypes)")
+    print(f" Mode        : {opponent_desc}")
+    print(f" Deck        : {args.deck}")
+    print(f" BC Init     : {bc_checkpoint or 'none - resuming latest.pt if present'}")
+    print(f" Entropy     : {args.entropy_preset} preset")
     print(f" Batch Scale : {args.num_envs} envs x {args.rollout_steps} steps = {args.num_envs * args.rollout_steps} samples/update")
     print(f" Checkpoints : {os.path.abspath(args.checkpoint_dir)}")
 
@@ -89,6 +130,38 @@ def main():
     # Initialize neural model
     model = AlphaStarCRNet()
 
+    # Optional behaviour-cloning stage before RL (ClashAI-style pipeline:
+    # clone the tactical teacher, then improve with PPO against scripted bots).
+    if args.bc_matches > 0:
+        # If starting a fresh BC stage, archive prior telemetry so the curve starts clean
+        for fname in ["training_history.json", "match_log.json"]:
+            fpath = os.path.join(args.checkpoint_dir, fname)
+            if os.path.exists(fpath):
+                prev_path = os.path.join(args.checkpoint_dir, f"{os.path.splitext(fname)[0]}_prev.json")
+                shutil.copy2(fpath, prev_path)
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+
+        from cr_alphastar_agent.warmstart_bc import run_warmstart
+        bc_path = os.path.join(args.checkpoint_dir, "bc.pt")
+        print("=" * 80)
+        print(f"   BEHAVIOUR CLONING STAGE: {args.bc_matches} matches, {args.bc_epochs} epochs, "
+              f"teacher={args.bc_teacher}, deck={args.deck}")
+        print("=" * 80)
+        run_warmstart(
+            num_matches=args.bc_matches,
+            epochs=args.bc_epochs,
+            lr=1e-3,
+            checkpoint_dir=args.checkpoint_dir,
+            env_backend="crsim",
+            deck=resolve_deck_names(args.deck),
+            teacher=args.bc_teacher,
+            out_name="bc.pt",
+        )
+        bc_checkpoint = bc_path
+
     # Initialize trainer
     trainer = HybridPPOTrainer(
         model=model,
@@ -96,8 +169,17 @@ def main():
         lr=args.lr,
         num_envs=args.num_envs,
         rollout_steps=args.rollout_steps,
-        pure_self_play=True,
-        env_backend="crsim"
+        pure_self_play=(args.opponents == "self_play"),
+        env_backend="crsim",
+        deck=args.deck,
+        opponent_mode=args.opponents,
+        init_checkpoint=bc_checkpoint,
+        elixir_leak_weight=args.elixir_leak_weight,
+        entropy_card_ceiling=entropy_preset["card_ceiling"],
+        entropy_tile_ceiling=entropy_preset["tile_ceiling"],
+        entropy_card_coef=entropy_preset["card_coef"],
+        entropy_tile_coef=entropy_preset["tile_coef"],
+        snapshot_opponent_rate=args.snapshot_opponent_rate,
     )
 
     batch_samples = args.num_envs * args.rollout_steps

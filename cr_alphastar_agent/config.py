@@ -47,11 +47,74 @@ CARDS_CATALOG: Dict[int, dict] = {
 }
 
 SPELL_CARD_IDS: Set[int] = {8, 9, 14, 16}
+WIN_CONDITION_IDS: Set[int] = {3, 11}  # Giant, HogRider (target buildings only)
+DEFENSIVE_CARD_IDS: Set[int] = {1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16}
 NUM_CARDS = 16
-DEFAULT_DECK = ["HogRider", "Musketeer", "Cannon", "IceGolemite", "Skeletons", "IceSpirits", "Fireball", "Log"]
+DEFAULT_DECK = ["Knight", "Mini P.E.K.K.A", "Archers", "Musketeer", "Arrows", "Fireball", "Giant", "Minions"]
+DEFAULT_DECK_IDS: List[int] = [1, 5, 2, 4, 9, 8, 3, 7]
+
+STARTER_DECK = ["Knight", "Archers", "Minions", "Arrows", "Fireball", "Giant", "Musketeer", "Mini PEKKA"]
+STARTER_DECK_IDS: List[int] = [1, 2, 7, 9, 8, 3, 4, 5]
+
+# The deck the account actually plays (Knight, Mini PEKKA, Archers, Musketeer,
+# Arrows, Fireball, Giant, Minions).  Every training entry point defaults to
+# this deck so behaviour cloning, RL and live play all speak the same cards.
+CURRENT_DECK = list(STARTER_DECK)
+CURRENT_DECK_IDS: List[int] = list(STARTER_DECK_IDS)
+
+# Display name -> engine card name (the simulator only knows the engine name).
+DECK_NAME_ALIASES: Dict[str, str] = {
+    "Archers": "Archer",
+    "Mini PEKKA": "MiniPekka",
+    "Mini P.E.K.K.A": "MiniPekka",
+    "MiniPekka": "MiniPekka",
+    "Hog Rider": "HogRider",
+    "Baby Dragon": "BabyDragon",
+    "Goblin Barrel": "GoblinBarrel",
+    "Mega Minion": "MegaMinion",
+    "Ice Golem": "IceGolemite",
+    "Ice Spirits": "IceSpirits",
+}
+
+# Named deck presets addressable from the CLI (``--deck current`` etc.).
+# Names are resolved to the coarse policy IDs at load time; the v1 policy
+# vocabulary only has 16 IDs, so a name pair that collapses onto the same ID
+# (e.g. Log and Zap) is de-duplicated by ``resolve_deck_ids``.
+DECK_PRESETS: Dict[str, List[str]] = {
+    "current": list(CURRENT_DECK),
+    "starter": list(STARTER_DECK),
+    "hog26": ["HogRider", "Musketeer", "Cannon", "Knight", "Skeletons",
+              "Archers", "Fireball", "Zap"],
+    "giant": ["Giant", "BabyDragon", "MiniPekka", "Musketeer",
+              "MegaMinion", "Fireball", "Zap", "Minions"],
+}
+
+# Opponent elixir observation source.
+#   "tracker" - reconstruct the opponent's elixir from public plays only
+#   "truth"   - legacy behaviour (reads the simulator's private counter)
+OPP_ELIXIR_SOURCE = "tracker"
+
+# Reward shaping weights for the tactical failures observed in live play.
+DEFENSE_PRIORITY_WEIGHT = 0.06    # reward for defending, penalty for pushing while threatened
+SPELL_VALUE_WEIGHT = 0.05         # reward for a spell that hits real targets
+SPELL_MISUSE_WEIGHT = 0.50        # penalty for a wasted / king-activating spell
+SUPPORT_DEFEND_WEIGHT = 0.04      # reward for protecting our own support units
+PLACEMENT_VARIETY_WEIGHT = 0.01   # small bonus for using varied placement tiles
+
+# Penalty per elixir that overflows the 10-elixir cap.  Without it the agent
+# learns to bank elixir and wait (it waits 437 of 466 decisions), because the
+# reward never charges for the regeneration that is thrown away.  Off by
+# default so existing runs stay comparable; enable it with
+# --elixir-leak-weight to train a card-cycling policy.
+ELIXIR_LEAK_WEIGHT = 0.0
+
+# Hard mask for spell placements: spells may only be cast at the enemy half
+# and never at the enemy king tower (casting there activates it).
+SPELL_SAFE_MASK = True
 
 # Standard Competitive Archetypes for AlphaStar Staged Curriculum
 POPULAR_DECKS: Dict[str, list] = {
+    "Starter Deck": ["Knight", "Archers", "Minions", "Arrows", "Fireball", "Giant", "Musketeer", "Mini PEKKA"],
     "PEKKA Bridge Spam": ["Pekka", "BattleRam", "DarkPrince", "Ghost", "Musketeer", "Minions", "Poison", "Zap"],
     "Classic Log Bait": ["GoblinBarrel", "Princess", "GoblinGang", "Knight", "Skeletons", "InfernoTower", "Log", "Fireball"],
     "Hog 2.6 Cycle": ["HogRider", "Musketeer", "Cannon", "IceGolemite", "Skeletons", "IceSpirits", "Fireball", "Log"],
@@ -65,6 +128,72 @@ POPULAR_DECKS: Dict[str, list] = {
     "Log Bait": ["GoblinBarrel", "Princess", "GoblinGang", "Knight", "Skeletons", "InfernoTower", "Log", "Fireball"],
     "Pekka Control": ["Pekka", "BattleRam", "DarkPrince", "Ghost", "Musketeer", "Minions", "Poison", "Zap"],
 }
+
+def resolve_deck_names(spec) -> List[str]:
+    """Resolve a deck specification to 8 distinct *engine* card names.
+
+    The simulator needs real card names (``Archer``, not ``Archers``) and
+    exactly eight distinct cards, otherwise ``Battle`` refuses the deck.
+    Display names are normalised on the way through and the deck is padded
+    from the 16-card policy catalog if it collapsed.
+    """
+    from cr_alphastar_agent.env.crsim_replica_env import ID_TO_CRSIM_NAME
+
+    if spec is None:
+        spec = "current"
+
+    if isinstance(spec, str):
+        key = spec.strip().lower()
+        if key in DECK_PRESETS:
+            spec = list(DECK_PRESETS[key])
+        elif key in ("none", "random"):
+            spec = [ID_TO_CRSIM_NAME[c] for c in sample_random_deck()]
+        else:
+            raise ValueError(
+                f"unknown deck '{spec}'. Known presets: {sorted(DECK_PRESETS)}"
+            )
+
+    raw = list(spec)
+    if raw and all(isinstance(n, int) for n in raw):
+        raw = [ID_TO_CRSIM_NAME.get(int(n), "Knight") for n in raw]
+
+    names: List[str] = []
+    for item in raw:
+        name = DECK_NAME_ALIASES.get(str(item), str(item))
+        if name not in names:
+            names.append(name)
+
+    # Pad to a legal 8-card deck from the policy catalog.
+    for cid in sorted(ID_TO_CRSIM_NAME):
+        if len(names) >= 8:
+            break
+        engine_name = ID_TO_CRSIM_NAME[cid]
+        if engine_name not in names:
+            names.append(engine_name)
+    return names[:8]
+
+
+def resolve_deck_ids(spec) -> List[int]:
+    """Resolve a deck specification to the coarse policy card IDs.
+
+    The v1 policy vocabulary only has 16 IDs, so two different cards can map
+    onto the same ID (Log and Zap, Skeletons and Ice Spirits).  The returned
+    list therefore may be shorter than eight entries - that is a property of
+    the policy vocabulary, not of the deck.  Use ``resolve_deck_names`` when
+    the simulator needs the real cards.
+    """
+    from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID
+
+    names = resolve_deck_names(spec)
+    ids: List[int] = []
+    for name in names:
+        cid = CRSIM_NAME_TO_ID.get(name)
+        if cid is None:
+            continue
+        if cid not in ids:
+            ids.append(int(cid))
+    return ids
+
 
 def sample_random_deck(rng=None) -> List[int]:
     """Uniform 8-card sample without replacement from the distinct policy IDs."""
