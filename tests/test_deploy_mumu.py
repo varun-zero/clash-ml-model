@@ -15,13 +15,97 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from deploy_mumu import (  # noqa: E402
     ADBController,
     BackgroundCapture,
+    ELIXIR_ICON_MAX_X,
+    ELIXIR_PIP_COUNT,
     PerceptionAdapter,
     WindowsMouseController,
+    detect_match_end_result,
     draw_hud,
+    resolve_deck_names,
+    TROPHY_DELTA_LOSS,
+    trophy_delta_for,
     update_artifact_log,
 )
-from cr_alphastar_agent.config import CARDS_CATALOG  # noqa: E402
+from cr_alphastar_agent.config import ARENA_WIDTH, CARDS_CATALOG  # noqa: E402
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Synthetic frame builders
+# ---------------------------------------------------------------------------
+def _magenta_bgr() -> np.ndarray:
+    """Bright magenta (H 150, S 200, V 255) as a BGR pixel."""
+    return cv2.cvtColor(np.uint8([[[150, 200, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+
+
+def _gold_bgr() -> np.ndarray:
+    """Crown gold (H 25, S 220, V 255) as a BGR pixel."""
+    return cv2.cvtColor(np.uint8([[[25, 220, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+
+
+def _pink_bgr() -> np.ndarray:
+    """Opponent ribbon pink (H 175, S 200, V 220) as a BGR pixel."""
+    return cv2.cvtColor(np.uint8([[[175, 200, 220]]]), cv2.COLOR_HSV2BGR)[0, 0]
+
+
+def _blue_bgr() -> np.ndarray:
+    """Player ribbon blue (H 110, S 200, V 220) as a BGR pixel."""
+    return cv2.cvtColor(np.uint8([[[110, 200, 220]]]), cv2.COLOR_HSV2BGR)[0, 0]
+
+
+def make_elixir_frame(pips: int, with_icon: bool = False,
+                      with_counter: str = "") -> np.ndarray:
+    """Build a 900x1600 frame whose elixir bar shows ``pips`` filled pips.
+
+    The empty segments are drawn as a dim purple track - that is what the
+    real game renders for an empty bar (only the segment separators keep a
+    purple tint), and it is what makes an *empty* bar distinguishable from a
+    *hidden* one.
+    """
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    magenta = _magenta_bgr()
+    track = cv2.cvtColor(np.uint8([[[150, 80, 120]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    x0 = int(0.258 * 900)
+    x1 = int(0.955 * 900)
+    y0 = int(0.966 * 1600)
+    y1 = int(0.984 * 1600)
+    frame[y0:y1, x0:x1] = track
+    segment = (x1 - x0) / 10.0
+    for index in range(max(0, min(10, pips))):
+        a = x0 + int(round(index * segment))
+        b = x0 + int(round((index + 1) * segment))
+        frame[y0:y1, a:b] = magenta
+    if with_icon:
+        # The purple drop icon, far to the left of the bar.
+        frame[y0:y1, int(0.08 * 900):int(0.11 * 900)] = magenta
+    if with_counter:
+        # The white elixir counter, drawn on top of the first pips.
+        cv2.putText(frame, with_counter, (int(0.262 * 900), int(0.978 * 1600)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+    return frame
+
+
+def make_end_screen(opponent_crowns: int = 0, player_crowns: int = 0,
+                    with_ribbons: bool = True,
+                    with_ok_button: bool = False) -> np.ndarray:
+    """Build a synthetic Clash Royale post-match end screen."""
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    if with_ribbons:
+        # Opponent (pink) ribbon, y 0.24 .. 0.36
+        frame[int(0.24 * 1600):int(0.36 * 1600), :] = _pink_bgr()
+        # Player (blue) ribbon, y 0.51 .. 0.63
+        frame[int(0.51 * 1600):int(0.63 * 1600), :] = _blue_bgr()
+    gold = _gold_bgr()
+    for index in range(opponent_crowns):
+        x = 120 + index * 200
+        frame[int(0.15 * 1600):int(0.205 * 1600), x:x + 160] = gold
+    for index in range(player_crowns):
+        x = 120 + index * 200
+        frame[int(0.42 * 1600):int(0.48 * 1600), x:x + 160] = gold
+    if with_ok_button:
+        # The blue "OK" button lives at the bottom and is NOT evidence.
+        frame[int(0.879 * 1600):int(0.941 * 1600), 350:550] = _blue_bgr()
+    return frame
 
 
 def make_frame(adapter: PerceptionAdapter) -> np.ndarray:
@@ -205,13 +289,13 @@ def test_perception_detects_buttons_on_synthetic_frames():
     # Create 900x1600 frame
     frame = np.zeros((1600, 900, 3), dtype=np.uint8)
 
-    # 1. Draw yellow button at Home Screen Battle location: (450, 1200), w=200, h=80
-    # Yellow in BGR: B=0, G=200, R=240 -> HSV hue ~25
-    frame[1160:1240, 350:550] = [0, 200, 240]
+    # 1. Draw the yellow Battle button at its real size and position:
+    #    302x168 px, centre (455, 1251).
+    frame[1167:1335, 304:606] = [0, 200, 240]
     btn = adapter.detect_home_battle_button(frame)
     assert btn is not None
-    assert 400 <= btn[0] <= 500
-    assert 1150 <= btn[1] <= 1250
+    assert 400 <= btn[0] <= 510
+    assert 1200 <= btn[1] <= 1300
 
     # 2. Draw blue button at post-match OK location: (450, 1450), w=160, h=60
     # Cyan/blue in BGR: B=240, G=180, R=0 -> HSV hue ~105
@@ -224,19 +308,25 @@ def test_perception_detects_buttons_on_synthetic_frames():
     assert 1400 <= post_btn[2] <= 1500
 
 
-def test_score_match_and_artifact_logging(tmp_path):
+def test_home_battle_button_is_not_confused_with_a_flat_orange_band():
+    """A full-width orange band (Pass Royale reward screen) is not a button."""
     adapter = PerceptionAdapter(device=torch.device("cpu"))
-    # Synthetic frame with a player gold crown in player region (yr ~ 0.45)
     frame = np.zeros((1600, 900, 3), dtype=np.uint8)
-    # Gold in HSV is Hue 15-35, Sat 140-255, Val 140-255. In BGR ~ [0, 200, 240]
-    # Place a 90x55 crown at y=720 (yr = 720/1600 = 0.45)
-    frame[700:755, 400:495] = [0, 215, 255]
+    frame[1120:1360, :] = [0, 170, 230]      # orange band across the screen
+    frame[1200:1260, 300:600] = [255, 255, 255]  # some white text in it
+    assert adapter.detect_home_battle_button(frame) is None
 
-    result, p_crowns, o_crowns, delta = adapter.score_match(frame)
-    assert result == "WIN"
-    assert p_crowns == 1
-    assert o_crowns == 0
-    assert delta == 30
+
+def test_score_match_and_artifact_logging(tmp_path):
+    """The end-screen detector must never guess, and the artifact log must
+    never default a missing result to a win."""
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+
+    # A frame that is *not* the post-match end screen must be UNVERIFIED.
+    blank = np.zeros((1600, 900, 3), dtype=np.uint8)
+    result, p_crowns, o_crowns, delta = adapter.detect_match_end_result(blank)
+    assert result == "UNVERIFIED"
+    assert (p_crowns, o_crowns, delta) == (0, 0, 0)
 
     # Test update_artifact_log
     history = [{
@@ -259,89 +349,398 @@ def test_score_match_and_artifact_logging(tmp_path):
     assert "500" in content
     assert "TestOpponent" in content
 
+    # A history entry without a result must be rendered as UNVERIFIED.
+    update_artifact_log([{"match": 2, "opponent": "NoResult"}],
+                        current_trophies=89, target_trophies=500,
+                        artifact_path=str(artifact_file))
+    content = artifact_file.read_text(encoding="utf-8")
+    assert "UNVERIFIED" in content
+    assert "| **WIN**" not in content
 
-def test_read_elixir_calibrated_bounds():
+
+def test_read_elixir_reads_ten_discrete_pips():
+    """The elixir reader must count filled pips, never a continuous ratio."""
     adapter = PerceptionAdapter(device=torch.device("cpu"))
-    # Verify calibrated bounding box
-    assert adapter.elixir_box == {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
 
-    # 1. Test empty bar on 900x1600 frame -> must return 0.0, no blind fallback
-    frame_empty = np.zeros((1600, 900, 3), dtype=np.uint8)
+    # 1. A *rendered but empty* bar -> 0 pips.
     adapter.current_elixir = 3.5
-    val = adapter.read_elixir(frame_empty)
-    assert val == 0.0
+    assert adapter.read_elixir(make_elixir_frame(0)) == 0.0
     assert adapter.current_elixir == 0.0
 
-    # 2. Test calibrated fill reading (e.g. 50% fill -> 5.0 elixir)
-    frame_half = np.zeros((1600, 900, 3), dtype=np.uint8)
-    ey1 = int(0.965 * 1600)
-    ey2 = int(0.988 * 1600)
-    ex1 = int(0.207 * 900)
-    ex2 = int(0.961 * 900)
-    mid_x = ex1 + (ex2 - ex1) // 2
-    # Fill left half of bar with purple (HSV: ~145, BGR: ~[180, 0, 220])
-    frame_half[ey1:ey2, ex1:mid_x] = [180, 0, 220]
-    val_half = adapter.read_elixir(frame_half)
-    assert 4.8 <= val_half <= 5.2
+    # 2. A frame without any elixir bar (the HUD is hidden) must NOT be
+    #    reported as "0 elixir" - that made the agent play cards it could
+    #    not afford and made the deployment verification believe that the
+    #    elixir had dropped when nothing was played.
+    adapter.current_elixir = 3.5
+    assert adapter.read_elixir(np.zeros((1600, 900, 3), dtype=np.uint8)) == 3.5
+    assert adapter.elixir_visible is False
 
-    # 3. Test full bar fill -> 10.0 elixir
-    frame_full = np.zeros((1600, 900, 3), dtype=np.uint8)
-    frame_full[ey1:ey2, ex1:ex2] = [180, 0, 220]
-    val_full = adapter.read_elixir(frame_full)
-    assert val_full == 10.0
+    # 2. One filled pip -> 1, ten filled pips -> 10.
+    for pips in range(0, 11):
+        frame = make_elixir_frame(pips)
+        value = adapter.read_elixir(frame)
+        assert value == float(pips), (pips, value)
+
+    # 3. The purple drop icon on the far left must never be counted.
+    frame = make_elixir_frame(0, with_icon=True)
+    assert adapter.read_elixir(frame) == 0.0
+    frame = make_elixir_frame(3, with_icon=True)
+    assert adapter.read_elixir(frame) == 3.0
+
+    # 4. The white elixir counter drawn over the first pips must not hide them.
+    frame = make_elixir_frame(10, with_counter="10")
+    assert adapter.read_elixir(frame) == 10.0
+    frame = make_elixir_frame(4, with_counter="4")
+    assert adapter.read_elixir(frame) == 4.0
+
+
+def test_read_elixir_uses_the_calibrated_pip_geometry():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    # The drop icon is excluded, the pip band starts at 0.258.
+    assert adapter.elixir_box["left"] == pytest.approx(0.255)
+    assert adapter.elixir_box["right"] == pytest.approx(0.955)
+    assert adapter.elixir_box["top"] == pytest.approx(0.966)
+    assert adapter.elixir_box["bottom"] == pytest.approx(0.984)
+    assert ELIXIR_ICON_MAX_X == 0.255
+    assert ELIXIR_PIP_COUNT == 10
+
+
+def test_elixir_reader_on_the_real_captured_frame():
+    """Regression test against the real 900x1600 emulator capture."""
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame_path = PROJECT_ROOT / ".tmp" / "diag_live.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    # The reference capture shows a completely filled bar.
+    assert adapter.read_elixir(frame) == 10.0
 
 
 def test_deploy_instant_elixir_deduction_and_cooldown():
     adapter = PerceptionAdapter(device=torch.device("cpu"))
     adapter.current_elixir = 7.0
-    # Card slot 0
     card_name = adapter.tracked_hand[0]
     cid = CRSIM_NAME_TO_ID[card_name]
     cost = CARDS_CATALOG[cid]["cost"]
 
-    # Verify instant elixir deduction logic
-    adapter.current_elixir = max(0.0, adapter.current_elixir - cost)
-    assert adapter.current_elixir == 7.0 - cost
-
-    # Verify update_hand_on_play maintains cycle without double deduction when deduct_elixir=False
+    # A *verified* play deducts the real card cost exactly once and rotates
+    # the hand.
     prev_next = adapter.tracked_next
-    adapter.update_hand_on_play(0, deduct_elixir=False)
+    adapter.update_hand_on_play(0, deduct_elixir=True, card_name=card_name)
     assert adapter.current_elixir == 7.0 - cost
     assert adapter.tracked_hand[0] == prev_next
+    assert card_name in adapter.recent_deployed_cards
 
-    # Verify cooldown masking contract
+    # The live loop deducts the elixir itself, so the rotation must not
+    # deduct it a second time.
+    adapter.current_elixir = 7.0 - cost
+    adapter.update_hand_on_play(1, deduct_elixir=False, card_name=adapter.tracked_hand[1])
+    assert adapter.current_elixir == 7.0 - cost
+
+    # Cooldown masking contract: while the cooldown is active only "Wait"
+    # may be chosen.
     frame = np.zeros((1600, 900, 3), dtype=np.uint8)
     obs = adapter.frame_to_obs(frame)
-    # Simulate cooldown enforcement
     obs["card_mask"][:, :4] = False
     obs["card_mask"][:, 4] = True
     assert obs["card_mask"][0, 4].item() is True
     assert all(obs["card_mask"][0, i].item() is False for i in range(4))
 
 
-def test_hand_resync_after_cooldown(monkeypatch):
+def test_hand_resync_after_cooldown():
+    """The hand must be re-classified after the cooldown - with the real
+    classifier, not a mock."""
     adapter = PerceptionAdapter(device=torch.device("cpu"))
     frame = np.zeros((1600, 900, 3), dtype=np.uint8)
 
-    # When force_refresh=False, read_hand does not invoke classify_hand
-    classify_called = False
-    def mock_classify(f, deck, return_scores=False):
-        nonlocal classify_called
-        classify_called = True
-        return ["Giant", "Musketeer", "MiniPekka", "Fireball"], [0.9, 0.9, 0.9, 0.9]
+    # When force_refresh=False, read_hand does not invoke classify_hand.
+    calls = []
+    original = adapter.classifier.classify_hand
 
-    monkeypatch.setattr(adapter.classifier, "classify_hand", mock_classify)
+    def counting(frame_, candidate_deck=None, return_scores=False, exclude=None):
+        calls.append(exclude)
+        return original(frame_, candidate_deck, return_scores, exclude)
 
-    # Default read_hand(frame) does not call classifier
+    adapter.classifier.classify_hand = counting  # type: ignore[assignment]
+
     hand_ids, next_id = adapter.read_hand(frame, force_refresh=False)
-    assert not classify_called
+    assert not calls
     assert [CRSIM_NAME_TO_ID[c] for c in adapter.tracked_hand] == hand_ids
 
-    # Post-cooldown re-sync with force_refresh=True invokes classifier and updates tracked_hand
-    hand_ids, next_id = adapter.read_hand(frame, force_refresh=True)
-    assert classify_called
-    assert adapter.tracked_hand == ["Giant", "Musketeer", "MiniPekka", "Fireball"]
-    assert hand_ids == [CRSIM_NAME_TO_ID[c] for c in ["Giant", "Musketeer", "MiniPekka", "Fireball"]]
+    # Post-cooldown re-sync with force_refresh=True invokes the classifier.
+    adapter.read_hand(frame, force_refresh=True)
+    assert len(calls) == 1
+    assert len(adapter.tracked_hand) == 4
+    assert len(set(adapter.tracked_hand)) == 4
+    assert set(adapter.tracked_hand) <= set(adapter.active_deck)
+    assert [CRSIM_NAME_TO_ID[c] for c in adapter.tracked_hand] == adapter.read_hand(frame)[0]
+
+
+def test_four_card_cycle_blocks_recently_deployed_cards():
+    """A card that was just played must not be predicted again for 3 plays."""
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+
+    adapter.recent_deployed_cards.append("Arrows")
+    adapter.read_hand(frame, force_refresh=True)
+    assert "Arrows" not in adapter.tracked_hand, adapter.tracked_hand
+
+    # After the card leaves the 3-card window it may be predicted again.
+    adapter.recent_deployed_cards.clear()
+    adapter.read_hand(frame, force_refresh=True)
+    assert len(adapter.tracked_hand) == 4
+
+
+def test_update_hand_on_play_records_the_cycle():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    played = adapter.tracked_hand[0]
+    adapter.update_hand_on_play(0, deduct_elixir=False, card_name=played)
+    assert played in adapter.recent_deployed_cards
+    assert adapter.deployed_card_names == [played]
+
+
+def test_deploy_rejects_when_nothing_happened():
+    """A tap that does not move the elixir and does not empty the slot must
+    be rejected (this is the phantom-deployment guard)."""
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame = make_elixir_frame(5)
+    ok, diagnostics = adapter.verify_deployment(
+        before_frame=frame, after_frame=frame, slot=0,
+        card_name="Knight", elixir_before=5.0,
+    )
+    assert ok is False
+    assert diagnostics["reason"] == "no evidence the card was deployed"
+
+    # A dropped elixir is proof of a deployment.
+    after = make_elixir_frame(3)
+    ok, diagnostics = adapter.verify_deployment(
+        before_frame=frame, after_frame=after, slot=0,
+        card_name="Knight", elixir_before=5.0,
+    )
+    assert ok is True
+    assert diagnostics["reason"] == "elixir dropped"
+
+
+def test_rejected_slot_is_blocked_for_two_ticks():
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    adapter.block_slot(2, ticks=2)
+    assert adapter._tick_blocked_slots() == [2]
+    assert adapter._tick_blocked_slots() == [2]
+    assert adapter._tick_blocked_slots() == []
+    assert 2 not in adapter.blocked_slots
+
+
+def test_detect_match_end_result_uses_the_ground_truth_zones():
+    # 0 - 3 (opponent took three crowns) -> LOSS
+    frame = make_end_screen(opponent_crowns=3)
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "LOSS"
+    assert o_crowns == 3
+    assert p_crowns == 0
+    assert delta == -9  # the model uses the conservative -9
+
+    # 1 - 0 player win -> WIN
+    frame = make_end_screen(player_crowns=1)
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "WIN"
+    assert p_crowns == 1
+    assert delta == 30
+
+    # 3 - 1 player win -> WIN (both sides can carry crowns, the higher score won)
+    frame = make_end_screen(player_crowns=3, opponent_crowns=1)
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "WIN", f"{result} {p_crowns}-{o_crowns}"
+    assert p_crowns == 3 and o_crowns == 1
+
+    # 1 - 1 -> genuinely ambiguous, never guessed.
+    frame = make_end_screen(opponent_crowns=1, player_crowns=1)
+    result, _, _, _ = detect_match_end_result(frame)
+    assert result == "UNVERIFIED"
+
+    # Ambiguous frame -> UNVERIFIED, never WIN.
+    frame = make_end_screen(opponent_crowns=0, player_crowns=0)
+    result, _, _, _ = detect_match_end_result(frame)
+    assert result == "UNVERIFIED"
+
+    # The bottom blue "OK" button alone must never be taken as evidence.
+    frame = make_end_screen(opponent_crowns=0, player_crowns=0,
+                            with_ribbons=False, with_ok_button=True)
+    result, _, _, _ = detect_match_end_result(frame)
+    assert result == "UNVERIFIED"
+
+    # A completely blank frame must never be a win.
+    result, _, _, _ = detect_match_end_result(np.zeros((1600, 900, 3), dtype=np.uint8))
+    assert result == "UNVERIFIED"
+
+
+def test_detect_match_end_result_on_the_real_captured_loss_screen():
+    frame_path = PROJECT_ROOT / ".tmp" / "diag_live2.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "LOSS"
+    assert p_crowns == 0
+    assert o_crowns >= 1
+
+
+def test_detect_match_end_result_on_the_real_two_crown_loss_screen():
+    """Real end screen: the opponent took two crowns (the ribbon shows -11)."""
+    frame_path = PROJECT_ROOT / ".tmp" / "endscreen_loss_2crowns.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "LOSS"
+    assert p_crowns == 0
+    assert o_crowns == 2
+    assert delta == TROPHY_DELTA_LOSS  # model value, reconciled by hand
+
+
+def test_classifier_identifies_a_real_in_battle_hand():
+    """Regression test on a real 900x1600 in-battle frame.
+
+    The hand in the reference frame is Knight / Musketeer / Giant / Arrows
+    with Archers as the next card.
+    """
+    frame_path = PROJECT_ROOT / ".tmp" / "inbattle_reference.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    adapter = PerceptionAdapter(device=torch.device("cpu"),
+                                 deck=resolve_deck_names("current"))
+
+    adapter.read_hand(frame, force_refresh=True)
+    assert adapter.tracked_hand == ["Knight", "Musketeer", "Giant", "Arrows"]
+    assert adapter.tracked_next == "Archers"
+
+    # The resting template correlation of a correctly identified card is
+    # 0.37 - 0.60 with the shipped deck-screen templates.  The deployment
+    # verification therefore relies on a *relative* drop, not an absolute
+    # 0.80 threshold.
+    for slot, card in enumerate(adapter.tracked_hand):
+        assert adapter.slot_correlation(frame, slot, card) >= 0.30, card
+
+
+def test_is_in_battle_survives_a_hidden_hud():
+    """The elixir bar can be replaced by the red "No card selected" hint.
+
+    A live capture showed the whole HUD (card tray *and* elixir bar)
+    disappearing for several seconds while the arena was still running.
+    The agent must not mistake that for "the match ended".
+    """
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+
+    # Real arena frame with the elixir bar replaced by the red
+    # "No card selected" hint (extracted from the recorded match video).
+    for name in ("vid7c/f120.png", "vid7c/f126.png"):
+        path = PROJECT_ROOT / ".tmp" / name
+        if path.exists():
+            assert adapter.is_in_battle(cv2.imread(str(path))) is True, name
+
+    # The sand arena and the green arena are both battles.
+    for name in ("inbattle_reference.png", "diag_live.png", "live_battle.png"):
+        path = PROJECT_ROOT / ".tmp" / name
+        if path.exists():
+            assert adapter.is_in_battle(cv2.imread(str(path))) is True, name
+
+    # Screens that are definitely not a battle.
+    for name in ("post_match_home.png", "endscreen_win_2crowns_ot.png",
+                 "battle_log_live.png", "m22_mid.png"):
+        path = PROJECT_ROOT / ".tmp" / name
+        if path.exists():
+            assert adapter.is_in_battle(cv2.imread(str(path))) is False, name
+
+
+def test_is_in_battle_rejects_the_pass_royale_reward_screen():
+    """An orange reward band is not an arena."""
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame = np.zeros((1600, 900, 3), dtype=np.uint8)
+    frame[100:1200, :] = [0, 170, 230]   # saturated orange everywhere
+    assert adapter.is_in_battle(frame) is False
+
+
+def test_is_in_battle_rejects_the_bone_pit_screen():
+    """The Pass Royale "Bone Pit" arena graphic is NOT a live battle.
+
+    Using the arena floor as a battle marker made the agent tap "Battle"
+    on this screen and start a match that never began.
+    """
+    adapter = PerceptionAdapter(device=torch.device("cpu"))
+    frame_path = PROJECT_ROOT / ".tmp" / "vid8" / "f003.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    assert adapter.is_in_battle(frame) is False
+    assert adapter.detect_home_battle_button(frame) is None
+
+
+def test_detect_match_end_result_on_the_real_three_crown_win_screen():
+    """Real end screen of a 3-0 win, including the reward chest popup.
+
+    The reward chest is a big gold box right below the player ribbon - it
+    must not be counted as a fourth crown.
+    """
+    frame_path = PROJECT_ROOT / ".tmp" / "endscreen_win_3crowns.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "WIN"
+    assert p_crowns == 3
+    assert o_crowns == 0
+
+
+def test_detect_match_end_result_on_the_real_win_screen():
+    """Real end screen after a live match: the player won 1-0 (+31).
+
+    The post-match screen does NOT have a fixed vertical layout - on a WIN
+    the ribbons sit much lower than on a LOSS - so this is the regression
+    test for the layout-independent detector.
+    """
+    frame_path = PROJECT_ROOT / ".tmp" / "endscreen_win_1crown.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "WIN"
+    assert p_crowns == 1
+    assert o_crowns == 0
+
+
+def test_detect_match_end_result_is_layout_independent():
+    """The same content at a different vertical offset must read the same."""
+    frame = make_end_screen(player_crowns=1)
+    shifted = np.zeros_like(frame)
+    shifted[200:] = frame[:frame.shape[0] - 200]
+    assert detect_match_end_result(frame)[0] == "WIN"
+    assert detect_match_end_result(shifted)[0] == "WIN"
+
+
+def test_detect_match_end_result_on_the_real_overtime_win_screen():
+    """Real end screen after a live overtime match: the player won 2-1.
+
+    On this screen the player's two crowns sit exactly *between* the two
+    ribbons, so the crown has to be assigned by the midpoint of the gap
+    between the ribbons, not by proximity.
+    """
+    frame_path = PROJECT_ROOT / ".tmp" / "endscreen_win_2crowns_ot.png"
+    if not frame_path.exists():
+        pytest.skip("no real emulator capture available")
+    frame = cv2.imread(str(frame_path))
+    result, p_crowns, o_crowns, delta = detect_match_end_result(frame)
+    assert result == "WIN"
+    assert p_crowns == 2
+    assert o_crowns == 1
+
+
+def test_trophy_delta_matches_the_observed_end_screens():
+    assert trophy_delta_for("WIN", 3, 1) == 30
+    assert trophy_delta_for("WIN", 1, 0) == 30
+    assert trophy_delta_for("LOSS", 0, 1) == -9
+    assert trophy_delta_for("LOSS", 0, 2) == -9
+    assert trophy_delta_for("LOSS", 0, 3) == -9
+    assert trophy_delta_for("UNVERIFIED", 0, 0) == 0
 
 
 def test_calibrate_game_column_preserves_calibrated_coordinates():
@@ -350,18 +749,19 @@ def test_calibrate_game_column_preserves_calibrated_coordinates():
     portrait_frame = np.zeros((1600, 900, 3), dtype=np.uint8)
     adapter.calibrate_game_column(portrait_frame)
 
-    assert adapter.hand_xs == [0.305, 0.500, 0.695, 0.890]
-    assert adapter.elixir_box["top"] == 0.965
-    assert adapter.elixir_box["bottom"] == 0.988
-    assert abs(adapter.elixir_box["left"] - 0.207) < 1e-4
-    assert abs(adapter.elixir_box["right"] - 0.961) < 1e-4
+    assert adapter.hand_xs == [0.312, 0.494, 0.680, 0.864]
+    assert adapter.elixir_box["top"] == pytest.approx(0.966)
+    assert adapter.elixir_box["bottom"] == pytest.approx(0.984)
+    # The drop icon is excluded from the elixir crop.
+    assert adapter.elixir_box["left"] == pytest.approx(0.255)
+    assert adapter.elixir_box["right"] == pytest.approx(0.955)
 
     # Widescreen frame (1920x1080)
     widescreen_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
     adapter.calibrate_game_column(widescreen_frame)
 
-    assert adapter.elixir_box["top"] == 0.965
-    assert adapter.elixir_box["bottom"] == 0.988
+    assert adapter.elixir_box["top"] == pytest.approx(0.966)
+    assert adapter.elixir_box["bottom"] == pytest.approx(0.984)
     assert adapter.hand_xs[0] > 0.30  # scaled into pillar
     assert adapter.elixir_box["left"] > 0.20  # scaled into pillar
 

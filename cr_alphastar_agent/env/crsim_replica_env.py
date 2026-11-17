@@ -27,6 +27,7 @@ from cr_alphastar_agent.config import (
     SPELL_SAFE_MASK, ELIXIR_LEAK_WEIGHT
 )
 from cr_alphastar_agent.env.opponent_elixir import OpponentElixirTracker
+from cr_alphastar_agent.env.tactical_masks import EnemyUnit, build_tactical_masks
 from cr_alphastar_agent.env.tactics import (
     SUPPORT_CARD_IDS,
     UnitView,
@@ -491,85 +492,59 @@ class CrSimReplicaEnv:
 
         grid[5] = deploy_mask.astype(np.float32)
 
-        # 5. Card and placement masks. The hand remains four distinct slots;
-        # placement legality comes from the simulator for each card.
-        card_mask = np.zeros(5, dtype=bool)
-        card_tiles = np.zeros((5, TOTAL_TILES), dtype=bool)
+        # 5. Card and placement masks.
+        #
+        # The mask rules live in ``cr_alphastar_agent.env.tactical_masks`` so
+        # that the simulator and the live MuMu bridge cannot drift apart.
+        # Here we only add the *engine* legality (the simulator knows which
+        # tiles a card may actually be dropped on).
         persp = perspective(team)
-        active_enemies = [u for u in b.units if not isinstance(u, CrTower) and u.team != team and u.hp > 0]
-        threats_our_half = [u for u in active_enemies if persp.is_own_half(u.y if player_id == 1 else 32.0 - u.y)]
-        
-        for slot in range(4):
-            if slot < len(b.hand[team]):
-                cname = b.hand[team][slot]
-                cid = CRSIM_NAME_TO_ID.get(cname, 1)
-                for tile in range(TOTAL_TILES):
-                    cx, cy = tile % ARENA_WIDTH, tile // ARENA_WIDTH   # canonical
-                    ex, ey = (cx, cy) if player_id == 1 else (cx, ARENA_HEIGHT - 1 - cy)
-                    if not b.legal_action(team, slot, float(ex), float(ey)):
-                        continue
-                    if cid == 11:  # HogRider: strictly Left and Right bridges (never own lane defense)
-                        if not (cy == 14 and (2 <= cx <= 4 or 13 <= cx <= 15)):
-                            continue
-                    if is_spell(cid):
-                        # UNCONDITIONALLY forbid all spells on tile_y <= 11 (ZERO EXCEPTIONS)
-                        if cy <= 11:
-                            continue
-                        if touches_enemy_king(float(cx), float(cy), team):
-                            continue
-                        # Strictly restricted to 2-tile radius around enemy units (lead_y = max(12, enemy_y - 1))
-                        in_spell_radius = False
-                        for u in active_enemies:
-                            uy = u.y if player_id == 1 else 32.0 - u.y
-                            ux = u.x if player_id == 1 else u.x
-                            if uy >= 11.5:
-                                lead_y = max(12, int(round(uy)) - 1)
-                                target_x = int(round(ux))
-                                if abs(cx - target_x) <= 2 and abs(cy - lead_y) <= 2:
-                                    in_spell_radius = True
-                                    break
-                        if not in_spell_radius:
-                            continue
-                    elif len(threats_our_half) > 0 and cid not in (13,):
-                        # Troop defenders deploy directly in the SAME LANE as the threat
-                        primary_ex = threats_our_half[0].x if player_id == 1 else threats_our_half[0].x
-                        lane_min_x = int(max(1, primary_ex - 2))
-                        lane_max_x = int(min(16, primary_ex + 2))
-                        if not (8 <= cy <= 12 and lane_min_x <= cx <= lane_max_x):
-                            continue
-                    card_tiles[slot, tile] = True
-                card_mask[slot] = bool(card_tiles[slot].any())
-                
-                # Gate spell slots: require >= 1 enemy units at tile_y >= 12
-                if is_spell(cid):
-                    enemies_target_zone = [
-                        u for u in active_enemies
-                        if (u.y if player_id == 1 else 32.0 - u.y) >= 12.0
-                    ]
-                    if len(enemies_target_zone) == 0:
-                        card_mask[slot] = False
+        active_enemies = [
+            u for u in b.units
+            if not isinstance(u, CrTower) and u.team != team and u.hp > 0
+        ]
 
-        # Win-condition defense guard: If under threat on our half, never waste building-targeters
-        # (Giant, HogRider) if an affordable defensive card is present in hand
-        if len(threats_our_half) > 0:
-            has_affordable_defense = any(
-                card_mask[s] and CRSIM_NAME_TO_ID.get(b.hand[team][s], 1) in DEFENSIVE_CARD_IDS
-                for s in range(min(4, len(b.hand[team])))
+        enemy_views = [
+            EnemyUnit(
+                card_id=UNIT_NAME_TO_CARD_ID.get(u.name, 1),
+                x=float(u.x),
+                y=float(u.y if player_id == 1 else ARENA_HEIGHT - 1 - u.y),
+                hp=float(u.hp),
+                is_air=bool(getattr(u, "flying", False)),
             )
-            if has_affordable_defense:
-                for s in range(min(4, len(b.hand[team]))):
-                    if CRSIM_NAME_TO_ID.get(b.hand[team][s], 1) in WIN_CONDITION_IDS:
-                        card_mask[s] = False
+            for u in active_enemies
+        ]
 
-        # Low-Elixir Idle Gate: When elixir < 7.5 and 0 enemy units on arena, bank elixir
+        hand_ids = [
+            CRSIM_NAME_TO_ID.get(b.hand[team][s], 1)
+            for s in range(min(4, len(b.hand[team])))
+        ]
+
+        # Engine legality per hand slot (canonical tile indices).
+        legal_per_slot = []
+        for slot in range(4):
+            legal = np.zeros(TOTAL_TILES, dtype=bool)
+            if slot < len(b.hand[team]):
+                for tile in range(TOTAL_TILES):
+                    cx, cy = tile % ARENA_WIDTH, tile // ARENA_WIDTH
+                    ex, ey = (cx, cy) if player_id == 1 else (cx, ARENA_HEIGHT - 1 - cy)
+                    if b.legal_action(team, slot, float(ex), float(ey)):
+                        legal[tile] = True
+            legal_per_slot.append(legal)
+
         own_elixir = float(b.elixir[team])
-        if own_elixir < 7.5 and len(active_enemies) == 0:
-            card_mask[:4] = False
+        bundle = build_tactical_masks(
+            hand_ids,
+            own_elixir,
+            enemy_views,
+            legal_tiles=legal_per_slot,
+            enemy_king=persp.enemy_king,
+        )
 
-        card_mask[4] = True  # No-Op / Wait is always legal
-        card_tiles[4] = True
+        card_mask = bundle.card_mask
+        card_tiles = bundle.card_tile_mask
         # Keep legacy tile_mask as union; network uses per-card mask when present.
-        tile_mask = card_tiles[:4].any(axis=0)
+        tile_mask = bundle.tile_mask
 
         return {
             "scalars": scalars,

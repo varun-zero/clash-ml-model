@@ -36,11 +36,37 @@ import struct
 import subprocess
 import sys
 import time
+from collections import deque
 from ctypes import wintypes
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+
+
+def _force_utf8_stdio() -> None:
+    """Make the console UTF-8 so emoji in log lines cannot kill the bridge.
+
+    On a default Windows console the stdout encoding is ``cp1252``.  A single
+    emoji (``⚔``, ``🎥``, ``🏁``) inside a ``print`` raised
+    ``UnicodeEncodeError`` and killed the whole live bridge *in the middle of
+    a match*.  It also silently disabled the match video recorder, because the
+    recorder prints its status line before it starts recording.
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                setattr(sys, stream_name, stream.buffer)
+            except Exception:
+                pass
+
+
+_force_utf8_stdio()
 
 try:
     import win32gui
@@ -56,18 +82,133 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from cr_alphastar_agent.config import (
-    ARENA_WIDTH, ARENA_HEIGHT, TOTAL_TILES, MAX_ENTITIES, D_MODEL,
-    ENTITY_FEATURES, SPATIAL_CHANNELS, NUM_CARDS, SPELL_CARD_IDS,
-    WIN_CONDITION_IDS, DEFENSIVE_CARD_IDS,
+    ARENA_WIDTH, ARENA_HEIGHT, MAX_ENTITIES, D_MODEL,
+    ENTITY_FEATURES, SPATIAL_CHANNELS, NUM_CARDS, WIN_CONDITION_IDS,
     CARDS_CATALOG, DEFAULT_DECK, POPULAR_DECKS, get_hardware_profile,
     CURRENT_DECK, DECK_PRESETS, resolve_deck_ids
 )
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID, ID_TO_CRSIM_NAME
 from cr_alphastar_agent.env.live_recorder import LiveMatchRecorder
+from cr_alphastar_agent.env.tactical_masks import (
+    ELIXIR_BANK_THRESHOLD,
+    EnemyUnit,
+    build_tactical_masks,
+)
 from cr_alphastar_agent.utils.card_classifier import VisualCardClassifier
 
 STARTER_DECK = ["Knight", "Archers", "Minions", "Arrows", "Fireball", "Giant", "Musketeer", "Mini PEKKA"]
+
+# ---------------------------------------------------------------------------
+# Elixir bar geometry.
+#
+# Calibrated against a real 900x1600 MuMu frame (`.tmp/diag_live.png`):
+#
+#   * the purple drop icon lives at x 0.080..0.263 and is NEVER elixir,
+#   * the ten discrete pips of the bar live at x 0.274..0.966,
+#   * the bar itself occupies y 0.965..0.987.
+#
+# The old reader cropped x >= 0.207, i.e. it included the drop icon and the
+# elixir counter, so it systematically over-reported the elixir and the bot
+# happily tapped cards it could not afford.
+# ---------------------------------------------------------------------------
+ELIXIR_ICON_MAX_X = 0.255        # anything left of this is icon/counter
+ELIXIR_PIP_X0 = 0.258             # first pip scan column
+ELIXIR_PIP_X1 = 0.955             # last pip scan column
+ELIXIR_PIP_Y0 = 0.966             # pip band top
+ELIXIR_PIP_Y1 = 0.984             # pip band bottom
+ELIXIR_PIP_COUNT = 10             # Clash Royale has exactly ten elixir pips
+ELIXIR_PIP_FILLED_RATIO = 0.45    # a pip is filled above this magenta ratio
+
+# ---------------------------------------------------------------------------
+# Post-match end-screen geometry (900x1600 reference frame).
+#
+# The Clash Royale post-match screen renders:
+#
+#   y 0.094..0.125  "Winner!" banner
+#   y 0.151..0.206  the winner's gold crown
+#   y 0.188..0.334  the opponent (pink) ribbon
+#   y 0.490..0.627  the player  (blue) ribbon
+#   y 0.879..0.941  the blue "OK" button  <-- MUST NOT be used as evidence
+#
+# The gold crown always sits directly above the *winner's* ribbon, so its
+# vertical position is the ground truth for who won.
+# ---------------------------------------------------------------------------
+END_OPP_RIBBON_Y = (0.14, 0.23)      # winner-crown indicator, opponent side
+END_OPP_CROWN_Y = (0.24, 0.36)       # opponent ribbon
+END_PLAYER_RIBBON_Y = (0.41, 0.51)   # winner-crown indicator, player side
+END_PLAYER_CROWN_Y = (0.51, 0.63)    # player ribbon
+#
+# NOTE: the post-match screen does NOT have a fixed vertical layout.  The
+# winner's side is rendered at the top and the loser's at the bottom, and the
+# two halves have different heights depending on how many towers were
+# destroyed.  Measured on three real 900x1600 end screens:
+#
+#   LOSS screen   opponent ribbon 0.188..0.334   player ribbon 0.490..0.627
+#                 winner crowns    0.151..0.231   (over the opponent's beds)
+#   WIN screen    opponent ribbon 0.419..0.488   player ribbon 0.694..0.750
+#                 winner crowns    0.569..0.663   (over the player's beds)
+#
+# The blue "OK" button lives at y 0.879..0.941 and is deliberately **never**
+# used as evidence - it is a UI control, not a result.  The detector therefore
+# works *relative to the ribbons it finds* instead of against absolute bands.
+RIBBON_MIN_COVERAGE = 0.55   # a ribbon spans the width; the OK button only ~22 %
+RIBBON_MIN_HEIGHT = 0.03     # the real banners are 0.04..0.15 tall; the thin
+                              # colour stripes of the home screen are < 0.01
+CROWN_MIN_WIDTH = 50         # a crown icon is 178x87 px on a 900x1600 frame
+CROWN_MIN_HEIGHT = 35
+CROWN_MAX_ASPECT = 3.0        # the crown icon is ~2.1 wide; a reward chest
+CROWN_MIN_ASPECT = 1.4        # (190x220) or a gold pile is not a crown
+CROWN_RIBBON_BAND = 0.13     # how far above/below a ribbon a crown may sit
+
+#: Neutral screen coordinate that is neither a hand slot nor an arena tile.
+#: Tapping it first guarantees a previously "lifted" card gets deselected.
+DEAD_ZONE_PX = (140, 1585)
+
+#: Physical clamp for deployment targets (canonical tile indices).
+DEPLOY_TILE_X_RANGE = (1, 16)
+DEPLOY_TILE_Y_RANGE = (1, 28)
+
+#: A deployment only counts when the hand slot template correlation drops
+#: below this value (the card really left the slot).
+DEPLOY_SLOT_CORRELATION_MAX = 0.80
+#: ... or when the correlation dropped by at least this much.
+#:
+#: The absolute threshold above is *never* reached with the shipped card
+#: templates: they were cut from the deck screen, while the live hand tray
+#: shows the same art at a different scale.  Measured on a real in-battle
+#: frame the resting correlation of a correctly identified card is 0.37 - 0.60.
+#: The absolute rule therefore has to be complemented by a *relative* drop,
+#: which is what actually proves that the card left the slot.
+DEPLOY_SLOT_CORRELATION_DROP_MIN = 0.15
+#: ... or when the elixir dropped by at least this much.
+DEPLOY_ELIXIR_DROP_MIN = 1.0
+#: How long to wait before capturing the verification frame.
+DEPLOY_VERIFY_DELAY_S = 0.55
+#: How many decision ticks a rejected slot stays blocked.
+REJECTED_SLOT_BLOCK_TICKS = 2
+#: Seconds after tapping "Battle" during which the autopilot must not blind-tap
+#: anything: the matchmaking screen is showing and the arena may appear at any
+#: moment.  Blind taps during this window cancelled matchmaking and, worse,
+#: landed in the middle of the arena.
+MATCHMAKING_GRACE_S = 25.0
+#: After this many seconds without ever seeing the Home screen the agent
+#: assumes it is stuck in a menu and presses BACK to get out.
+STUCK_SCREEN_S = 45.0
+#: After this many seconds on a non-home screen the game is relaunched (it
+#: may have been closed by a stray BACK press).
+RELAUNCH_AFTER_S = 90.0
+#: How long the arena may stay "not in battle" before the agent gives up on
+#: the match.  The elixir bar can be hidden for tens of seconds ("No card
+#: selected" hint, tower-destruction cinematics, overtime camera pull-back).
+#: The match should end because the OK button or the end screen appears, not
+#: because a HUD element vanished - so this is only a last-resort guard.
+MATCH_OVER_TIMEOUT_S = 120.0
+#: After the match is declared over, poll for the real post-match summary
+#: (pink/blue ribbons) for this many ticks before giving up.  The game first
+#: shows a short celebration frame which has no ribbons.
+END_SCREEN_WAIT_TICKS = 30
+END_SCREEN_POLL_S = 0.5
 
 
 def resolve_deck_names(spec) -> list:
@@ -144,45 +285,90 @@ def _run_adb(args: List[str], timeout: float = 8.0, text: bool = True):
 
 
 def list_adb_devices() -> List[str]:
+    """Serial of every device that is currently *online* (not offline)."""
+    return [serial for serial, state in list_adb_devices_with_state() if state == "device"]
+
+
+def list_adb_devices_with_state() -> List[Tuple[str, str]]:
+    """``(serial, state)`` for every device the adb server knows about."""
     try:
         output = _run_adb(["devices"], timeout=5).stdout or ""
     except Exception:
         return []
 
-    devices: List[str] = []
+    devices: List[Tuple[str, str]] = []
     for line in output.splitlines():
         line = line.strip()
         if not line or line.startswith("List of devices") or line.startswith("*"):
             continue
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "device":
-            devices.append(parts[0])
+        if len(parts) >= 2:
+            devices.append((parts[0], parts[1]))
     return devices
 
 
+def _adb_device_responds(serial: str) -> bool:
+    """Does the device actually answer a trivial command?"""
+    try:
+        result = _run_adb(["-s", serial, "shell", "echo", "clashbot_ok"], timeout=6)
+        return result.returncode == 0 and "clashbot_ok" in (result.stdout or "")
+    except Exception:
+        return False
+
+
+def _adb_connect(target: str) -> bool:
+    try:
+        result = _run_adb(["connect", target], timeout=6)
+        return "connected" in (result.stdout or "").lower()
+    except Exception:
+        return False
+
+
 def find_adb_serial(preferred: Optional[str] = None) -> Optional[str]:
-    """Find a live adb device, connecting to MuMu Player / BlueStacks ports if needed."""
+    """Find a live, *responsive* adb device.
+
+    MuMu Player exposes the same guest on several transports.  Their
+    robustness differs a lot:
+
+    * ``emulator-XXXX`` is the emulator console transport.  It is owned by
+      the emulator, so it survives an adb-server restart.
+    * ``127.0.0.1:16384`` is a plain TCP connection.  It is silently dropped
+      every time the adb server restarts, which used to kill the bridge
+      mid-match ("[ADB] Shell pipe disconnected" in a loop).
+
+    The console transport is therefore preferred, and every candidate is
+    probed with a real command before it is accepted.
+    """
+    candidates: List[str] = []
     if preferred:
-        return preferred
+        candidates.append(preferred)
 
-    devices = list_adb_devices()
-    for target in KNOWN_ADB_TARGETS:
-        if target in devices:
+    known = list_adb_devices_with_state()
+    # Console transports first - they are the resilient ones.
+    candidates.extend(serial for serial, _ in known if serial.startswith("emulator-"))
+    candidates.extend(target for target in KNOWN_ADB_TARGETS if target not in candidates)
+    candidates.extend(serial for serial, _ in known if serial not in candidates)
+
+    for target in candidates:
+        if ":" in target and not target.startswith("emulator-"):
+            # TCP transport: make sure it is connected.
+            if not _adb_connect(target):
+                continue
+        if _adb_device_responds(target):
             return target
-    if devices:
-        return devices[0]
 
-    for target in KNOWN_ADB_TARGETS:
-        try:
-            _run_adb(["connect", target], timeout=3)
-        except Exception:
-            pass
+    # Last resort: any device that at least claims to be online.
+    for serial, state in known:
+        if state == "device":
+            return serial
+    return None
 
-    devices = list_adb_devices()
-    for target in KNOWN_ADB_TARGETS:
-        if target in devices:
-            return target
-    return devices[0] if devices else None
+
+def ensure_adb_device(serial: Optional[str]) -> Optional[str]:
+    """Re-resolve a working serial, reconnecting the TCP transport if needed."""
+    if serial and _adb_device_responds(serial):
+        return serial
+    return find_adb_serial(serial)
 
 
 def _window_exe_name(hwnd: int) -> str:
@@ -380,7 +566,27 @@ class BackgroundCapture:
             if not self.serial:
                 return None
 
-        base = [_adb_path(), "-s", self.serial]
+        frame = self._screencap_via_adb(self.serial, raw)
+        if frame is not None:
+            self._adb_error_logged = False
+            return frame
+
+        # The transport may have gone away (an adb-server restart drops the
+        # TCP connection).  Re-resolve a responsive device and try once more.
+        now = time.time()
+        if now - self._last_adb_probe >= 2.0:
+            self._last_adb_probe = now
+            resolved = ensure_adb_device(self.serial)
+            if resolved and resolved != self.serial:
+                self.serial = resolved
+                frame = self._screencap_via_adb(self.serial, raw)
+                if frame is not None:
+                    self._adb_error_logged = False
+                    return frame
+        return None
+
+    def _screencap_via_adb(self, serial: str, raw: bool) -> Optional[np.ndarray]:
+        base = [_adb_path(), "-s", serial]
         try:
             if raw:
                 result = subprocess.run(
@@ -391,7 +597,6 @@ class BackgroundCapture:
                 )
                 frame = self._decode_raw_screencap(result.stdout)
                 if frame is not None:
-                    self._adb_error_logged = False
                     return frame
 
             result = subprocess.run(
@@ -403,7 +608,6 @@ class BackgroundCapture:
             if result.returncode == 0 and result.stdout:
                 frame = cv2.imdecode(np.frombuffer(result.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is not None and frame.size > 0:
-                    self._adb_error_logged = False
                     return frame
         except Exception as exc:
             if not self._adb_error_logged:
@@ -474,6 +678,14 @@ class BackgroundCapture:
         gdi32.CreateCompatibleDC.restype = ctypes.c_void_p
         gdi32.CreateCompatibleBitmap.restype = ctypes.c_void_p
         gdi32.SelectObject.restype = ctypes.c_void_p
+        # Without explicit argtypes ctypes passes Python ints as a 32-bit
+        # C int.  A GDI device context handle does not fit into 32 bits, so
+        # ``CreateCompatibleBitmap(hdc, ...)`` raised
+        # "OverflowError: int too long to convert" and the PrintWindow
+        # fallback never worked at all.
+        user32.GetDC.argtypes = [wintypes.HWND]
+        gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+        gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
         gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
         gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
@@ -570,11 +782,18 @@ class PerceptionAdapter:
         # Arena layout normalization ratios (based on Clash Royale vertical phone layout)
         # Arena bounds (top, bottom, left, right in normalized 0.0 - 1.0 coords)
         self.arena_box = {"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97}
-        # Hand slots (calibrated centers for Clash Royale hand tray)
+        # Hand slots (calibrated centers for Clash Royale hand tray).
+        #
+        # Measured on a real 900x1600 in-battle frame: the four cards span
+        # x 207..850 with a ~148 px card width and a ~165 px pitch, i.e.
+        # centers at x = 281, 445, 612, 778.
         self.hand_box_y = 0.888
-        self.hand_xs = [0.305, 0.500, 0.695, 0.890]
-        # Elixir bar region
-        self.elixir_box = {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
+        self.hand_xs = [0.312, 0.494, 0.680, 0.864]
+
+        # Elixir bar region.  Only the *pip* area is meaningful; the drop icon
+        # that sits to the left of it is excluded by ELIXIR_ICON_MAX_X.
+        self.elixir_box = {"top": ELIXIR_PIP_Y0, "bottom": ELIXIR_PIP_Y1,
+                           "left": ELIXIR_ICON_MAX_X, "right": ELIXIR_PIP_X1}
 
         # Tracked internal game state
         self.tracked_hand = list(self.active_deck[:4])
@@ -584,65 +803,199 @@ class PerceptionAdapter:
         self.last_card_play_time = 0.0
         self.classifier = VisualCardClassifier(active_deck=self.active_deck)
         self.last_hand_scores = [1.0, 1.0, 1.0, 1.0]
+        #: Is the elixir bar currently rendered?  Clash Royale hides the
+        #: whole HUD for seconds at a time; an invisible bar must never be
+        #: reported as "0 elixir".
+        self.elixir_visible = True
 
+        # 4-card cycle bookkeeping.  A card that was just played must not be
+        # predicted in hand again for the next three plays, so we remember the
+        # last three deployed cards and re-rank the classifier around them.
+        self.recent_deployed_cards: deque = deque(maxlen=3)
+        self.deployed_card_names: List[str] = []
+        # slot index -> number of decision ticks it stays blocked
+        self.blocked_slots: Dict[int, int] = {}
+
+    # ------------------------------------------------------------------
+    # Elixir
+    # ------------------------------------------------------------------
     def read_elixir(self, frame: np.ndarray) -> float:
-        """
-        Estimates elixir by cropping the bottom purple bar and computing fill ratio.
-        Clash Royale Elixir Bar features a distinct magenta/purple hue (HSV: ~135-165).
-        """
-        h, w, _ = frame.shape
-        ey1 = int(self.elixir_box["top"] * h)
-        ey2 = int(self.elixir_box["bottom"] * h)
-        ex1 = int(self.elixir_box["left"] * w)
-        ex2 = int(self.elixir_box["right"] * w)
+        """Read the elixir count as a number of filled pips (0 .. 10).
 
-        crop = frame[ey1:ey2, ex1:ex2]
+        The Clash Royale elixir bar is a row of ten discrete segments.  The
+        old implementation cropped the whole bar including the purple drop
+        icon and the white elixir counter that the game draws on top of the
+        first pips, and then estimated a continuous fill ratio.  That
+        systematically over-reported the elixir (the icon is always "full"),
+        which is how the bot ended up tapping cards it could not afford.
+
+        This reader:
+          * ignores everything left of ``ELIXIR_ICON_MAX_X`` (drop icon),
+          * splits the bar into ten equal pip segments,
+          * counts a pip as filled when at least 45 % of its pixels are bright
+            magenta (H 132..172, S >= 110, V >= 155),
+          * ignores the white counter glyphs so they cannot masquerade as an
+            empty pip,
+          * scans strictly left to right and stops at the first empty pip
+            (elixir always fills from the left).
+        """
+        if frame is None or frame.size == 0:
+            return self.current_elixir
+
+        h, w = frame.shape[:2]
+        x1 = int(ELIXIR_PIP_X0 * w)
+        x2 = int(ELIXIR_PIP_X1 * w)
+        y1 = int(ELIXIR_PIP_Y0 * h)
+        y2 = int(ELIXIR_PIP_Y1 * h)
+        if x2 <= x1 or y2 <= y1:
+            return self.current_elixir
+
+        crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
-            return 5.0
+            return self.current_elixir
 
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # Purple/magenta mask in HSV: Hue 130-170, Sat 60-255, Val 60-255
-        purple_mask = cv2.inRange(hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        magenta = (hue >= 132) & (hue <= 172) & (sat >= 110) & (val >= 155)
+        # The elixir counter ("7", "10", ...) is drawn in white on top of the
+        # first pips.  Those pixels carry no elixir information at all.
+        glyph = (sat <= 70) & (val >= 190)
 
-        # Column-wise fill: find farthest right column with purple pixels
-        col_sums = np.sum(purple_mask > 0, axis=0)
-        filled_cols = np.where(col_sums > (crop.shape[0] * 0.3))[0]
+        # Is the bar actually rendered?  Clash Royale hides the whole HUD
+        # for several seconds at a time.  Reporting "0 elixir" for a hidden
+        # bar is worse than useless: it makes the agent play cards it cannot
+        # afford ("Not enough Elixir!") and it makes the deployment
+        # verification believe the elixir "dropped" when nothing was played.
+        loose = cv2.inRange(hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
+        cols = np.sum(loose > 0, axis=0)
+        visible = int(np.sum(cols > (crop.shape[0] * 0.35)))
+        self.elixir_visible = visible >= ELIXIR_BAR_MIN_COLUMNS
+        if not self.elixir_visible:
+            return self.current_elixir
 
-        if len(filled_cols) == 0:
-            # Empty purple bar corresponds to drained (0.0) elixir
-            self.current_elixir = 0.0
-            return 0.0
+        width = crop.shape[1]
+        ratios: List[float] = []
+        filled = 0
+        for index in range(ELIXIR_PIP_COUNT):
+            a = int(round(index * width / ELIXIR_PIP_COUNT))
+            b = int(round((index + 1) * width / ELIXIR_PIP_COUNT))
+            if b <= a:
+                ratios.append(0.0)
+                break
+            seg_magenta = magenta[:, a:b]
+            seg_glyph = glyph[:, a:b]
+            denominator = int(seg_magenta.size) - int(seg_glyph.sum())
+            ratio = (int(seg_magenta.sum()) / denominator) if denominator > 0 else 0.0
+            ratios.append(float(ratio))
+            if ratio >= ELIXIR_PIP_FILLED_RATIO:
+                filled += 1
+            else:
+                break
 
-        fill_ratio = (filled_cols[-1] + 1) / max(1, crop.shape[1])
-        est_elixir = float(np.clip(fill_ratio * 10.0, 0.0, 10.0))
+        self.last_elixir_ratios = ratios
+        self.current_elixir = float(filled)
+        return round(float(filled), 1)
 
-        # Dampen sudden elixir spikes immediately following a card deployment
-        if (time.time() - self.last_card_play_time < 1.5):
-            est_elixir = min(est_elixir, self.current_elixir + 0.6)
+    def save_elixir_debug(self, frame: np.ndarray, path: str = ".tmp/elixir_debug.png") -> str:
+        """Dump the elixir bar region so a misread can be diagnosed offline."""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            h, w = frame.shape[:2]
+            x1 = max(0, int(ELIXIR_ICON_MAX_X * w))
+            x2 = min(w, int(ELIXIR_PIP_X1 * w))
+            y1 = max(0, int(ELIXIR_PIP_Y0 * h))
+            y2 = min(h, int(ELIXIR_PIP_Y1 * h))
+            crop = frame[y1:y2, x1:x2].copy()
+            if crop.size:
+                # Mark the detected pip boundaries.
+                for index in range(1, ELIXIR_PIP_COUNT):
+                    x = int(round(index * crop.shape[1] / ELIXIR_PIP_COUNT))
+                    cv2.line(crop, (x, 0), (x, crop.shape[0] - 1), (0, 255, 255), 1)
+            cv2.imwrite(path, crop)
+            return path
+        except Exception:
+            return ""
 
-        self.current_elixir = est_elixir
-        return round(est_elixir, 1)
+    def save_hand_debug(self, frame: np.ndarray, path: str = ".tmp/hand_debug.png") -> str:
+        """Dump the four hand slots with the classifier's verdict.
 
+        The reference templates in ``card_templates/`` were cut from the
+        *deck* screen, not from the in-battle hand tray.  If the template
+        correlation is low the classifier is guessing, and this image makes
+        that immediately visible.
+        """
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            crops = self.classifier.crop_slots(frame)
+            if not crops:
+                return ""
+            h = max(c.shape[0] for c in crops)
+            strip = np.zeros((h, sum(c.shape[1] for c in crops), 3), dtype=np.uint8)
+            x = 0
+            for index, crop in enumerate(crops):
+                strip[: crop.shape[0], x:x + crop.shape[1]] = crop
+                name = self.tracked_hand[index] if index < len(self.tracked_hand) else "?"
+                score = self.last_hand_scores[index] if index < len(self.last_hand_scores) else 0.0
+                cv2.putText(strip, f"{index}:{name} {score:.2f}", (x + 4, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+                x += crop.shape[1]
+            cv2.imwrite(path, strip)
+            return path
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Hand
+    # ------------------------------------------------------------------
     def read_hand(self, frame: np.ndarray, force_refresh: bool = False) -> Tuple[List[int], int]:
         """
         Return policy card IDs for the four-card hand and next card.
         Refreshes card slots via VisualCardClassifier when force_refresh=True.
+
+        The classifier is never allowed to predict a card that was deployed in
+        the last three plays (the 4-card cycle): those names are excluded and
+        the next best in-deck template match is used instead.
         """
         if force_refresh and frame is not None and frame.size > 0:
             try:
-                classified, scores = self.classifier.classify_hand(frame, self.active_deck, return_scores=True)
+                classified, scores = self.classifier.classify_hand(
+                    frame, self.active_deck, return_scores=True,
+                    exclude=set(self.recent_deployed_cards),
+                )
                 if len(classified) == 4:
                     self.tracked_hand = list(classified)
                     self.last_hand_scores = [float(s) for s in scores]
                     rem = [c for c in self.active_deck if c not in self.tracked_hand]
                     if rem:
                         self.tracked_next = rem[0]
+                self.save_hand_debug(frame)
             except Exception:
                 pass
 
         hand_ids = [CRSIM_NAME_TO_ID.get(name, 1) for name in self.tracked_hand]
         next_id = CRSIM_NAME_TO_ID.get(self.tracked_next, 1)
         return hand_ids, next_id
+
+    def block_slot(self, slot: int, ticks: int = REJECTED_SLOT_BLOCK_TICKS) -> None:
+        """Temporarily forbid re-selecting a hand slot after a rejected tap."""
+        if 0 <= slot < 4:
+            self.blocked_slots[slot] = int(ticks)
+
+    def _tick_blocked_slots(self) -> List[int]:
+        """Age the blocked-slot counters and return the still-blocked slots.
+
+        A slot blocked for ``ticks`` ticks stays blocked for exactly ``ticks``
+        consecutive decision ticks.
+        """
+        blocked = []
+        for slot in list(self.blocked_slots.keys()):
+            remaining = self.blocked_slots[slot] - 1
+            if remaining < 0:
+                self.blocked_slots.pop(slot, None)
+            else:
+                self.blocked_slots[slot] = remaining
+                blocked.append(slot)
+        return blocked
 
     def detect_entities(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -844,17 +1197,18 @@ class PerceptionAdapter:
                 "left": col_left + 0.03 * col_w,
                 "right": col_left + 0.97 * col_w,
             }
-            self.hand_xs = [col_left + x * col_w for x in [0.305, 0.500, 0.695, 0.890]]
+            self.hand_xs = [col_left + x * col_w for x in [0.312, 0.494, 0.680, 0.864]]
             self.elixir_box = {
-                "top": 0.965,
-                "bottom": 0.988,
-                "left": col_left + 0.207 * col_w,
-                "right": col_left + 0.961 * col_w,
+                "top": ELIXIR_PIP_Y0,
+                "bottom": ELIXIR_PIP_Y1,
+                "left": col_left + ELIXIR_ICON_MAX_X * col_w,
+                "right": col_left + ELIXIR_PIP_X1 * col_w,
             }
         else:
             self.arena_box = {"top": 0.05, "bottom": 0.78, "left": 0.03, "right": 0.97}
-            self.hand_xs = [0.305, 0.500, 0.695, 0.890]
-            self.elixir_box = {"top": 0.965, "bottom": 0.988, "left": 0.207, "right": 0.961}
+            self.hand_xs = [0.312, 0.494, 0.680, 0.864]
+            self.elixir_box = {"top": ELIXIR_PIP_Y0, "bottom": ELIXIR_PIP_Y1,
+                               "left": ELIXIR_ICON_MAX_X, "right": ELIXIR_PIP_X1}
 
     def frame_to_obs(self, frame: np.ndarray) -> Dict[str, torch.Tensor]:
         """Constructs full 7-tensor observation batch ready for AlphaStarCRNet."""
@@ -862,6 +1216,7 @@ class PerceptionAdapter:
         elixir = self.read_elixir(frame)
         hand_cards, next_card = self.read_hand(frame)
         entities, entity_mask, arena_grid = self.detect_entities(frame)
+        blocked_slots = self._tick_blocked_slots()
 
         # 1. Scalars: [own_elixir_norm, opp_elixir_est, time_norm, is_ot]
         time_norm = max(0.0, (180.0 - self.match_time_elapsed) / 180.0)
@@ -871,103 +1226,31 @@ class PerceptionAdapter:
         # 2. Hand Cards: [card0, card1, card2, card3, next_card]
         hand_tensor_np = np.array(hand_cards + [next_card], dtype=np.int64)
 
-        # 3. Card Mask: 5-way boolean mask (Slots 0..3: Hand, Slot 4: Wait)
-        active_enemies = sum(1 for idx in range(6, MAX_ENTITIES) if not entity_mask[idx] and entities[idx, 1] < 0)
-        enemies_at_bridge_or_above = sum(
-            1 for idx in range(6, MAX_ENTITIES)
-            if not entity_mask[idx] and entities[idx, 1] < 0 and (entities[idx, 3] * ARENA_HEIGHT) >= 12.0
-        )
-        threats_our_half = []
+        # 3./4. Card mask + per-card tile mask.
+        #
+        # The tactical rules live in ``cr_alphastar_agent.env.tactical_masks``
+        # so the simulator and the live bridge cannot drift apart.
+        enemy_units: List[EnemyUnit] = []
         for idx in range(6, MAX_ENTITIES):
-            if not entity_mask[idx] and entities[idx, 1] < 0:
-                ey_tile = entities[idx, 3] * ARENA_HEIGHT
-                if ey_tile <= 15.5:
-                    threats_our_half.append((entities[idx, 2] * ARENA_WIDTH, ey_tile))
+            if entity_mask[idx] or entities[idx, 1] >= 0:
+                continue
+            enemy_units.append(EnemyUnit(
+                card_id=int(round(entities[idx, 0] * NUM_CARDS)),
+                x=float(entities[idx, 2] * ARENA_WIDTH),
+                y=float(entities[idx, 3] * ARENA_HEIGHT),
+                hp=float(entities[idx, 4]),
+            ))
 
-        card_mask = np.zeros(5, dtype=bool)
-        for i, cid in enumerate(hand_cards):
-            cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-            if elixir >= cost:
-                # Gate Spell Slots: Spells require >= 1 enemy at tile_y >= 12
-                if cid in SPELL_CARD_IDS and enemies_at_bridge_or_above == 0:
-                    card_mask[i] = False
-                else:
-                    card_mask[i] = True
-            else:
-                card_mask[i] = False
-
-        # If enemy troops are threatening our half (ey <= 15), never waste win-condition cards (HogRider, Giant)
-        # to defend if an affordable defensive card is available in hand
-        if threats_our_half:
-            has_affordable_defense = any(
-                card_mask[s] and hand_cards[s] in DEFENSIVE_CARD_IDS
-                for s in range(4)
-            )
-            if has_affordable_defense:
-                for s in range(4):
-                    if hand_cards[s] in WIN_CONDITION_IDS:
-                        card_mask[s] = False
-
-        # Low-Elixir Idle Gate: When elixir < 7.5 and 0 enemy units on arena, bank elixir
-        if elixir < 7.5 and active_enemies == 0:
-            card_mask[:4] = False
-
-        card_mask[4] = True  # Slot 4 (Wait) is ALWAYS legal
-
-        # 4. Construct Card-Conditioned Tile Mask: shape [5, 576]
-        card_tile_mask = np.zeros((5, TOTAL_TILES), dtype=bool)
-        for slot in range(4):
-            cid = hand_cards[slot]
-            if cid not in SPELL_CARD_IDS:
-                if cid == 11:  # HogRider: strictly Left and Right bridges (never own lane defense)
-                    for x in range(2, 5):
-                        card_tile_mask[slot, 14 * ARENA_WIDTH + x] = True
-                    for x in range(13, 16):
-                        card_tile_mask[slot, 14 * ARENA_WIDTH + x] = True
-                elif threats_our_half:
-                    # When defending an active bridge threat on our side, placements must be in front of towers (y in 8..12)
-                    # Troops deploy directly in the SAME LANE as the threat
-                    primary_ex = threats_our_half[0][0]
-                    lane_min_x = int(max(1, primary_ex - 2))
-                    lane_max_x = int(min(16, primary_ex + 2))
-                    if cid in (13,):  # Cannon (pulls to center)
-                        for y in range(9, 13):
-                            for x in range(7, 11):
-                                card_tile_mask[slot, y * ARENA_WIDTH + x] = True
-                    else:  # Troop defenders (Knight, Mini PEKKA, Skeletons, Archers, etc.)
-                        for y in range(8, 13):
-                            for x in range(lane_min_x, lane_max_x + 1):
-                                card_tile_mask[slot, y * ARENA_WIDTH + x] = True
-                else:
-                    # Troops / Buildings: legal tiles are strictly friendly side 0..14
-                    for y in range(15):
-                        for x in range(ARENA_WIDTH):
-                            card_tile_mask[slot, y * ARENA_WIDTH + x] = True
-            else:
-                # Spells: STRICTLY restricted to a 2-tile radius around detected enemy units (y >= 12)
-                # Never unmask entire arena (prevents logit bias to empty grass like (12, 27)).
-                # Starts with all False across all 576 tiles.
-                for idx in range(6, MAX_ENTITIES):
-                    if not entity_mask[idx] and entities[idx, 1] < 0:
-                        ex_val = entities[idx, 2] * ARENA_WIDTH
-                        ey_val = entities[idx, 3] * ARENA_HEIGHT
-                        if ey_val >= 11.5:  # Enemy at or above bridge
-                            cx = int(round(ex_val))
-                            cy = max(12, int(round(ey_val)) - 1)  # Lead 1 tile down for travel time, strictly >= 12
-                            for dx in range(-2, 3):
-                                for dy in range(-2, 3):
-                                    tx = cx + dx
-                                    ty = cy + dy
-                                    if 0 <= tx < ARENA_WIDTH and 12 <= ty < ARENA_HEIGHT:
-                                        card_tile_mask[slot, ty * ARENA_WIDTH + tx] = True
-
-        card_tile_mask[4] = True  # Slot 4 (Wait) is legal everywhere
-
-        # Base tile_mask: union of troop friendly half
-        tile_mask = np.zeros(TOTAL_TILES, dtype=bool)
-        for y in range(15):
-            for x in range(ARENA_WIDTH):
-                tile_mask[y * ARENA_WIDTH + x] = True
+        bundle = build_tactical_masks(
+            hand_cards,
+            elixir,
+            enemy_units,
+            enemy_king=(9.0, 31.0),
+            blocked_slots=blocked_slots,
+        )
+        card_mask = bundle.card_mask
+        card_tile_mask = bundle.card_tile_mask
+        tile_mask = bundle.tile_mask
 
         # Wrap in PyTorch batch tensors [1, ...] on target device
         obs = {
@@ -982,21 +1265,88 @@ class PerceptionAdapter:
         }
         return obs
 
-    def update_hand_on_play(self, played_slot: int, deduct_elixir: bool = True):
-        """Updates internal hand cycle when a card is deployed."""
+    def update_hand_on_play(self, played_slot: int, deduct_elixir: bool = True,
+                            card_name: Optional[str] = None):
+        """Updates internal hand cycle when a card is *verified* deployed.
+
+        The played card is pushed onto the 4-card-cycle deque so the visual
+        classifier can never predict it again for the next three plays.
+        """
         if 0 <= played_slot < 4:
-            played_card = self.tracked_hand[played_slot]
+            played_card = card_name or self.tracked_hand[played_slot]
             card_id = CRSIM_NAME_TO_ID.get(played_card, 1)
             cost = CARDS_CATALOG.get(card_id, {}).get("cost", 3)
             if deduct_elixir:
                 self.current_elixir = max(0.0, self.current_elixir - cost)
             self.last_card_play_time = time.time()
 
+            # Remember the play so the 4-card cycle is respected.
+            self.recent_deployed_cards.append(played_card)
+            self.deployed_card_names.append(played_card)
+
             # Draw next card
             self.tracked_hand[played_slot] = self.tracked_next
             # Rotate cycle
             cycle = [c for c in self.active_deck if c not in self.tracked_hand]
             self.tracked_next = cycle[0] if cycle else self.active_deck[0]
+
+    # ------------------------------------------------------------------
+    # Deployment verification
+    # ------------------------------------------------------------------
+    def slot_correlation(self, frame: np.ndarray, slot: int, card_name: str) -> float:
+        """Template correlation of one hand slot against a card template."""
+        try:
+            crops = self.classifier.crop_slots(frame)
+            if slot >= len(crops):
+                return 0.0
+            return float(self.classifier.score_card_crop(crops[slot], card_name))
+        except Exception:
+            return 0.0
+
+    def verify_deployment(self, before_frame: np.ndarray, after_frame: np.ndarray,
+                          slot: int, card_name: str, elixir_before: float) -> Tuple[bool, Dict[str, Any]]:
+        """Verify that a card really left the hand.
+
+        A tap only counts as a deployment when either
+
+        * the elixir dropped by at least ``DEPLOY_ELIXIR_DROP_MIN``, or
+        * the template correlation of the tapped hand slot fell below
+          ``DEPLOY_SLOT_CORRELATION_MAX`` (the card is no longer in the slot).
+
+        Anything else is a *rejected tap* (card not affordable, target tile
+        clipped, tap swallowed by the game, ...).
+        """
+        diagnostics: Dict[str, Any] = {
+            "slot": slot,
+            "card": card_name,
+            "elixir_before": round(float(elixir_before), 2),
+        }
+        if after_frame is None or after_frame.size == 0:
+            diagnostics["reason"] = "no verification frame"
+            return False, diagnostics
+
+        elixir_after = self.read_elixir(after_frame)
+        diagnostics["elixir_after"] = round(float(elixir_after), 2)
+        diagnostics["elixir_visible"] = bool(self.elixir_visible)
+        elixir_drop = float(elixir_before) - float(elixir_after)
+        diagnostics["elixir_drop"] = round(elixir_drop, 2)
+
+        corr_before = self.slot_correlation(before_frame, slot, card_name)
+        corr_after = self.slot_correlation(after_frame, slot, card_name)
+        diagnostics["correlation_before"] = round(corr_before, 3)
+        diagnostics["correlation_after"] = round(corr_after, 3)
+
+        if self.elixir_visible and elixir_drop >= DEPLOY_ELIXIR_DROP_MIN:
+            diagnostics["reason"] = "elixir dropped"
+            return True, diagnostics
+        if corr_before - corr_after >= DEPLOY_SLOT_CORRELATION_DROP_MIN:
+            diagnostics["reason"] = "card left the hand slot"
+            return True, diagnostics
+        if corr_after < DEPLOY_SLOT_CORRELATION_MAX and corr_before >= DEPLOY_SLOT_CORRELATION_MAX:
+            diagnostics["reason"] = "card left the hand slot"
+            return True, diagnostics
+        diagnostics["reason"] = "no evidence the card was deployed"
+        return False, diagnostics
 
     def detect_home_battle_button(self, frame: np.ndarray, check_battle: bool = True) -> Optional[Tuple[int, int]]:
         """Detects the yellow 'Battle' button on the Clash Royale Home Screen."""
@@ -1015,11 +1365,41 @@ class PerceptionAdapter:
         cnts, _ = cv2.findContours(yellow_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
-            # Real Home Battle button on 900x1600 is ~302x168
-            if bw > 180 and bh > 60:
-                cx = int(w * 0.25) + bx + bw // 2
-                cy = int(h * 0.70) + by + bh // 2
-                return cx, cy
+            # Real Home Battle button on 900x1600 is ~302x168 (151x84 at half
+            # resolution).  The size limits are therefore relative to the
+            # frame, while the shape limits are scale invariant:
+            #
+            # * the Pass Royale reward screen has a full-width orange band in
+            #   the same y range which used to be reported as the "Battle"
+            #   button - tapping it opened the reward screen instead of
+            #   starting a match,
+            # * the aspect ratio (1.8) and the fill ratio (0.99) of the real
+            #   button separate it from flat colour bands and icons.
+            if not (0.26 * w <= bw <= 0.45 * w and 0.045 * h <= bh <= 0.20 * h):
+                continue
+            aspect = bw / float(max(1, bh))
+            if not (1.3 <= aspect <= 3.6):
+                continue
+            fill = cv2.contourArea(c) / float(max(1, bw * bh))
+            if fill < 0.55:
+                continue
+            # The real Battle button is a yellow rectangle on the dark blue
+            # home background.  A flat orange band (Pass Royale reward
+            # screen) has yellow all around it - reject that.
+            margin = 8
+            x0 = max(0, bx - margin)
+            y0 = max(0, by - margin)
+            x1 = min(crop.shape[1], bx + bw + margin)
+            y1 = min(crop.shape[0], by + bh + margin)
+            ring = np.ones((y1 - y0, x1 - x0), dtype=bool)
+            ring[by - y0:by - y0 + bh, bx - x0:bx - x0 + bw] = False
+            if ring.any():
+                ring_yellow = float(np.mean(yellow_mask[y0:y1, x0:x1][ring] > 0))
+                if ring_yellow > 0.40:
+                    continue
+            cx = int(w * 0.25) + bx + bw // 2
+            cy = int(h * 0.70) + by + bh // 2
+            return cx, cy
         return None
 
     def detect_post_match_buttons(self, frame: np.ndarray) -> Optional[Tuple[str, int, int]]:
@@ -1047,7 +1427,11 @@ class PerceptionAdapter:
         for c in b_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             cx = bx + bw // 2
-            if 120 <= bw <= 450 and 35 <= bh <= 140 and int(w * 0.35) <= cx <= int(w * 0.88):
+            # Size limits are relative to the frame: the OK button is ~212x60
+            # on a 900x1600 screen and ~106x30 at half resolution.
+            if not (0.10 * w <= bw <= 0.50 * w and 0.018 * h <= bh <= 0.10 * h):
+                continue
+            if int(w * 0.35) <= cx <= int(w * 0.88):
                 cy = int(h * 0.80) + by + bh // 2
                 return "ok", cx, cy
 
@@ -1057,11 +1441,63 @@ class PerceptionAdapter:
         for c in y_cnts:
             bx, by, bw, bh = cv2.boundingRect(c)
             cx = bx + bw // 2
-            if 80 <= bw <= 350 and 35 <= bh <= 120 and int(w * 0.15) <= cx <= int(w * 0.55):
+            if not (0.08 * w <= bw <= 0.40 * w and 0.018 * h <= bh <= 0.09 * h):
+                continue
+            if int(w * 0.15) <= cx <= int(w * 0.55):
                 cy = int(h * 0.80) + by + bh // 2
                 return "play_again", cx, cy
 
         return None
+
+    def _card_tray_visible(self, frame: np.ndarray) -> bool:
+        """Are the four hand cards visible in the tray?
+
+        The elixir bar is **not** a reliable battle marker: when the player
+        taps in the arena without a card selected, Clash Royale temporarily
+        replaces the whole bar with a red "No card selected" hint.  A live
+        capture showed the bar hidden for several seconds, which made the
+        agent believe the match had ended while the arena was still running.
+
+        The hand tray stays visible in that state, so it is the better
+        secondary marker: four separate card frames in the bottom band.
+        """
+        h, w = frame.shape[:2]
+        top = int(0.815 * h)
+        bottom = int(0.950 * h)
+        if bottom <= top:
+            return False
+        band = frame[top:bottom]
+        mx = band.max(axis=2).astype(np.int16)
+        mn = band.min(axis=2).astype(np.int16)
+        mask = ((mx > 110) & ((mx - mn) > 40)).astype(np.uint8)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        cards = 0
+        for cnt in cnts:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            if 0.055 * w <= bw <= 0.17 * w and bh >= 0.030 * h:
+                cards += 1
+        return cards >= 3
+
+    def _arena_visible(self, frame: np.ndarray) -> bool:
+        """Does the playfield fill the middle of the screen?
+
+        .. warning::
+            This is a **diagnostic helper only**.  It must NOT be used as a
+            battle marker: the Pass Royale "Bone Pit" screen shows a big sand
+            arena graphic and was mistaken for a live battle.
+        """
+        h, w = frame.shape[:2]
+        top = int(0.08 * h)
+        bottom = int(0.75 * h)
+        if bottom <= top:
+            return False
+        band = frame[top:bottom]
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        green = (hue >= 40) & (hue <= 85) & (sat >= 60) & (val >= 70)
+        sand = (hue >= 10) & (hue <= 25) & (sat >= 90) & (sat <= 185) & (val >= 90)
+        return float(np.mean(green | sand)) >= 0.35
 
     def is_in_battle(self, frame: np.ndarray) -> bool:
         """
@@ -1073,6 +1509,9 @@ class PerceptionAdapter:
         4. Purple is strictly localized to the horizontal elixir bar container and not
            predominantly distributed across arena, card tray, or full screen (rejects
            full-screen purple modals like Mystery Box or Trophy Road animations).
+
+        The elixir bar can be temporarily replaced by the red "No card
+        selected" hint, so the hand tray is accepted as a secondary marker.
         """
         h, w = frame.shape[:2]
         if w > h:
@@ -1091,57 +1530,287 @@ class PerceptionAdapter:
         col_sums = np.sum(purple_mask > 0, axis=0)
         filled_cols = np.where(col_sums > (crop.shape[0] * 0.35))[0]
         # Real battle has 50 to 520 solid columns of purple. Home screen has at most 3.
-        if len(filled_cols) < 30:
-            return False
+        if len(filled_cols) >= 30:
+            # Purple localization check: Ensure purple fill is strictly localized to the
+            # horizontal elixir bar container and that surrounding areas (arena, card tray, full screen)
+            # are not predominantly purple (full-screen purple modals have purple across multiple bands).
+            full_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            full_purple = cv2.inRange(full_hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
 
-        # Purple localization check: Ensure purple fill is strictly localized to the
-        # horizontal elixir bar container and that surrounding areas (arena, card tray, full screen)
-        # are not predominantly purple (full-screen purple modals have purple across multiple bands).
-        full_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        full_purple = cv2.inRange(full_hsv, np.array([125, 50, 50]), np.array([170, 255, 255]))
+            full_ratio = float(np.mean(full_purple > 0))
+            arena_ratio = float(np.mean(full_purple[int(h * 0.10):int(h * 0.70), :] > 0))
+            tray_ratio = float(np.mean(full_purple[int(h * 0.75):int(h * 0.94), :] > 0))
+            above_bar_ratio = float(np.mean(full_purple[int(h * 0.90):ey1, ex1:ex2] > 0))
 
-        full_ratio = float(np.mean(full_purple > 0))
-        arena_ratio = float(np.mean(full_purple[int(h * 0.10):int(h * 0.70), :] > 0))
-        tray_ratio = float(np.mean(full_purple[int(h * 0.75):int(h * 0.94), :] > 0))
-        above_bar_ratio = float(np.mean(full_purple[int(h * 0.90):ey1, ex1:ex2] > 0))
+            if full_ratio > 0.15 or arena_ratio > 0.12 or tray_ratio > 0.20 or above_bar_ratio > 0.40:
+                return False
+            return True
 
-        if full_ratio > 0.15 or arena_ratio > 0.12 or tray_ratio > 0.20 or above_bar_ratio > 0.40:
-            return False
-
-        return True
+        # No elixir bar: accept the frame when the hand tray is visible.
+        #
+        # The arena floor is deliberately *not* used as a marker: the
+        # Pass Royale "Bone Pit" screen shows a big sand arena graphic and
+        # was mistaken for a live battle, which made the agent tap "Battle"
+        # and start a match that never began.
+        return self._card_tray_visible(frame)
 
     def score_match(self, frame: np.ndarray) -> Tuple[str, int, int, int]:
+        """Deprecated alias for :func:`detect_match_end_result`.
+
+        The old implementation counted *any* gold blob in two wide y-bands
+        and defaulted to ``"DRAW"``.  It mistook the opponent's gold crown,
+        the gold trophy badge inside the player ribbon and the gold level
+        badges for crown markers, so results were essentially random.
         """
-        Determines the match result (WIN/LOSS/DRAW), crown score, and trophy delta.
-        Returns: (result_str, player_crowns, opp_crowns, trophy_delta)
-        """
-        h, w = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        gold_mask = cv2.inRange(hsv, np.array([15, 140, 140]), np.array([35, 255, 255]))
-        cnts, _ = cv2.findContours(gold_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return detect_match_end_result(frame)
 
-        player_crowns = 0
-        opp_crowns = 0
-        for c in cnts:
-            x, y, bw, bh = cv2.boundingRect(c)
-            if bw > 80 and bh > 45:
-                yr = y / max(1, h)
-                if 0.40 <= yr <= 0.55:
-                    player_crowns += 1
-                elif 0.10 <= yr <= 0.25:
-                    opp_crowns += 1
+    def detect_match_end_result(self, frame: np.ndarray) -> Tuple[str, int, int, int]:
+        """Ground-truth match outcome from the post-match end screen."""
+        return detect_match_end_result(frame)
 
-        if player_crowns > opp_crowns:
-            result = "WIN"
-            delta = 30
-        elif opp_crowns > player_crowns:
-            result = "LOSS"
-            delta = -2
-        else:
-            result = "DRAW"
-            delta = 0
+# ==============================================================================
+# 3. Ground-truth post-match outcome detection
+# ==============================================================================
 
-        return result, player_crowns, opp_crowns, delta
+def _gold_blobs(hsv: np.ndarray, y0: float, y1: float,
+                min_w: int = 50, min_h: int = 35) -> List[Tuple[int, int, int, int]]:
+    """Gold (crown) blobs whose top edge lies inside the normalized band.
+
+    The reference crown icon on a 900x1600 frame is 178x87 px; at half
+    resolution it is still ~89x43.  Anything smaller is a decorative gold
+    detail on the ribbon, not a crown.
+    """
+    h = hsv.shape[0]
+    top = int(round(y0 * h))
+    bottom = int(round(y1 * h))
+    if bottom <= top:
+        return []
+    band = hsv[top:bottom]
+    gold = cv2.inRange(band, np.array([15, 140, 140]), np.array([35, 255, 255]))
+    cnts, _ = cv2.findContours(gold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw >= min_w and bh >= min_h:
+            out.append((x, y + top, bw, bh))
+    return out
+
+
+def _ribbon_bands(hsv: np.ndarray, kind: str) -> List[Tuple[float, float]]:
+    """Vertical bands (normalized) covered by a full-width *ribbon*.
+
+    The opponent ribbon is pink/magenta, the player ribbon is blue.  Both
+    span the whole screen width, which is what separates them from the blue
+    ``OK`` button (only ~22 % of the width) and from the narrow red HP bars
+    of the towers.
+    """
+    h, w = hsv.shape[:2]
+    hue, sat, _ = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    if kind == "pink":
+        mask = ((hue >= 158) | (hue <= 6)) & (sat > 90)
+    else:
+        mask = (hue >= 100) & (hue <= 120) & (sat > 90)
+
+    coverage = np.mean(mask > 0, axis=1)
+    rows = [y for y in range(h) if coverage[y] >= RIBBON_MIN_COVERAGE]
+
+    bands: List[Tuple[float, float]] = []
+    start = None
+    prev = None
+    for y in rows:
+        if start is None:
+            start = y
+        elif y - prev > 6:
+            bands.append((start / h, prev / h))
+            start = y
+        prev = y
+    if start is not None and prev is not None:
+        bands.append((start / h, prev / h))
+    return [b for b in bands if (b[1] - b[0]) >= RIBBON_MIN_HEIGHT]
+
+
+def _crowns_near_ribbon(hsv: np.ndarray, band: Tuple[float, float],
+                        other: Optional[Tuple[float, float]] = None) -> int:
+    """How many crown icons belong to the ribbon in ``band``?
+
+    A crown is a large gold blob (>= 50x35 px).  It belongs to the ribbon
+    whose *half* of the screen it sits in.  The two ribbons bound a gap in
+    the middle of the screen (the "VS" area); the midpoint of that gap
+    splits the screen into an upper half (the upper ribbon) and a lower
+    half (the lower ribbon).  A crown is assigned by its **bottom edge**,
+    because the crown icon is drawn at the foot of the destroyed tower bed
+    and therefore always ends on its own side of the midpoint.
+
+    Measured on four real end screens this rule assigns every crown
+    correctly, including the WIN screen where the player's two crowns sit
+    right between the two ribbons.
+    """
+    h, w = hsv.shape[:2]
+    gold = cv2.inRange(hsv, np.array([15, 140, 140]), np.array([35, 255, 255]))
+    cnts, _ = cv2.findContours(gold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if other is None:
+        midpoint = None
+    else:
+        upper, lower = (band, other) if band[0] <= other[0] else (other, band)
+        midpoint = (upper[1] + lower[0]) / 2.0
+
+    def distance(centre: float, target: Tuple[float, float]) -> float:
+        if target[0] <= centre <= target[1]:
+            return 0.0
+        if centre < target[0]:
+            return target[0] - centre
+        return centre - target[1]
+
+    count = 0
+    for cnt in cnts:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw < CROWN_MIN_WIDTH or bh < CROWN_MIN_HEIGHT:
+            continue
+        aspect = bw / float(max(1, bh))
+        if not (CROWN_MIN_ASPECT <= aspect <= CROWN_MAX_ASPECT):
+            continue
+        bottom_edge = (y + bh) / float(h)
+        if midpoint is not None:
+            upper, lower = (band, other) if band[0] <= other[0] else (other, band)
+            belongs_to_upper = bottom_edge < midpoint
+            if belongs_to_upper != (band is upper):
+                continue
+        if distance((y + bh / 2.0) / h, band) > CROWN_RIBBON_BAND:
+            continue
+        count += 1
+    return count
+
+
+#: How many columns of the elixir band must show *any* purple for the bar
+#: to count as rendered.  A filled bar has 60-250 such columns, an *empty*
+#: bar still has ~27 (the segment separators), and a hidden bar has 0-1.
+ELIXIR_BAR_MIN_COLUMNS = 6
+#: Trophy delta awarded for a win.
+#:
+#: The win bonus is **not** a constant.  Measured:
+#:
+#: ===========  ======  ==================
+#: score        delta   source
+#: ===========  ======  ==================
+#: 3 - 1        +30     Battle Log (154 -> 184)
+#: 1 - 0        +30     Battle Log (184 -> 214)
+#: 1 - 0        +31     live end screen (212 -> 243)
+#: 2 - 1        +29     live end screen (243 -> 272)
+#: 3 - 0        +32     live end screen
+#: ===========  ======  ==================
+#:
+#: so a win is +29 .. +32.  The model reports the median (+30); the
+#: authoritative number is always the difference of the trophy counter on
+#: the Home screen before and after the match.
+TROPHY_DELTA_WIN = 30
+
+#: Trophy delta for a loss.  Measured:
+#:
+#: ===========  ======  ==================
+#: score        delta   source
+#: ===========  ======  ==================
+#: 0 - 1        -9      live end screen (223 -> 212)
+#: 0 - 2        -11     live end screen
+#: 0 - 3        -4      live end screen
+#: ===========  ======  ==================
+#:
+#: The three points do **not** fit a simple formula (a 3-crown loss cost
+#: less than a 1-crown loss), so no formula is applied: the model returns
+#: the conservative -9 and the history entry is tagged
+#: ``delta_source: "model"``.  The absolute trophy counter on the Home
+#: screen is the only authoritative value - reconcile it.
+TROPHY_DELTA_LOSS = -9
+
+
+def trophy_delta_for(result: str, player_crowns: int, opp_crowns: int) -> int:
+    """Modelled trophy delta for a finished match.
+
+    .. warning::
+       This is a **model**, not a measurement.  The win bonus was observed
+       between +29 and +32 and the loss penalty between -4 and -11, so no
+       formula reproduces them.  Every history entry written from this value
+       carries ``"delta_source": "model"`` and must be reconciled against
+       the trophy counter on the Home screen.
+    """
+    if result == "WIN":
+        return TROPHY_DELTA_WIN
+    if result == "LOSS":
+        return TROPHY_DELTA_LOSS
+    return 0
+
+
+def detect_match_end_result(frame: np.ndarray) -> Tuple[str, int, int, int]:
+    """Determine the match outcome from the Clash Royale post-match screen.
+
+    Returns ``(result, player_crowns, opp_crowns, trophy_delta)`` where
+    ``result`` is one of ``"WIN"``, ``"LOSS"``, ``"DRAW"`` or ``"UNVERIFIED"``.
+
+    The detector is **layout independent**.  The post-match screen does not
+    use fixed vertical bands: the winner's side is drawn at the top and the
+    loser's at the bottom, and the two halves have different heights
+    depending on how many towers were destroyed.  Measured on three real
+    900x1600 end screens:
+
+    ==========  ====================  ====================
+    screen      opponent ribbon       player ribbon
+    ==========  ====================  ====================
+    LOSS        y 0.188 .. 0.334      y 0.490 .. 0.627
+    LOSS (2c)   y 0.188 .. 0.334      y 0.490 .. 0.627
+    WIN         y 0.419 .. 0.488      y 0.694 .. 0.750
+    ==========  ====================  ====================
+
+    So instead of absolute bands the detector:
+
+    1. finds the **pink** (opponent) and **blue** (player) ribbons by their
+       full-width row coverage - the blue ``OK`` button only covers ~22 % of
+       the width and is therefore rejected,
+    2. counts the **gold crowns** that sit on top of each ribbon.  The
+       winner's crowns are drawn over the winner's own destroyed tower beds,
+       i.e. immediately above the winner's ribbon,
+    3. derives the result from which side carries crowns.
+
+    If the frame does not clearly show the end screen, or if the evidence is
+    contradictory, the result is ``"UNVERIFIED"``.  It is never defaulted to
+    ``"WIN"``.
+    """
+    if frame is None or frame.size == 0:
+        return "UNVERIFIED", 0, 0, 0
+
+    h, w = frame.shape[:2]
+    if w > h:
+        return "UNVERIFIED", 0, 0, 0
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    opp_bands = _ribbon_bands(hsv, "pink")
+    player_bands = _ribbon_bands(hsv, "blue")
+    if not opp_bands or not player_bands:
+        # Not (or not unambiguously) the post-match end screen.
+        return "UNVERIFIED", 0, 0, 0
+
+    # The player ribbon is the lowest blue ribbon, the opponent ribbon is the
+    # lowest pink ribbon.  On the end screen the opponent is always rendered
+    # above the player, so a reversed order means this is not the end screen.
+    opp_ribbon = opp_bands[-1]
+    player_ribbon = player_bands[-1]
+    if opp_ribbon[0] > player_ribbon[0]:
+        return "UNVERIFIED", 0, 0, 0
+
+    opp_crowns = _crowns_near_ribbon(hsv, opp_ribbon, other=player_ribbon)
+    player_crowns = _crowns_near_ribbon(hsv, player_ribbon, other=opp_ribbon)
+
+    # The side with more crowns won.  A match can end 2-1, so both sides can
+    # carry crowns - only a tie is ambiguous.
+    if player_crowns > opp_crowns:
+        return "WIN", player_crowns, opp_crowns, trophy_delta_for("WIN", player_crowns, opp_crowns)
+    if opp_crowns > player_crowns:
+        return "LOSS", player_crowns, opp_crowns, trophy_delta_for("LOSS", player_crowns, opp_crowns)
+    if player_crowns == 0 and opp_crowns == 0:
+        # The screen looks like the end screen but we cannot see who won.
+        return "UNVERIFIED", 0, 0, 0
+    # Equal crown counts: contradictory evidence, do not guess.
+    return "UNVERIFIED", player_crowns, opp_crowns, 0
 
 # ==============================================================================
 # 3. Input Controllers (Background ADB Only)
@@ -1263,6 +1932,12 @@ class ADBController:
             self.process = None
             return
 
+        # Make sure the transport is still alive before opening the pipe.
+        resolved = ensure_adb_device(self.device_serial)
+        if resolved and resolved != self.device_serial:
+            print(f"[ADB] Transport changed: {self.device_serial} -> {resolved}")
+            self.device_serial = resolved
+
         cmd = self._adb_command()
         try:
             print(f"[ADB] Launching persistent shell: {' '.join(cmd)}")
@@ -1303,47 +1978,92 @@ class ADBController:
                 return False
         return False
 
-    def ensure_game_focused(self):
-        """Checks if Clash Royale is in the foreground, relaunching it if minimized."""
+    def ensure_game_focused(self, allow_relaunch: bool = True):
+        """Check that Clash Royale is the *resumed* activity.
+
+        The check must look at the **resumed** activity, not at the whole
+        `dumpsys activity activities` dump: after the game is closed the
+        dump still mentions `com.supercell.clashroyale` in its history, so a
+        naive substring check reports "in foreground" while the device is
+        sitting on the Android launcher and the agent waits forever.
+
+        The old check used `dumpsys window`, which does not expose
+        `mCurrentFocus` on this Android build, so it *always* failed and the
+        agent relaunched the game with `monkey` - that restarts the activity
+        and would throw away a live match.  ``allow_relaunch`` must be False
+        while a battle is running.
+        """
         if self.dry_run:
             return
         cmd = [_adb_path()]
         if self.device_serial:
             cmd.extend(["-s", self.device_serial])
-        cmd.extend(["shell", "dumpsys", "window"])
+        cmd.extend(["shell", "dumpsys activity activities"])
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=CREATE_NO_WINDOW)
-            if "com.supercell.clashroyale" not in res.stdout:
-                print("[Controller] Clash Royale not in foreground! Bringing to front...")
-                launch_cmd = [_adb_path()]
-                if self.device_serial:
-                    launch_cmd.extend(["-s", self.device_serial])
-                launch_cmd.extend(["shell", "monkey", "-p", "com.supercell.clashroyale", "-c", "android.intent.category.LAUNCHER", "1"])
-                subprocess.run(launch_cmd, capture_output=True, timeout=5, creationflags=CREATE_NO_WINDOW)
-                time.sleep(4.0)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=6,
+                                 creationflags=CREATE_NO_WINDOW)
+            resumed = ""
+            for line in (res.stdout or "").splitlines():
+                if "topResumedActivity" in line or "mResumedActivity" in line:
+                    resumed = line
+                    break
+            if "com.supercell.clashroyale" in resumed:
+                return
+            if not allow_relaunch:
+                print("[Controller] Clash Royale is not the resumed activity "
+                      "(not relaunching during a battle).")
+                return
+            print("[Controller] Clash Royale is not in the foreground - relaunching.")
+            launch_cmd = [_adb_path()]
+            if self.device_serial:
+                launch_cmd.extend(["-s", self.device_serial])
+            launch_cmd.extend(["shell", "monkey", "-p", "com.supercell.clashroyale", "-c", "android.intent.category.LAUNCHER", "1"])
+            subprocess.run(launch_cmd, capture_output=True, timeout=8, creationflags=CREATE_NO_WINDOW)
+            time.sleep(6.0)
+        except Exception:
+            pass
+
+    def press_back(self) -> None:
+        """Send the Android BACK key event."""
+        if self.dry_run:
+            return
+        cmd = [_adb_path()]
+        if self.device_serial:
+            cmd.extend(["-s", self.device_serial])
+        cmd.extend(["shell", "input", "keyevent", "4"])
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5, creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
 
     def dismiss_post_match_popups(self):
-        """Dismisses chest rewards, level-up popups, and returns firmly to Home Screen Battle tab."""
+        """Dismiss chest rewards, level-up popups, and return to the Home screen.
+
+        The old implementation tapped the screen centre (450, 800) six times
+        to "collect rewards".  That coordinate is the middle of the arena and
+        it opens the *card upgrade screen*, from which the agent could not
+        recover - the account ended up stuck in a menu instead of on the Home
+        screen with its Battle button.
+
+        Only proven UI elements are tapped now (the modal OK button and the
+        bottom navigation) and the Android BACK key is used to leave any
+        menu that is still open.
+        """
         if self.dry_run:
             return
-        # Tap bottom OK multiple times (match exit confirmation)
+        # Modal OK buttons (post-match summary, rewards).
         for _ in range(3):
             self.tap_pixel(450, 1450)
             time.sleep(0.35)
-        # Tap center multiple times to open and dismiss chest cards
-        for _ in range(6):
-            self.tap_pixel(450, 800)
-            time.sleep(0.35)
-        # Tap bottom OK again in case an 'Open Later' or chest summary OK appeared
-        self.tap_pixel(450, 1450)
-        time.sleep(0.35)
-        # Tap Battle tab icon at bottom center to ensure on Home Battle tab
+        # Leave any open menu / info screen.
+        for _ in range(3):
+            self.press_back()
+            time.sleep(0.4)
+        # Ensure we are on the Home "Battle" tab.
         for _ in range(2):
             self.tap_pixel(450, 1550)
             time.sleep(0.4)
-        self.ensure_game_focused()
+        self.ensure_game_focused(allow_relaunch=False)
 
     def grid_to_screen_pixel(self, tile_x: float, tile_y: float, arena_box: dict) -> Tuple[int, int]:
         """Converts canonical 18x32 grid tile to guest screen pixel (X, Y)."""
@@ -1366,19 +2086,42 @@ class ADBController:
                     arena_box: dict, hand_xs: List[float], hand_box_y: float) -> bool:
         """
         Deploys a card from hand to arena tile.
-        Uses native drag-and-drop swipe (150ms) to ensure zero drop rate from card selection animation,
-        or two-stage tap with delay if use_swipe is disabled.
+
+        The tap sequence is deliberately three staged taps:
+
+        1. a **neutral dead-zone tap** that deselects whatever card may still
+           be lifted from a previous, failed attempt.  Without it the very
+           next tap on the hand slot *de-selects* the lifted card and the
+           following arena tap drops nothing on empty grass - the classic
+           "phantom deployment" that produced ``Arrows x8`` in a 17 card
+           match;
+        2. the hand-slot tap (selects the card, 160 ms dwell so the
+           selection animation completes);
+        3. the arena tap (drops the card).
+
+        The arena target is clamped to playable grass so a spell or troop can
+        never land on the top HUD banners.
         """
         if card_slot == 4:
             return True
 
+        # --- clamp the deployment target to playable grass -----------------
+        tile_x = int(np.clip(int(tile_x), DEPLOY_TILE_X_RANGE[0], DEPLOY_TILE_X_RANGE[1]))
+        tile_y = int(np.clip(int(tile_y), DEPLOY_TILE_Y_RANGE[0], DEPLOY_TILE_Y_RANGE[1]))
+
         card_px, card_py = self.card_slot_to_screen_pixel(card_slot, hand_xs, hand_box_y)
         arena_px, arena_py = self.grid_to_screen_pixel(tile_x, tile_y, arena_box)
 
-        method_str = "SWIPE DRAG" if self.use_swipe else "TWO-STAGE TAP"
+        # The dead zone is expressed for a 900x1600 guest and scaled.
+        dead_x = int(round(DEAD_ZONE_PX[0] * self.screen_w / 900.0))
+        dead_y = int(round(DEAD_ZONE_PX[1] * self.screen_h / 1600.0))
+        dead_x = int(np.clip(dead_x, 0, max(0, self.screen_w - 1)))
+        dead_y = int(np.clip(dead_y, 0, max(0, self.screen_h - 1)))
+
+        method_str = "SWIPE DRAG" if self.use_swipe else "THREE-STAGE TAP"
         action_desc = (
             f"Slot {card_slot} -> Tile ({tile_x}, {tile_y}) [{method_str}] | "
-            f"({card_px}, {card_py}) -> ({arena_px}, {arena_py})"
+            f"dead({dead_x},{dead_y}) -> card({card_px},{card_py}) -> arena({arena_px},{arena_py})"
         )
 
         if self.dry_run:
@@ -1394,10 +2137,19 @@ class ADBController:
                 if self.use_swipe:
                     # Native drag-and-drop: drag card to arena tile with 350ms duration
                     self.process.stdin.write(f"input swipe {card_px} {card_py} {arena_px} {arena_py} 350\n")
+                    self.process.stdin.flush()
                 else:
-                    # Two-stage tap with dwell delay to ensure card selection animation completes
-                    self.process.stdin.write(f"input tap {card_px} {card_py} && sleep 0.15 && input tap {arena_px} {arena_py}\n")
-                self.process.stdin.flush()
+                    # 1) deselect any previously lifted card
+                    self.process.stdin.write(f"input tap {dead_x} {dead_y}\n")
+                    self.process.stdin.flush()
+                    time.sleep(0.06)
+                    # 2) select the card
+                    self.process.stdin.write(f"input tap {card_px} {card_py}\n")
+                    self.process.stdin.flush()
+                    time.sleep(0.16)
+                    # 3) drop it
+                    self.process.stdin.write(f"input tap {arena_px} {arena_py}\n")
+                    self.process.stdin.flush()
                 print(f"[ADB EXEC] {action_desc}")
                 return True
             except Exception as e:
@@ -1605,15 +2357,17 @@ def update_artifact_log(history: List[dict], current_trophies: int, target_troph
         for m in history:
             m_num = m.get("match", 1)
             opp = m.get("opponent", "Ladder Opponent")
-            res = m.get("result", "WIN")
-            score = m.get("score", "1 - 0")
-            delta_val = m.get("delta", 30)
+            # NEVER default to a win: an unknown outcome stays unknown.
+            res = m.get("result", "UNVERIFIED")
+            score = m.get("score") or "unverified"
+            delta_val = m.get("delta") or 0
             delta_str = f"+{delta_val}" if delta_val > 0 else str(delta_val)
             trophies = m.get("trophies", current_trophies)
-            dur = m.get("duration_s", 180.0)
-            cards = m.get("cards_deployed", 0)
-            notes = m.get("notes", "Tactical deployment via ADB swipe")
-            lines.append(f"| **{m_num}** | `{opp}` | **{res}** | {score} | {delta_str} | **{trophies}** | {dur:.1f}s | {cards} | {notes} |")
+            dur = m.get("duration_s")
+            dur_str = f"{float(dur):.1f}" if dur is not None else "n/a"
+            cards = m.get("cards_deployed") or 0
+            notes = m.get("notes", "no verified deployment")
+            lines.append(f"| **{m_num}** | `{opp}` | **{res}** | {score} | {delta_str} | **{trophies}** | {dur_str}s | {cards} | {notes} |")
 
         lines.extend([
             "\n---\n",
@@ -1639,8 +2393,8 @@ def main():
                         help="Number of autonomous matches to play (default: 0 = unconstrained until target trophies)")
     parser.add_argument("--target-trophies", type=int, default=500,
                         help="Target trophy count to climb to before stopping (default: 500)")
-    parser.add_argument("--starting-trophies", type=int, default=89,
-                        help="Starting trophy count if not found in history file (default: 89)")
+    parser.add_argument("--starting-trophies", type=int, default=214,
+                        help="Starting trophy count if not found in history file (default: 214)")
     parser.add_argument("--history-file", type=str, default="trophy_climb_history.json",
                         help="Path to JSON file storing trophy climb match history")
     parser.add_argument("--artifact-file", type=str,
@@ -1826,6 +2580,9 @@ def main():
     last_action_time = 0.0
     last_deploy_time = 0.0
     last_dismiss_tap_time = 0.0
+    last_battle_tap_time = 0.0
+    last_back_press_time = 0.0
+    last_home_seen_time = time.time()
     min_deploy_cooldown = 1.2  # 1.2s post-deployment animation duration (R2)
     pending_hand_resync = False
     post_match_cooldown = 0.0
@@ -1873,21 +2630,56 @@ def main():
 
                 if in_battle and battle_duration >= 45.0:
                     post_btn = perception.detect_post_match_buttons(frame)
-                    if post_btn is None and (now - last_in_battle_time > 6.0):
+                    if post_btn is None:
+                        # The end screen itself is proof as well.
+                        end_result, _, _, _ = perception.detect_match_end_result(frame)
+                        if end_result != "UNVERIFIED":
+                            post_btn = ("end_screen", 0, 0)
+                    if post_btn is None and (now - last_in_battle_time > MATCH_OVER_TIMEOUT_S):
                         battle_ended_by_timeout = True
 
                 if in_battle and (post_btn is not None or battle_ended_by_timeout):
                     saved_video = video_recorder.stop_recording()
                     completed_matches += 1
                     session_matches_played += 1
-                    result, p_crowns, o_crowns, delta = perception.score_match(frame)
+
+                    # The match can end with a short *celebration* frame
+                    # ("You" + three crowns, HUD hidden) before the real
+                    # post-match summary with the ribbons appears.  Reading
+                    # that transition produced UNVERIFIED even for clear
+                    # wins.  Wait for the summary screen to show up.
+                    end_frame = frame
+                    for _ in range(END_SCREEN_WAIT_TICKS):
+                        if detect_match_end_result(end_frame)[0] != "UNVERIFIED":
+                            break
+                        time.sleep(END_SCREEN_POLL_S)
+                        fresh = capture.capture_frame()
+                        if fresh is not None and fresh.size:
+                            end_frame = fresh
+
+                    result, p_crowns, o_crowns, delta = perception.detect_match_end_result(end_frame)
+                    if result == "UNVERIFIED":
+                        # The outcome could not be proven from the screen.
+                        # Save the frame so a human (or the battle log) can
+                        # adjudicate it later.  NEVER guess a win.
+                        try:
+                            os.makedirs(".tmp", exist_ok=True)
+                            cv2.imwrite(".tmp/unverified_endscreen.png", end_frame)
+                        except Exception:
+                            pass
+                        delta = 0
+                        print("[END SCREEN] Outcome UNVERIFIED - saved .tmp/unverified_endscreen.png "
+                              "for manual adjudication (see STRICT_VERIFICATION_RUNBOOK.md).")
                     current_trophies = max(0, current_trophies + delta)
 
                     card_summary = {}
                     for cname, _, _ in match_deployments:
                         card_summary[cname] = card_summary.get(cname, 0) + 1
-                    top_cards = ", ".join(f"{c}x{n}" for c, n in sorted(card_summary.items(), key=lambda x: -x[1])[:3]) or "Tactical cycle"
-                    note_str = f"Result: {result} ({p_crowns}-{o_crowns}). Cards deployed: {len(match_deployments)} ({top_cards}). AI inputs clean."
+                    top_cards = ", ".join(f"{c}x{n}" for c, n in sorted(card_summary.items(), key=lambda x: -x[1])[:3]) or "no verified deployment"
+                    note_str = (
+                        f"Result: {result} ({p_crowns}-{o_crowns}). "
+                        f"Verified deployments: {len(match_deployments)} ({top_cards})."
+                    )
 
                     match_entry = {
                         "match": completed_matches,
@@ -1895,9 +2687,11 @@ def main():
                         "result": result,
                         "score": f"{p_crowns} - {o_crowns}",
                         "delta": delta,
+                        "delta_source": "model" if result in ("WIN", "LOSS") else "unverified",
                         "trophies": current_trophies,
                         "duration_s": round(battle_duration, 1),
                         "cards_deployed": len(match_deployments),
+                        "verified": result in ("WIN", "LOSS", "DRAW"),
                         "video": saved_video or "",
                         "notes": note_str,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1914,7 +2708,7 @@ def main():
                     print("=" * 65)
                     print(f"🏁 MATCH {completed_matches} FINISHED! [{result} {p_crowns}-{o_crowns}]")
                     print(f"   Delta: {delta:+d} | Total Trophies: {current_trophies}/{args.target_trophies}")
-                    print(f"   Duration: {battle_duration:.1f}s | Cards Deployed: {len(match_deployments)}")
+                    print(f"   Duration: {battle_duration:.1f}s | Verified deployments: {len(match_deployments)}")
                     print("=" * 65)
 
                     in_battle = False
@@ -1943,8 +2737,10 @@ def main():
                             print(f"\n[Completed] Reached target of {args.matches} match(es). Stopping.")
                             break
                         bx, by = home_btn
+                        last_home_seen_time = now
                         print(f"[Autopilot] On Home Screen. Tapping 'Battle' at ({bx}, {by}) for Match {completed_matches + 1} (Trophies: {current_trophies}/{args.target_trophies})...")
                         controller.tap_pixel(bx, by)
+                        last_battle_tap_time = now
                         time.sleep(3.0)
                         continue
 
@@ -1957,17 +2753,32 @@ def main():
                         time.sleep(1.5)
                         continue
 
-                    # If neither home battle nor post-match button is visible, tap chest/rewards and battle tab
-                    if (now - last_dismiss_tap_time > 2.5):
+                    # Neither a home button nor a modal button: we are most
+                    # likely on the matchmaking screen - or stuck in a menu
+                    # (the Pass Royale reward screen opens on its own after a
+                    # match and the agent used to get lost in it forever).
+                    #
+                    # The only safe blind target is the bottom navigation
+                    # "Battle" tab.  The Android BACK key is only used once
+                    # the screen has clearly been stuck for a while, because
+                    # BACK during the matchmaking would cancel the match.
+                    if (now - last_dismiss_tap_time > 2.5) and (now - last_battle_tap_time > MATCHMAKING_GRACE_S):
                         last_dismiss_tap_time = now
-                        print("[Autopilot] Modal/Reward active. Tapping center (450, 800) and Battle tab (450, 1550)...")
-                        controller.tap_pixel(450, 800)
-                        time.sleep(0.35)
-                        controller.tap_pixel(450, 1450)
-                        time.sleep(0.35)
+                        stuck_for = now - last_home_seen_time
+                        if stuck_for > STUCK_SCREEN_S:
+                            if now - last_back_press_time > 15.0:
+                                last_back_press_time = now
+                                print(f"[Autopilot] Stuck on a non-home screen for "
+                                      f"{stuck_for:.0f}s - pressing BACK to leave the menu.")
+                                controller.press_back()
+                                time.sleep(0.6)
+                            if stuck_for > RELAUNCH_AFTER_S:
+                                controller.ensure_game_focused(allow_relaunch=not in_battle)
+                        print("[Autopilot] No home/modal button. "
+                              "Tapping bottom nav 'Battle' tab only (450, 1550) - no arena taps.")
                         controller.tap_pixel(450, 1550)
                         time.sleep(0.5)
-                        controller.ensure_game_focused()
+                        controller.ensure_game_focused(allow_relaunch=not in_battle)
                         continue
 
                 # C. Detect Battle Start (only after post-match cooldown)
@@ -1978,6 +2789,10 @@ def main():
                     match_deployments = []
                     perception.match_time_elapsed = 0.0
                     pending_hand_resync = False
+                    # A new match resets the 4-card cycle bookkeeping.
+                    perception.recent_deployed_cards.clear()
+                    perception.deployed_card_names.clear()
+                    perception.blocked_slots.clear()
                     perception.read_hand(frame, force_refresh=True)
                     video_recorder.start_recording(completed_matches + 1)
                     if args.telemetry_file and os.path.exists(args.telemetry_file):
@@ -2116,12 +2931,24 @@ def main():
                     except Exception:
                         pass
 
-                # Action Execution via background ADB pipe
-                if chosen_card != 4 and not cooldown_active and (now - last_deploy_time >= min_deploy_cooldown):
+                # Action Execution via background ADB pipe.
+                #
+                # A tap is only counted as a deployment when it is *verified*
+                # on a follow-up frame (elixir dropped or the card left its
+                # hand slot).  Unverified taps are rejected, blocked for the
+                # next two ticks and never enter the match statistics.
+                if (chosen_card != 4 and not cooldown_active
+                        and (now - last_deploy_time >= min_deploy_cooldown)
+                        and perception.elixir_visible):
+                    # Never tap while the elixir bar is hidden: the elixir
+                    # value is stale, so the game would reject the play with
+                    # "Not enough Elixir!" / "No card selected" and the
+                    # verification could produce a false positive.
                     cname = perception.tracked_hand[chosen_card]
                     cid = CRSIM_NAME_TO_ID.get(cname, 1)
                     cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
                     if elixir >= cost:
+                        elixir_before = float(elixir)
                         deployed = controller.deploy_card(
                             card_slot=chosen_card,
                             tile_x=tile_x,
@@ -2131,13 +2958,54 @@ def main():
                             hand_box_y=perception.hand_box_y
                         )
                         if deployed:
-                            last_deploy_time = now
-                            perception.current_elixir = max(0.0, perception.current_elixir - cost)
-                            perception.last_card_play_time = now
-                            pending_hand_resync = True
-                            perception.update_hand_on_play(chosen_card, deduct_elixir=False)
-                            match_deployments.append((cname, (tile_x, tile_y), source))
-                            print(f"{source} Deployed {cname} (Slot {chosen_card}) -> Tile ({tile_x}, {tile_y}) [Elixir: {perception.current_elixir:.1f}]")
+                            time.sleep(DEPLOY_VERIFY_DELAY_S)
+                            verify_frame = capture.capture_frame()
+                            verified, diagnostics = perception.verify_deployment(
+                                before_frame=frame,
+                                after_frame=verify_frame,
+                                slot=chosen_card,
+                                card_name=cname,
+                                elixir_before=elixir_before,
+                            )
+                            if verified:
+                                last_deploy_time = now
+                                if diagnostics.get("reason") == "elixir dropped":
+                                    # The verification frame already shows the
+                                    # post-spend elixir - do not deduct twice.
+                                    perception.current_elixir = max(
+                                        0.0, float(diagnostics.get("elixir_after", perception.current_elixir))
+                                    )
+                                else:
+                                    # Verified through the hand slot only: the
+                                    # elixir bar may not have caught up yet.
+                                    perception.current_elixir = max(0.0, elixir_before - cost)
+                                perception.last_card_play_time = now
+                                pending_hand_resync = True
+                                perception.update_hand_on_play(
+                                    chosen_card, deduct_elixir=False, card_name=cname
+                                )
+                                match_deployments.append((cname, (tile_x, tile_y), source))
+                                print(f"{source} Deployed {cname} (Slot {chosen_card}) -> "
+                                      f"Tile ({tile_x}, {tile_y}) [Elixir: {perception.current_elixir:.1f}] "
+                                      f"[verified via {diagnostics.get('reason')}]")
+                            else:
+                                # REJECTED TAP: the card never left the hand.
+                                try:
+                                    os.makedirs(".tmp", exist_ok=True)
+                                    if verify_frame is not None and verify_frame.size:
+                                        cv2.imwrite(".tmp/rejected_tap.png", verify_frame)
+                                    else:
+                                        cv2.imwrite(".tmp/rejected_tap.png", frame)
+                                    perception.save_elixir_debug(
+                                        verify_frame if (verify_frame is not None and verify_frame.size) else frame
+                                    )
+                                except Exception:
+                                    pass
+                                perception.block_slot(chosen_card, REJECTED_SLOT_BLOCK_TICKS)
+                                print(f"[REJECTED TAP] {cname} (Slot {chosen_card}) -> Tile "
+                                      f"({tile_x}, {tile_y}) was NOT deployed: {diagnostics}. "
+                                      f"Slot blocked for {REJECTED_SLOT_BLOCK_TICKS} ticks. "
+                                      f"Evidence: .tmp/rejected_tap.png / .tmp/elixir_debug.png")
 
                 # Record the decision so real matches can be used for
                 # behaviour cloning (tools/train_live_bc.py).

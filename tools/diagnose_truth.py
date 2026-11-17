@@ -16,32 +16,41 @@ from cr_alphastar_agent.config import (
 )
 from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID
+from cr_alphastar_agent.env.tactical_masks import EnemyUnit, build_tactical_masks
 from cr_alphastar_agent.utils.card_classifier import VisualCardClassifier
 from deploy_mumu import PerceptionAdapter, ADBController
 
 def create_environment_state(hand_ids, elixir, active_enemy_units=None, device="cpu"):
     """
-    Builds canonical observation dict according to the updated perception & environment rules:
-    1. Card-conditioned tile mask (spells strictly 2-tile radius around enemies with lead; troops same-lane).
-    2. Spell gating on empty arena (spells disabled when 0 active enemies at y >= 12).
-    3. Low-elixir idle gate (< 7.5 elixir with 0 active enemies forces banking).
+    Builds canonical observation dict according to the updated perception & environment rules.
+
+    The tactical masks are produced by the *shared* module
+    ``cr_alphastar_agent.env.tactical_masks`` so that this diagnostic, the
+    simulator and the live MuMu bridge can never disagree:
+
+    1. Card-conditioned tile mask (spells strictly 2-tile radius around
+       enemies with lead; troops same-lane).
+    2. Spell gating on empty arena (spells disabled when 0 active enemies
+       at y >= 12).
+    3. Empty-board elixir bank (< 8.0 elixir with 0 active enemies forces
+       banking).
     """
     if active_enemy_units is None:
         active_enemy_units = []
-        
+
     num_active_enemies = len(active_enemy_units)
-    
+
     # 1. Scalars: [own_elixir_norm, opp_elixir_est, time_norm, is_ot]
     scalars = torch.tensor([[elixir / 10.0, 0.5, 0.8, 0.0]], dtype=torch.float32, device=device)
-    
+
     # 2. Hand cards: 4 cards + next card (dummy 1)
     hand_cards = torch.tensor([hand_ids + [1]], dtype=torch.long, device=device)
-    
+
     # 3. Entities & Arena Grid
     entities = torch.zeros((1, MAX_ENTITIES, ENTITY_FEATURES), dtype=torch.float32, device=device)
     entity_mask = torch.ones((1, MAX_ENTITIES), dtype=torch.bool, device=device)
     arena_grid = torch.zeros((1, SPATIAL_CHANNELS, ARENA_HEIGHT, ARENA_WIDTH), dtype=torch.float32, device=device)
-    
+
     # Crown towers: slots 0..5
     towers = [
         [0.0,  1.0, 3.5 / 18.0,   6.5 / 32.0,  1.0, 0.0, 1.0],  # 0: Friendly Left Princess
@@ -59,102 +68,27 @@ def create_environment_state(hand_ids, elixir, active_enemy_units=None, device="
         arena_grid[0, 4, gy, gx] = 1.0
 
     arena_grid[0, 5, :16, :] = 1.0  # Friendly zone
-    
+
     # Inject active enemy units (slot 6+)
-    threats_our_half = []
     for idx, (cid, ex, ey) in enumerate(active_enemy_units, start=6):
         norm_x = ex / 18.0
         norm_y = ey / 32.0
         entities[0, idx] = torch.tensor([cid / 16.0, -1.0, norm_x, norm_y, 1.0, 0.0, 1.0], device=device)
         entity_mask[0, idx] = False
         arena_grid[0, 2, int(np.clip(ey, 0, 31)), int(np.clip(ex, 0, 17))] = 1.0
-        if ey <= 15.5:
-            threats_our_half.append((ex, ey))
-            
-    # 4. Card Mask (with spell gating & low-elixir idle gate)
-    # Only unmask a Spell card in card_mask[slot] if there are >= 1 enemy units at tile_y >= 12
-    enemies_at_bridge_or_above = sum(1 for (cid, ex, ey) in active_enemy_units if ey >= 12.0)
-    card_mask = torch.zeros((1, 5), dtype=torch.bool, device=device)
-    for i, cid in enumerate(hand_ids):
-        cost = CARDS_CATALOG.get(cid, {}).get("cost", 3)
-        if elixir >= cost:
-            # Rule 2: Gate spells if 0 enemies at tile_y >= 12
-            if cid in SPELL_CARD_IDS and enemies_at_bridge_or_above == 0:
-                card_mask[0, i] = False
-            else:
-                card_mask[0, i] = True
-        else:
-            card_mask[0, i] = False
 
-    # Win-condition defense guard: If under threat on our half (ey <= 15.5),
-    # never waste building-targeters (Giant, HogRider) if an affordable defensive card is present
-    if threats_our_half:
-        has_affordable_defense = any(
-            card_mask[0, s] and hand_ids[s] in DEFENSIVE_CARD_IDS
-            for s in range(4)
-        )
-        if has_affordable_defense:
-            for s in range(4):
-                if hand_ids[s] in WIN_CONDITION_IDS:
-                    card_mask[0, s] = False
+    # 4./5. Card mask + card-conditioned tile mask (shared implementation).
+    enemy_views = [
+        EnemyUnit(card_id=int(cid), x=float(ex), y=float(ey), hp=1.0)
+        for (cid, ex, ey) in active_enemy_units
+    ]
+    bundle = build_tactical_masks(
+        hand_ids, float(elixir), enemy_views, enemy_king=(9.0, 31.0)
+    )
+    card_mask = torch.from_numpy(bundle.card_mask).unsqueeze(0).to(device)
+    card_tile_mask = torch.from_numpy(bundle.card_tile_mask).unsqueeze(0).to(device)
+    tile_mask = torch.from_numpy(bundle.tile_mask).unsqueeze(0).to(device)
 
-    # Rule 3: Low-Elixir Idle Gate (< 7.5 elixir with 0 active enemies forces banking)
-    if elixir < 7.5 and num_active_enemies == 0:
-        card_mask[0, :4] = False
-        
-    card_mask[0, 4] = True  # Slot 4 (Wait) is always legal
-    
-    # 5. Card-Conditioned Tile Mask: shape [1, 5, 576]
-    card_tile_mask = torch.zeros((1, 5, TOTAL_TILES), dtype=torch.bool, device=device)
-    for slot in range(4):
-        cid = hand_ids[slot]
-        if cid not in SPELL_CARD_IDS:
-            if cid == 11:  # HogRider: strictly Left and Right bridges
-                for x in range(2, 5):
-                    card_tile_mask[0, slot, 14 * ARENA_WIDTH + x] = True
-                for x in range(13, 16):
-                    card_tile_mask[0, slot, 14 * ARENA_WIDTH + x] = True
-            elif threats_our_half:
-                # When defending an active bridge threat on our side, placements must be in front of towers (y in 8..12)
-                # Troops deploy directly in the SAME LANE as the threat
-                primary_ex = threats_our_half[0][0]
-                lane_min_x = int(max(1, primary_ex - 2))
-                lane_max_x = int(min(16, primary_ex + 2))
-                if cid in (13,):  # Cannon / defensive buildings
-                    for y in range(9, 13):
-                        for x in range(7, 11):
-                            card_tile_mask[0, slot, y * ARENA_WIDTH + x] = True
-                else:  # Defenders (Mini P.E.K.K.A, Knight, Skeletons, Archers, etc.)
-                    for y in range(8, 13):
-                        for x in range(lane_min_x, lane_max_x + 1):
-                            card_tile_mask[0, slot, y * ARENA_WIDTH + x] = True
-            else:
-                for y in range(15):
-                    for x in range(ARENA_WIDTH):
-                        card_tile_mask[0, slot, y * ARENA_WIDTH + x] = True
-        else:
-            # Spells: STRICTLY restricted to a 2-tile radius around detected enemy units (y >= 12)
-            # Never unmask entire arena (prevents logit bias to empty grass like (12, 27)).
-            # Starts with all False across all 576 tiles.
-            for (ecid, ex_val, ey_val) in active_enemy_units:
-                if ey_val >= 11.5:
-                    cx = int(round(ex_val))
-                    cy = max(12, int(round(ey_val)) - 1)  # Lead 1 tile down for travel time, strictly >= 12
-                    for dx in range(-2, 3):
-                        for dy in range(-2, 3):
-                            tx = cx + dx
-                            ty = cy + dy
-                            if 0 <= tx < ARENA_WIDTH and 12 <= ty < ARENA_HEIGHT:
-                                card_tile_mask[0, slot, ty * ARENA_WIDTH + tx] = True
-                        
-    card_tile_mask[0, 4] = True  # Slot 4 (Wait) legal everywhere
-    
-    # Base tile mask (legacy union of friendly side)
-    tile_mask = torch.zeros((1, TOTAL_TILES), dtype=torch.bool, device=device)
-    for y in range(15):
-        for x in range(ARENA_WIDTH):
-            tile_mask[0, y * ARENA_WIDTH + x] = True
-            
     obs = {
         "scalars": scalars,
         "hand_cards": hand_cards,

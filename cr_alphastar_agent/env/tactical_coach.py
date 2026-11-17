@@ -39,6 +39,7 @@ from cr_alphastar_agent.env.tactics import (
     card_hp,
     is_spell,
     nearest_legal_tile,
+    perspective,
     sample_placement,
     threat_pressure,
     threats_on_our_side,
@@ -124,21 +125,34 @@ class TacticalCoachBot:
         return int(self.rng.choice(slots))
 
     def _legal_tile(self, obs: Dict[str, np.ndarray], slot: int,
-                    desired_x: float, desired_y: float) -> Optional[int]:
+                    desired_x: float, desired_y: float,
+                    min_y: Optional[int] = None) -> Optional[int]:
         """Snap the desired tile onto the closest tile legal for this card.
 
         Buildings block deployment zones and the engine refuses those
         placements, so a purely geometric anchor is not always playable.
         Without this snap the teacher would emit actions the network cannot
         imitate and behaviour cloning would train against a masked target.
+
+        ``min_y`` restricts the snap to rows at or above the given tile row.
+        It is used for spells: snapping a spell onto the closest unmasked
+        tile would otherwise happily drop a Fireball *in front of our own
+        tower* once the target has already crossed the bridge.
         """
         card_tiles = obs.get("card_tile_mask")
         if card_tiles is None:
             return tile_index(desired_x, desired_y)
         mask = np.asarray(card_tiles[slot], dtype=bool)
+        if min_y is not None:
+            rows = np.arange(mask.size) // ARENA_WIDTH
+            mask = np.logical_and(mask, rows >= int(min_y))
         if not mask.any():
             return None
         return nearest_legal_tile(mask, desired_x, desired_y)
+
+    def _spell_min_row(self) -> int:
+        """First canonical row that is *not* in our own half."""
+        return int(perspective(self.team).own_half_max_y) + 1
 
     # ------------------------------------------------------------------ act
     def act(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
@@ -165,7 +179,7 @@ class TacticalCoachBot:
                 decision = best_spell_target(cid, units, team=self.team)
                 if decision is not None and decision.target is not None:
                     tx, ty = decision.target
-                    tile = self._legal_tile(obs, slot, tx, ty)
+                    tile = self._legal_tile(obs, slot, tx, ty, min_y=self._spell_min_row())
                     if tile is not None:
                         return np.array([slot, tile], dtype=np.int64)
 
@@ -201,7 +215,7 @@ class TacticalCoachBot:
                 decision = best_spell_target(cid, units, team=self.team)
                 if decision is not None and decision.target is not None:
                     tx, ty = decision.target
-                    tile = self._legal_tile(obs, slot, tx, ty)
+                    tile = self._legal_tile(obs, slot, tx, ty, min_y=self._spell_min_row())
                     if tile is not None:
                         return np.array([slot, tile], dtype=np.int64)
 

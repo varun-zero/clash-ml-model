@@ -134,13 +134,28 @@ class VisualCardClassifier:
                         self.templates["Archer"] = img
 
     def crop_slots(self, frame: np.ndarray,
-                   y_range: Tuple[float, float] = (0.835, 0.945),
+                   y_range: Tuple[float, float] = (0.815, 0.950),
                    x_slots: Optional[List[Tuple[float, float]]] = None) -> List[np.ndarray]:
-        """Crops the 4 hand card slots from a vertical frame."""
+        """Crops the 4 hand card slots from a vertical frame.
+
+        The vertical window is deliberately *taller* than the resting card
+        slot (``0.815 .. 0.950`` instead of ``0.835 .. 0.945``).  When a card
+        is selected it is lifted by roughly 15-20 px, and a crop that only
+        covers the resting position no longer matches the reference template.
+        The padded crop lets :meth:`score_card_crop` slide the template
+        vertically and still find a high correlation.
+        """
         h, w = frame.shape[:2]
         if x_slots is None:
+            # Measured on a real 900x1600 in-battle frame: the four hand
+            # cards span x 207..850 with a ~148 px card width and a ~165 px
+            # pitch.  These windows take the central 126 px of every card,
+            # which is what the reference templates in ``card_templates/``
+            # (cut from the deck screen) match best - verified 4/4 on a real
+            # in-battle hand with a top-1/top-2 margin of 0.20 / 0.11 /
+            # 0.21 / 0.46.
             x_slots = [(0.24, 0.38), (0.43, 0.57), (0.62, 0.76), (0.81, 0.95)]
-            
+
         y1, y2 = int(y_range[0] * h), int(y_range[1] * h)
         crops = []
         for x1_r, x2_r in x_slots:
@@ -153,56 +168,84 @@ class VisualCardClassifier:
         """Computes matching similarity score [0.0 .. 1.0] for a given card candidate."""
         if crop is None or crop.size == 0:
             return 0.0
-            
+
         # 1. Template match score if reference image exists
         template_score = 0.0
         tmpl = self.templates.get(cname)
         if tmpl is None:
             tmpl = self.templates.get(self._canonical(cname))
         if tmpl is not None:
-            # Resize template to match crop size
-            resized_tmpl = cv2.resize(tmpl, (crop.shape[1], crop.shape[0]))
-            res = cv2.matchTemplate(crop, resized_tmpl, cv2.TM_CCOEFF_NORMED)
-            template_score = float(max(0.0, res[0, 0]))
-            
+            template_score = self._template_correlation(crop, tmpl)
+
         # 2. HSV Color Profile Score
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         prof = COLOR_PROFILES.get(cname)
         if prof is None:
             prof = COLOR_PROFILES.get(self._canonical(cname), {})
-        
+
         # Compute matching pixel mask for this card profile
         h_min, h_max = prof.get("h_range", (0, 180))
         h_mask = (h >= h_min) & (h <= h_max)
-        
+
         s_min = prof.get("s_min", 0)
         s_max = prof.get("s_max", 255)
         s_range = prof.get("s_range")
         if s_range:
             s_min, s_max = s_range
         s_mask = (s >= s_min) & (s <= s_max)
-        
+
         v_min = prof.get("v_min", 0)
         v_max = prof.get("v_max", 255)
         v_range = prof.get("v_range")
         if v_range:
             v_min, v_max = v_range
         v_mask = (v >= v_min) & (v <= v_max)
-        
+
         match_pixels = np.sum(h_mask & s_mask & v_mask)
         color_score = float(match_pixels / max(1, crop.shape[0] * crop.shape[1]))
-        
+
         # Combined score: if template exists, 85% template + 15% color; else 100% color
         if tmpl is not None:
             return 0.85 * template_score + 0.15 * min(1.0, color_score * 2.0)
         else:
             return float(np.clip(color_score * 3.5, 0.0, 1.0))
 
+    @staticmethod
+    def _template_correlation(crop: np.ndarray, tmpl: np.ndarray) -> float:
+        """Shift-tolerant template correlation.
+
+        The template is resized to the *width* of the crop and keeps its
+        aspect ratio, so it is normally slightly **shorter** than the crop.
+        ``cv2.matchTemplate`` then slides it over every vertical offset and
+        we keep the best score.  A card that is currently lifted (selected)
+        by 15-20 px therefore still correlates strongly with its reference
+        template instead of dropping to noise.
+        """
+        crop_h, crop_w = crop.shape[:2]
+        tmpl_h, tmpl_w = tmpl.shape[:2]
+        if tmpl_w <= 0 or tmpl_h <= 0 or crop_w <= 0 or crop_h <= 0:
+            return 0.0
+
+        scaled_h = int(round(tmpl_h * (crop_w / float(tmpl_w))))
+        scaled_h = max(1, min(crop_h, scaled_h))
+        resized = cv2.resize(tmpl, (crop_w, scaled_h), interpolation=cv2.INTER_AREA)
+
+        # Vertical slide search -> tolerant to the "lifted card" offset.
+        res = cv2.matchTemplate(crop, resized, cv2.TM_CCOEFF_NORMED)
+        return float(max(0.0, float(np.max(res))))
+
     def classify_hand(self, frame: np.ndarray,
                       candidate_deck: Optional[List[str]] = None,
-                      return_scores: bool = False):
-        """Classifies the 4 slots and ensures 4 distinct cards strictly from active_deck are chosen."""
+                      return_scores: bool = False,
+                      exclude: Optional[set] = None):
+        """Classifies the 4 slots and ensures 4 distinct cards strictly from active_deck are chosen.
+
+        ``exclude`` holds card names that must not be predicted (the 4-card
+        cycle: a card that was just played cannot reappear in hand for the
+        next three plays).  Excluded cards are only used as a last resort
+        when no other card can fill a slot.
+        """
         # Strictly restrict candidate deck to active_deck
         allowed_deck = list(self.active_deck)
         if candidate_deck is not None:
@@ -218,44 +261,56 @@ class VisualCardClassifier:
                 candidate_deck = allowed_deck
         else:
             candidate_deck = allowed_deck
-            
+
+        exclude_canon = {self._canonical(c) for c in (exclude or set())}
+
         crops = self.crop_slots(frame)
         if len(crops) != 4:
             if return_scores:
                 return candidate_deck[:4], [1.0] * 4
             return candidate_deck[:4]
-            
+
         # Build score matrix: [4 slots, len(candidate_deck)]
         scores = np.zeros((4, len(candidate_deck)), dtype=np.float32)
         for s_idx, crop in enumerate(crops):
             for c_idx, cname in enumerate(candidate_deck):
                 scores[s_idx, c_idx] = self.score_card_crop(crop, cname)
-                
+
         # Greedy assignment to enforce 4 distinct cards
         chosen = [None] * 4
         chosen_scores = [0.0] * 4
         used_cards = set()
-        
+
         # Sort all (score, slot, card) tuples descending
         pairs = []
         for s in range(4):
             for c in range(len(candidate_deck)):
                 pairs.append((scores[s, c], s, candidate_deck[c]))
         pairs.sort(key=lambda x: -x[0])
-        
+
+        # Pass 1: only cards that respect the 4-card cycle.
+        for score, s, cname in pairs:
+            if self._canonical(cname) in exclude_canon:
+                continue
+            if chosen[s] is None and cname not in used_cards:
+                chosen[s] = cname
+                chosen_scores[s] = float(score)
+                used_cards.add(cname)
+
+        # Pass 2: fill whatever is left with the excluded cards (rare).
         for score, s, cname in pairs:
             if chosen[s] is None and cname not in used_cards:
                 chosen[s] = cname
                 chosen_scores[s] = float(score)
                 used_cards.add(cname)
-                
+
         # Fill any unassigned slots
         rem = [c for c in candidate_deck if c not in used_cards]
         for s in range(4):
             if chosen[s] is None:
                 chosen[s] = rem.pop(0) if rem else candidate_deck[s]
                 chosen_scores[s] = 0.5
-                
+
         self.last_scores = chosen_scores
         if return_scores:
             return chosen, chosen_scores

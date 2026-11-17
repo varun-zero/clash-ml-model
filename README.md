@@ -185,6 +185,28 @@ Run the automated test suite covering rules, card cycle, model heads, and UI ada
 pytest -v
 ```
 
+### 4b. Strict Ground-Truth Verification (mandatory before every live run)
+```powershell
+# Offline ground-truth gates: 10-pip elixir reader, post-match outcome
+# detector, 4-card cycle and tactical mask invariants.
+python tools/verify_ground_truth.py
+
+# Tactical diagnostics (spell masks, same-lane defence, perception audit)
+python tools/diagnose_truth.py
+
+# Full test suite
+pytest -q
+```
+
+**Every live MuMu run MUST follow [`STRICT_VERIFICATION_RUNBOOK.md`](STRICT_VERIFICATION_RUNBOOK.md).**
+It defines the mandatory procedures for a misreading elixir bar, for repeated
+`[REJECTED TAP]` events and for a `"UNVERIFIED"` match outcome (including the
+mandatory in-game Battle Log proof capture into `.tmp/battle_log_proof.png`).
+
+The ground-truth hierarchy is: **in-game Battle Log > post-match end screen >
+match video > `trophy_climb_history.json`**. The history file is a log, never a
+source of truth, and a result is never defaulted to a win.
+
 ### 5. Background BlueStacks Deployment (ADB-only)
 Deploy the trained AlphaStar agent into a live BlueStacks match without taking
 over your desktop:
