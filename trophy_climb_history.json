@@ -176,5 +176,21 @@
     "timestamp": "2026-11-17 19:12:53",
     "trophies_before": 330,
     "evidence": "21 verified deployments, video match_recordings/match_011_20261117_190430.mp4. The live end-screen detector returned WIN 3-0 with delta +30, and the post-match screen (captured afterwards) shows three gold crowns over the player tower beds and the player ribbon reading +30. The Clash Royale home screen trophy counter reads 360, which is the authoritative absolute value."
+  },
+  {
+    "match": 31,
+    "opponent": "Ladder Opponent 12",
+    "result": "WIN",
+    "score": "1 - 0",
+    "delta": 30,
+    "delta_source": "live_end_screen_detector",
+    "trophies": 390,
+    "duration_s": 173.7,
+    "cards_deployed": 25,
+    "verified": true,
+    "video": "match_recordings\\match_012_20261117_205533.mp4",
+    "notes": "First live run with stateful board tracking, card-counter knowledge and self-growing unit-identity templates. 26 unit templates were learned from verified deployments during this session. The post-match learning step was skipped because of a replay tensor-shape bug that has since been fixed and validated on the real replay (KL 7e-06, loss 2.3139 -> 2.3056).",
+    "timestamp": "2026-11-17 20:58:34",
+    "evidence": "Live end-screen detector returned WIN 1-0 during the match; video match_recordings/match_012_20261117_205533.mp4 (81.04 MB). 25 verified deployments, 0 rejected taps."
   }
 ]

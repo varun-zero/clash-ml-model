@@ -227,6 +227,29 @@ python deploy_mumu.py --capture-backend adb-raw
 `--input-mode mouse` now fails with an explanation. `WindowsMouseController`
 remains only as a dry-run compatibility shim for the HUD and tests.
 
+### 5b. Live board understanding and post-match learning
+
+The bridge verifies every tap on a follow-up frame (elixir drop or hand-slot
+correlation change). Unverified taps are logged as `[REJECTED TAP]`, saved to
+`.tmp/rejected_tap.png`, and their slot is blocked for two ticks. Match results
+come from a layout-independent post-match end-screen detector; anything it
+cannot prove is recorded as `UNVERIFIED`, never as a win.
+
+* `env/board_tracker.py` keeps persistent enemy tracks with velocity and
+  destination, detects pushes and identifies the endangered tower. A detected
+  push tightens troop placement to the threatened lane.
+* `utils/card_intel.py` derives a full counter table from the shipped
+  `data/logic.json` (145 cards) using real stats — cost, HP, DPS, range,
+  splash, air/ground and summoned count — with auditable explanations.
+* `env/unit_identity.py` **learns what each card looks like on the battlefield**
+  from every verified deployment. Templates accumulate in `data/unit_templates/`.
+  Enemy card recognition therefore improves with every match.
+* `training/live_learner.py` runs a guarded fine-tune after every verified
+  WIN/LOSS using only verified actions (LR 1e-5, KL leash 0.02, validation
+  check, automatic rollback). `UNVERIFIED` matches produce no gradient. Each
+  attempt is logged in `checkpoints/live_learning_log.jsonl`. Disable with
+  `--no-learn`.
+
 ---
 
 ## Competitive v2 (additive, public-information agent)

@@ -95,6 +95,10 @@ from cr_alphastar_agent.env.tactical_masks import (
     EnemyUnit,
     build_tactical_masks,
 )
+from cr_alphastar_agent.env.board_tracker import BoardTracker
+from cr_alphastar_agent.env.unit_identity import UnitIdentityMemory
+from cr_alphastar_agent.utils.card_intel import get_card_intel
+from cr_alphastar_agent.training.live_learner import LiveLearner
 from cr_alphastar_agent.utils.card_classifier import VisualCardClassifier
 
 STARTER_DECK = ["Knight", "Archers", "Minions", "Arrows", "Fireball", "Giant", "Musketeer", "Mini PEKKA"]
@@ -808,6 +812,18 @@ class PerceptionAdapter:
         #: reported as "0 elixir".
         self.elixir_visible = True
 
+        # Live board understanding: enemy tracks, push detection and the
+        # data-driven card counter table.  None of this changes the network
+        # input shapes, so the trained checkpoint remains loadable.
+        self.board_tracker = BoardTracker()
+        self.card_intel = get_card_intel()
+        self.board_snapshot = None
+        self.enemy_card_names: List[str] = []
+        self.counter_advice: List[Dict[str, Any]] = []
+        # Learns the visual signature of every card we deploy; over matches
+        # this becomes a library of real battlefield unit templates.
+        self.unit_identity = UnitIdentityMemory("data/unit_templates")
+
         # 4-card cycle bookkeeping.  A card that was just played must not be
         # predicted in hand again for the next three plays, so we remember the
         # last three deployed cards and re-rank the classifier around them.
@@ -1252,6 +1268,76 @@ class PerceptionAdapter:
         card_tile_mask = bundle.card_tile_mask
         tile_mask = bundle.tile_mask
 
+        # 5. Live board understanding (stateful, no change to tensor shapes).
+        board_obs = []
+        for e in enemy_units:
+            item = {"x": e.x, "y": e.y, "hp": e.hp}
+            px, py = self.tile_to_pixel(e.x, e.y, frame.shape)
+            identity = self.unit_identity.identify(frame, px, py)
+            if identity is not None:
+                item["card_name"] = identity.card_name
+                item["card_id"] = CRSIM_NAME_TO_ID.get(identity.card_name, 5)
+                item["confidence"] = identity.confidence
+            board_obs.append(item)
+        self.board_snapshot = self.board_tracker.update(board_obs, time.time())
+        snapshot = self.board_snapshot
+
+        # Counter knowledge: only mask out a card that is *useless* against
+        # everything currently on the board (e.g. a ground-only troop facing
+        # a lone Balloon).  Ranking is advisory; we never override a legal
+        # action with a guess.
+        self.enemy_card_names = []
+        for track in snapshot.enemy_tracks:
+            if track.card_name and track.card_name != "unknown":
+                self.enemy_card_names.append(track.card_name)
+        self.counter_advice = []
+        if self.enemy_card_names:
+            scored_slots = []
+            for slot, name in enumerate(self.tracked_hand[:4]):
+                scores = [self.card_intel.counter_score(name, e).score
+                          for e in self.enemy_card_names]
+                best = max(scores) if scores else 0.0
+                target = self.enemy_card_names[int(np.argmax(scores))] if scores else None
+                if scores and best <= -100 and slot < 4:
+                    card_mask[slot] = False  # can never answer this threat
+                self.counter_advice.append({
+                    "slot": slot, "card": name,
+                    "best_score": round(best, 1), "against": target,
+                })
+                if card_mask[slot]:
+                    scored_slots.append((best, slot))
+
+            # Prefer real answers over clearly bad trades.  This is a mask,
+            # not a logit edit: at least one card and Wait always stay legal.
+            if scored_slots:
+                best_score = max(s for s, _ in scored_slots)
+                if best_score >= 25:
+                    for score, slot in scored_slots:
+                        if score <= -25:
+                            card_mask[slot] = False
+                if not card_mask[:4].any():
+                    _, fallback = max(scored_slots)
+                    card_mask[fallback] = True
+
+        # A detected push tightens troop deployment to the threatened lane.
+        if snapshot.push_detected and snapshot.defense_target is not None:
+            target_x, target_y = snapshot.defense_target
+            for slot in range(4):
+                cid = hand_cards[slot]
+                if cid in (11, 3) or cid in (8, 9, 14, 16):
+                    continue  # win conditions and spells keep their own masks
+                if not card_mask[slot]:
+                    continue
+                x_min = int(max(1, target_x - 2))
+                x_max = int(min(16, target_x + 2))
+                focused = np.zeros_like(card_tile_mask[slot])
+                for tile_y in range(8, 13):
+                    for tile_x in range(x_min, x_max + 1):
+                        focused[tile_y * ARENA_WIDTH + tile_x] = True
+                if focused.any():
+                    card_tile_mask[slot] = focused
+                    card_mask[slot] = True
+
         # Wrap in PyTorch batch tensors [1, ...] on target device
         obs = {
             "scalars": torch.from_numpy(scalars).unsqueeze(0).to(self.device),
@@ -1448,6 +1534,21 @@ class PerceptionAdapter:
                 return "play_again", cx, cy
 
         return None
+
+    def tile_to_pixel(self, tile_x: float, tile_y: float,
+                      frame_shape: Tuple[int, int]) -> Tuple[int, int]:
+        """Canonical arena tile -> guest screen pixel (same mapping as the controller)."""
+        h, w = frame_shape[:2]
+        norm_x = (tile_x + 0.5) / ARENA_WIDTH
+        norm_y = (tile_y + 0.5) / ARENA_HEIGHT
+        screen_y = self.arena_box["bottom"] - norm_y * (
+            self.arena_box["bottom"] - self.arena_box["top"]
+        )
+        screen_x = self.arena_box["left"] + norm_x * (
+            self.arena_box["right"] - self.arena_box["left"]
+        )
+        return (int(np.clip(screen_x * w, 0, w - 1)),
+                int(np.clip(screen_y * h, 0, h - 1)))
 
     def _card_tray_visible(self, frame: np.ndarray) -> bool:
         """Are the four hand cards visible in the tray?
@@ -2427,9 +2528,14 @@ def main():
                         help="Dry-run mode: Visualize decisions without sending ADB taps")
     parser.add_argument("--telemetry-file", type=str, default=".tmp/match_telemetry.jsonl",
                         help="Path to write per-tick forensic telemetry JSONL logs")
-    parser.add_argument("--record-matches", type=str, default=None,
-                        help="Record live decisions to this JSONL file so real matches can be "
-                             "used for behaviour cloning (see tools/train_live_bc.py)")
+    parser.add_argument("--record-matches", type=str, default=".tmp/live_replays.jsonl",
+                        help="Record verified live decisions to this JSONL file for post-match learning")
+    parser.add_argument("--learn", dest="learn", action="store_true", default=True,
+                        help="Run a guarded fine-tuning step after each verified match (default)")
+    parser.add_argument("--no-learn", dest="learn", action="store_false",
+                        help="Disable post-match learning")
+    parser.add_argument("--learning-log", type=str, default="checkpoints/live_learning_log.jsonl",
+                        help="Audit log for post-match weight updates")
     parser.add_argument("--deck", type=str, default="current",
                         help="Deck preset or comma-separated card list to track in hand "
                              "(default: current)")
@@ -2705,6 +2811,40 @@ def main():
 
                     update_artifact_log(history, current_trophies, args.target_trophies, args.artifact_file)
 
+                    # Guarded post-match learning.  The recorder writes one
+                    # row per decision with a `weight` that is 1 only when
+                    # the tap was verified on a follow-up frame, so phantom
+                    # deployments can never become training targets.
+                    if args.learn and recorder is not None and result in ("WIN", "LOSS"):
+                        try:
+                            replay_rows = []
+                            if os.path.exists(args.record_matches):
+                                with open(args.record_matches, "r", encoding="utf-8") as handle:
+                                    all_rows = [json.loads(line) for line in handle if line.strip()]
+                                replay_rows = [
+                                    row for row in all_rows
+                                    if (row.get("session") or {}).get("match_index") == completed_matches
+                                ]
+                            learner = LiveLearner(args.checkpoint, device=str(device),
+                                                  log_path=args.learning_log)
+                            learn_result = learner.after_match(
+                                replay_rows, result, len(match_deployments)
+                            )
+                            match_entry["learning"] = learn_result.as_dict()
+                            if learn_result.updated:
+                                # The running model must use the new weights too.
+                                model.load_state_dict(learner.model.state_dict())
+                            print(f"[LEARN] {learn_result.reason} "
+                                  f"(samples={learn_result.samples}, "
+                                  f"KL={learn_result.mean_kl:.4f})")
+                            try:
+                                with open(args.history_file, "w", encoding="utf-8") as f:
+                                    json.dump(history, f, indent=2)
+                            except Exception:
+                                pass
+                        except Exception as exc:
+                            print(f"[LEARN] skipped: {exc}")
+
                     print("=" * 65)
                     print(f"🏁 MATCH {completed_matches} FINISHED! [{result} {p_crowns}-{o_crowns}]")
                     print(f"   Delta: {delta:+d} | Total Trophies: {current_trophies}/{args.target_trophies}")
@@ -2793,6 +2933,9 @@ def main():
                     perception.recent_deployed_cards.clear()
                     perception.deployed_card_names.clear()
                     perception.blocked_slots.clear()
+                    perception.board_tracker.reset()
+                    if recorder is not None:
+                        recorder.session["match_index"] = completed_matches + 1
                     perception.read_hand(frame, force_refresh=True)
                     video_recorder.start_recording(completed_matches + 1)
                     if args.telemetry_file and os.path.exists(args.telemetry_file):
@@ -2923,6 +3066,23 @@ def main():
                         "chosen_tile": [int(tile_x), int(tile_y)],
                         "screen_tap": [int(screen_px), int(screen_py)],
                         "value_est": round(float(value_est), 3),
+                        "board": ({
+                            "tracked_enemies": [
+                                {"id": t.track_id, "x": round(t.x, 2), "y": round(t.y, 2),
+                                 "vx": round(t.vx, 2), "vy": round(t.vy, 2),
+                                 "destination": [round(v, 1) for v in t.destination],
+                                 "card": t.card_name, "confidence": round(t.confidence, 2)}
+                                for t in perception.board_snapshot.enemy_tracks
+                            ],
+                            "enemy_cards": perception.enemy_card_names,
+                            "push": perception.board_snapshot.push_detected,
+                            "push_size": perception.board_snapshot.push_size,
+                            "under_threat": perception.board_snapshot.under_threat,
+                            "danger_tower": perception.board_snapshot.most_dangerous_tower,
+                            "tower_hp": {k: round(v.hp_ratio, 2)
+                                         for k, v in perception.board_snapshot.towers.items()},
+                            "counters": perception.counter_advice,
+                        } if perception.board_snapshot is not None else None),
                     }
                     try:
                         os.makedirs(os.path.dirname(os.path.abspath(args.telemetry_file)), exist_ok=True)
@@ -2937,6 +3097,7 @@ def main():
                 # on a follow-up frame (elixir dropped or the card left its
                 # hand slot).  Unverified taps are rejected, blocked for the
                 # next two ticks and never enter the match statistics.
+                last_action_verified = False
                 if (chosen_card != 4 and not cooldown_active
                         and (now - last_deploy_time >= min_deploy_cooldown)
                         and perception.elixir_visible):
@@ -2968,6 +3129,20 @@ def main():
                                 elixir_before=elixir_before,
                             )
                             if verified:
+                                last_action_verified = True
+                                # Teach the identity memory what this card
+                                # looks like on the battlefield.  The
+                                # verification frame is guaranteed to be
+                                # after the tap, so the unit is visible.
+                                try:
+                                    arena_px, arena_py = perception.tile_to_pixel(
+                                        tile_x, tile_y, verify_frame.shape
+                                    )
+                                    perception.unit_identity.learn(
+                                        cname, verify_frame, arena_px, arena_py
+                                    )
+                                except Exception:
+                                    pass
                                 last_deploy_time = now
                                 if diagnostics.get("reason") == "elixir dropped":
                                     # The verification frame already shows the
@@ -3017,6 +3192,8 @@ def main():
                         done=False,
                         result=None,
                         t_ms=int(perception.match_time_elapsed * 1000),
+                        weight=1.0 if last_action_verified else 0.0,
+                        verified=last_action_verified,
                     )
 
             # 4. Optional Visualization Overlay

@@ -32,6 +32,10 @@ checkpoints/current_deck/match_log*.json
 checkpoints/current_deck/training_history*.json
 checkpoints/*.png
 
+# Post-match learning backups (the live learner keeps its own .pre_live.bak)
+checkpoints/*.bak
+checkpoints/*.before_live_learning
+
 # Local match replay recordings and temporary files
 replays/*.json
 match_recordings/

@@ -1,0 +1,55 @@
+{
+  "templates": {
+    "Knight": [
+      "Knight_000.png",
+      "Knight_001.png",
+      "Knight_002.png",
+      "Knight_003.png"
+    ],
+    "Mini PEKKA": [
+      "Mini PEKKA_000.png"
+    ],
+    "Giant": [
+      "Giant_000.png",
+      "Giant_001.png",
+      "Giant_002.png",
+      "Giant_003.png"
+    ],
+    "Arrows": [
+      "Arrows_000.png",
+      "Arrows_001.png",
+      "Arrows_002.png",
+      "Arrows_003.png",
+      "Arrows_004.png"
+    ],
+    "Archers": [
+      "Archers_000.png",
+      "Archers_001.png",
+      "Archers_002.png",
+      "Archers_003.png",
+      "Archers_004.png"
+    ],
+    "Musketeer": [
+      "Musketeer_000.png",
+      "Musketeer_001.png"
+    ],
+    "Minions": [
+      "Minions_000.png",
+      "Minions_001.png",
+      "Minions_002.png"
+    ],
+    "Fireball": [
+      "Fireball_000.png"
+    ]
+  },
+  "counts": {
+    "Knight": 4,
+    "Mini PEKKA": 1,
+    "Giant": 4,
+    "Arrows": 5,
+    "Archers": 5,
+    "Musketeer": 2,
+    "Minions": 3,
+    "Fireball": 1
+  }
+}

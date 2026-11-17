@@ -454,8 +454,54 @@ The absolute correlation threshold of `0.80` is **unreachable** with the
 shipped templates: they were cut from the deck screen while the live hand
 tray shows the same art at a different scale.  Measured on a real in-battle
 frame the resting correlation of a *correctly identified* card is
-**0.37 - 0.60**.  The relative drop is therefore the mechanism that
-actually works, and the absolute rule is only a secondary fallback.
+**0.37 - 0.60**.  The relative drop is therefore the mechanism that actually
+works, and the absolute rule is only a secondary fallback.
+
+---
+
+## 5b. Live board understanding and card identity
+
+The bridge now keeps a **stateful board model** (`env/board_tracker.py`)
+instead of treating every frame independently:
+
+* enemy detections are matched to persistent tracks using velocity prediction
+  (two troops one tile apart must not swap identities);
+* each track carries a smoothed velocity, a 3-second destination, and a
+  confidence;
+* the tracker answers "which tower is in danger", "is the opponent building
+  a push", and "where should I defend";
+* a detected push tightens troop placement to the threatened lane before the
+  model chooses a tile.
+
+`data/logic.json` (the shipped game data, 145 playable cards) is converted to
+a counter table by `utils/card_intel.py`.  Every score comes from real stats
+(cost, HP, DPS, range, splash, air/ground, summoned count) and carries an
+explanation.  When a card is completely useless against the threat (e.g. a
+ground-only troop against a lone Balloon) it is masked out.  With a strong
+counter in hand, clearly bad trades are masked as well — at least one card and
+Wait always stay legal.
+
+**Enemy card identity is learned from the game itself**: every verified
+deployment teaches `env/unit_identity.py` what that card looks like on the
+battlefield.  Templates persist in `data/unit_templates/`.  Identification
+is only accepted above 0.72 correlation and its confidence is recorded in the
+telemetry; unknown units remain `card_id = 5` (the honest fallback from the
+original perception layer).
+
+### Post-match learning
+
+`training/live_learner.py` runs after every WIN/LOSS:
+
+* only decisions with `weight = 1` (verified deployments) are targets;
+* `UNVERIFIED` matches produce **no gradient**;
+* at least 12 verified decisions are required, learning rate 1e-5, one epoch;
+* the update is rejected if validation loss regresses > 5% or the policy
+  drifts more than 0.02 KL from the frozen reference;
+* the old checkpoint is backed up to `*.pre_live.bak` before every write.
+
+Every attempt is written to `checkpoints/live_learning_log.jsonl`.
+Use `--no-learn` to disable.  The checkpoint keeps all trainer-compatible
+keys, so training can be resumed normally afterwards.
 
 ---
 

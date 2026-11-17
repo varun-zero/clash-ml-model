@@ -46,14 +46,34 @@ class LiveMatchRecorder:
     # ------------------------------------------------------------------ api
     def record(self, obs: Dict[str, np.ndarray], action: Sequence[int],
                *, reward: float = 0.0, done: bool = False,
-               result: Optional[int] = None, t_ms: int = 0) -> None:
+               result: Optional[int] = None, t_ms: int = 0,
+               weight: float = 1.0, verified: bool = False) -> None:
+        """Append one decision.
+
+        ``weight``/``verified`` carry the forensic signal from the post-tap
+        check: only decisions whose deployment was actually confirmed on a
+        follow-up frame should train the policy.  Recording them lets the
+        post-match learner ignore phantom taps.
+        """
+        # The live bridge builds its observation tensors on the selected
+        # device (CUDA on this machine).  numpy cannot convert a CUDA tensor
+        # directly, so move every tensor to the CPU first.
+        def serialisable(value):
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            return np.asarray(value).tolist()
+
         row = {
             "t_ms": int(t_ms),
-            "obs": {k: np.asarray(v).tolist() for k, v in obs.items()},
+            "obs": {k: serialisable(v) for k, v in obs.items()},
             "action": [int(a) for a in action],
             "reward": float(reward),
             "done": bool(done),
             "result": result,
+            "weight": float(weight),
+            "verified": bool(verified),
             "session": self.session,
         }
         self._handle.write(json.dumps(row) + "\n")

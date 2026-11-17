@@ -1,0 +1,1 @@
+{"updated": true, "reason": "guarded BC update after WIN", "samples": 25, "loss_before": 2.31392, "loss_after": 2.305563, "mean_kl": 7e-06, "checkpoint": "checkpoints/latest.pt", "timestamp": "2026-11-17 21:03:13", "match_result": "WIN"}
