@@ -1058,11 +1058,13 @@ class HybridPPOTrainer:
                 active_card_ent = card_ent[multi_choice].mean() if multi_choice.any() else card_entropy_mean
 
                 if critic_warmup:
+                    # The actor does not move, but its distribution is still
+                    # measurable — logging zero here made the whole warmup
+                    # phase look like a broken entropy metric.
                     metrics["pg_loss"] += 0.0
-                    metrics["entropy"] += 0.0
                 else:
                     metrics["pg_loss"] += pg_loss.item()
-                    metrics["entropy"] += (card_entropy_mean + tile_entropy_mean).item()
+                metrics["entropy"] += (card_entropy_mean + tile_entropy_mean).item()
                 metrics["v_loss"] += v_loss.item()
                 metrics["card_entropy"] += card_entropy_mean.item()
                 metrics["card_entropy_active"] += active_card_ent.item()
