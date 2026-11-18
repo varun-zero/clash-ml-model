@@ -56,6 +56,11 @@ ENTROPY_CARD_COEF = 0.015
 #: Raised from 0.0005 for PFSP league training: the old value let the tile
 #: head collapse onto a single tile ((2, 13) in live matches).
 ENTROPY_TILE_COEF = 0.004
+#: Direct anti-collapse term.  Penalises the concentration (sum p^2) of the
+#: batch-level marginal tile distribution.  The entropy bonus is hinge-clamped
+#: at 2.8 nats, so it is INACTIVE for the current ~4.25-nat policy; this term
+#: is what actually stops one tile from taking 40-50% of all placements.
+TILE_DIVERSITY_COEF = 0.15
 
 # After a behaviour-cloning warm start the critic needs a few updates to
 # settle before the actor is allowed to move.
@@ -991,8 +996,9 @@ class HybridPPOTrainer:
                 mb_obs = {k: v[mb_idx] for k, v in b_obs.items()}
 
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    _, newlogprob, (card_ent, tile_ent), newvalue = self.model.get_action_and_value(
+                    _, newlogprob, (card_ent, tile_ent), newvalue, tile_probs = self.model.get_action_and_value(
                         mb_obs, b_actions[mb_idx], return_entropy_breakdown=True,
+                        return_tile_probs=True,
                         # Replay the nucleus that was used to sample the action
                         # so the evaluated distribution matches the behaviour
                         # policy exactly (otherwise the ratio explodes).
@@ -1036,12 +1042,28 @@ class HybridPPOTrainer:
                     else:
                         anchor_penalty = torch.zeros((), device=self.device)
 
+                    # Anti-collapse: penalise concentration (sum p^2) of the
+                    # batch-level marginal tile distribution.  Wait actions
+                    # have no placement and must not contribute.  The entropy
+                    # bonus is hinge-clamped at 2.8 nats, so it is INACTIVE at
+                    # the current ~4.25-nat policy; this differentiable term is
+                    # what actually stops one tile taking 40-50% of placements.
+                    play_mask = (b_actions[mb_idx, 0] != 4).float().unsqueeze(-1)
+                    n_play = play_mask.sum().clamp(min=1.0)
+                    marginal = (tile_probs * play_mask).sum(dim=0) / n_play
+                    concentration = (marginal ** 2).sum()
+                    diversity_penalty = TILE_DIVERSITY_COEF * concentration
+                    metrics["diversity_concentration"] = metrics.get(
+                        "diversity_concentration", 0.0
+                    ) + float(concentration.detach().item())
+
                     if critic_warmup:
                         # Critic warmup: only the value head is updated, the
                         # actor is left exactly where behaviour cloning put it.
                         loss = (VF_COEF * v_loss) / accum_steps
                     else:
                         loss = (pg_loss - entropy_loss + anchor_penalty
+                                + diversity_penalty
                                 + VF_COEF * v_loss) / accum_steps
 
                 self.scaler.scale(loss).backward()
@@ -1153,7 +1175,8 @@ class HybridPPOTrainer:
             "tactical_zone_pcts": zone_pcts,
             "distinct_tiles": len(self.batch_tiles),
             "top_tile_share": round(
-                max(self.batch_tiles.values()) / max(1, sum(self.batch_tiles.values())), 4
+                max(self.batch_tiles.values()) / max(1, sum(self.batch_tiles.values()))
+                if self.batch_tiles else 0.0, 4
             ),
         })
 
@@ -1179,6 +1202,7 @@ class HybridPPOTrainer:
             "batch_win_rate": float(batch_win_rate),
             "distinct_tiles": len(self.batch_tiles),
             "top_tile_share": float(avg_metrics.get("top_tile_share", 0.0)),
+            "diversity_concentration": float(avg_metrics.get("diversity_concentration", 0.0)),
         }
         self.training_history.append(history_entry)
         self._save_training_history()

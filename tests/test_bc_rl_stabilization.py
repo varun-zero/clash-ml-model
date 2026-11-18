@@ -135,9 +135,11 @@ def test_critic_warmup_freezes_actor_gradients(tmp_path):
 
     metrics = trainer.ppo_update(buffer, epochs=1)
 
-    # In critic warmup: pg_loss = 0.0 and entropy = 0.0
+    # In critic warmup the actor does not move, so pg_loss stays 0.  Entropy
+    # is still measurable (and now logged) during warmup - it reflects the
+    # policy's distribution, not whether the actor was updated.
     assert metrics["pg_loss"] == 0.0
-    assert metrics["entropy"] == 0.0
+    assert metrics["entropy"] > 0.0
     assert metrics["critic_warmup"] == 1.0
 
     # Actor card_head weights MUST NOT HAVE CHANGED

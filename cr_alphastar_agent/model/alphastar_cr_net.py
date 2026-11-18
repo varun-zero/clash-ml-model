@@ -218,7 +218,8 @@ class AlphaStarCRNet(nn.Module):
 
     def get_action_and_value(self, obs: dict, action: torch.Tensor = None, deterministic: bool = False,
                              return_entropy_breakdown: bool = False, temperature: float = 1.0,
-                             nucleus_mask: torch.Tensor = None, return_nucleus: bool = False):
+                             nucleus_mask: torch.Tensor = None, return_nucleus: bool = False,
+                             return_tile_probs: bool = False):
         """
         Autoregressive action sampling & value estimation with:
         - FP16-safe logit masking (FP32 cast before -1e9 mask)
@@ -320,6 +321,13 @@ class AlphaStarCRNet(nn.Module):
         total_entropy = card_entropy + tile_entropy
 
         if return_entropy_breakdown:
+            if return_tile_probs:
+                # Used by the PFSP diversity regulariser to measure the
+                # batch-level marginal tile distribution.
+                probs = tile_dist.probs
+                if return_nucleus:
+                    return action, total_log_prob, (card_entropy, tile_entropy), value, nucleus, probs
+                return action, total_log_prob, (card_entropy, tile_entropy), value, probs
             if return_nucleus:
                 return action, total_log_prob, (card_entropy, tile_entropy), value, nucleus
             return action, total_log_prob, (card_entropy, tile_entropy), value
