@@ -129,9 +129,9 @@ def test_top_p_never_removes_every_legal_tile():
 
 def _fake_obs(batch: int = 4) -> dict:
     return {
-        "scalars": torch.randn(batch, 4),
+        "scalars": torch.randn(batch, 7),
         "hand_cards": torch.tensor([[0, 1, 2, 3, 4]] * batch),
-        "entities": torch.randn(batch, 40, 7),
+        "entities": torch.randn(batch, 40, 9),
         "entity_mask": torch.ones(batch, 40, dtype=torch.bool),
         "arena_grid": torch.randn(batch, 6, 32, 18),
         "card_mask": torch.ones(batch, 5, dtype=torch.bool),

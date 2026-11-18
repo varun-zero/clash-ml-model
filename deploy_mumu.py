@@ -87,7 +87,9 @@ from cr_alphastar_agent.config import (
     CARDS_CATALOG, DEFAULT_DECK, POPULAR_DECKS, get_hardware_profile,
     CURRENT_DECK, DECK_PRESETS, resolve_deck_ids
 )
-from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
+from cr_alphastar_agent.model.alphastar_cr_net import (
+    AlphaStarCRNet, adapt_legacy_state_dict,
+)
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID, ID_TO_CRSIM_NAME
 from cr_alphastar_agent.env.live_recorder import LiveMatchRecorder
 from cr_alphastar_agent.env.tactical_masks import (
@@ -97,6 +99,11 @@ from cr_alphastar_agent.env.tactical_masks import (
 )
 from cr_alphastar_agent.env.board_tracker import BoardTracker
 from cr_alphastar_agent.env.unit_identity import UnitIdentityMemory
+from cr_alphastar_agent.env.arena_monitor import ArenaMonitor
+from cr_alphastar_agent.env.opponent_tracker import OpponentTracker
+from cr_alphastar_agent.env.pro_geometry import (
+    king_activation_tiles, kite_tiles, lethal_spell_cycle, should_kite,
+)
 from cr_alphastar_agent.utils.card_intel import get_card_intel
 from cr_alphastar_agent.training.live_learner import LiveLearner
 from cr_alphastar_agent.utils.card_classifier import VisualCardClassifier
@@ -823,6 +830,10 @@ class PerceptionAdapter:
         # Learns the visual signature of every card we deploy; over matches
         # this becomes a library of real battlefield unit templates.
         self.unit_identity = UnitIdentityMemory("data/unit_templates")
+        self.arena_monitor = ArenaMonitor()
+        self.opponent_tracker = OpponentTracker(self.card_intel)
+        self.opponent_state = None
+        self.full_hp_blobs = []
 
         # 4-card cycle bookkeeping.  A card that was just played must not be
         # predicted in hand again for the next three plays, so we remember the
@@ -1040,7 +1051,7 @@ class PerceptionAdapter:
         ]
 
         for i, t in enumerate(towers):
-            entities[i] = t
+            entities[i, :len(t)] = t
             entity_mask[i] = False  # UNMASKED -> Active entity
 
             # Spatial grid channel 4 = buildings/towers
@@ -1168,6 +1179,36 @@ class PerceptionAdapter:
                     continue
                 clean_candidates.append(c_i)
 
+            # Full-HP fusion: a troop at 100% HP renders no HP bar, so the
+            # colour detector above is blind to it.  Background subtraction
+            # exposes the moving sprite directly, including on stone bridges
+            # and tower bases where the dark-border heuristic fails.
+            try:
+                motion_blobs = self.arena_monitor.detect(
+                    arena_crop, self.arena_box, frame.shape[:2]
+                )
+                self.full_hp_blobs = motion_blobs
+                for blob in motion_blobs:
+                    nx = blob.x_tile / ARENA_WIDTH
+                    ny = blob.y_tile / ARENA_HEIGHT
+                    # Skip blobs already explained by an HP bar / badge.
+                    if any(abs(c["norm_x"] - nx) < 0.06 and abs(c["norm_y"] - ny) < 0.06
+                           for c in clean_candidates):
+                        continue
+                    if len(clean_candidates) >= MAX_ENTITIES - 6:
+                        break
+                    clean_candidates.append({
+                        "is_enemy": blob.y_tile >= 16.0,
+                        "norm_x": nx,
+                        "norm_y": ny,
+                        "hp_ratio": 1.0,          # full HP by construction
+                        "bw": blob.w,
+                        "bh": blob.h,
+                        "full_hp_sprite": True,
+                    })
+            except Exception:
+                self.full_hp_blobs = []
+
             slot_idx = 6
             for cand in clean_candidates:
                 if slot_idx >= MAX_ENTITIES:
@@ -1177,7 +1218,7 @@ class PerceptionAdapter:
                 norm_y = cand["norm_y"]
                 hp_ratio = cand["hp_ratio"]
 
-                entities[slot_idx] = [
+                entities[slot_idx, :7] = [
                     5.0 / NUM_CARDS,  # Default troop proxy
                     -1.0 if is_enemy else 1.0,
                     norm_x, norm_y,
@@ -1234,10 +1275,12 @@ class PerceptionAdapter:
         entities, entity_mask, arena_grid = self.detect_entities(frame)
         blocked_slots = self._tick_blocked_slots()
 
-        # 1. Scalars: [own_elixir_norm, opp_elixir_est, time_norm, is_ot]
+        # 1. Scalars (7): the legacy four followed by elixir difference,
+        # opponent counter availability and threat state.
         time_norm = max(0.0, (180.0 - self.match_time_elapsed) / 180.0)
         is_ot = 1.0 if self.match_time_elapsed >= 180.0 else 0.0
-        scalars = np.array([elixir / 10.0, 0.5, time_norm, is_ot], dtype=np.float32)
+        scalars = np.array([elixir / 10.0, 0.5, time_norm, is_ot],
+                           dtype=np.float32)
 
         # 2. Hand Cards: [card0, card1, card2, card3, next_card]
         hand_tensor_np = np.array(hand_cards + [next_card], dtype=np.int64)
@@ -1282,6 +1325,73 @@ class PerceptionAdapter:
         self.board_snapshot = self.board_tracker.update(board_obs, time.time())
         snapshot = self.board_snapshot
 
+        # Opponent hidden-state inference from public plays.  New tracks with
+        # a learned identity are the only trustworthy "card was played"
+        # signal; unmatched sprites stay unknown rather than being guessed.
+        now_s = float(self.match_time_elapsed)
+        speed_phase = 1 if now_s < 120.0 else (2 if now_s < 180.0 else 3)
+        current_ids = {t.track_id for t in snapshot.enemy_tracks}
+        new_tracks = [t for t in snapshot.enemy_tracks
+                      if t.track_id not in getattr(self, "_prev_track_ids", set())]
+        self._prev_track_ids = current_ids
+        if not hasattr(self, "enemy_tower_hp_est"):
+            self.enemy_tower_hp_est = {"left": 1.0, "right": 1.0, "king": 1.0}
+        played = 0
+        for track in new_tracks:
+            if track.card_name and track.card_name != "unknown":
+                if self.opponent_tracker.observe_play(
+                        track.card_name, now_s, track.card_id, "spawn") is not None:
+                    played += 1
+        self.opponent_tracker.tick(
+            now_s, elixir, speed=speed_phase,
+            my_activity=bool(getattr(self, "_my_activity_flag", False)),
+            opp_activity=played > 0,
+        )
+        self.opponent_state = self.opponent_tracker.snapshot(
+            my_elixir=elixir, now=now_s,
+            under_threat=snapshot.under_threat
+        )
+        scalars = np.concatenate([
+            scalars,
+            np.array([
+                self.opponent_state.elixir_diff,
+                1.0 if self.opponent_state.counter_available else 0.0,
+                1.0 if snapshot.under_threat else 0.0,
+            ], dtype=np.float32),
+        ]).astype(np.float32)
+
+        # Zero-shot typing: when no sprite template matched, infer a coarse
+        # role from the measured speed (and air/ground where known) so CardIntel
+        # can still tell an air swarm from a slow tank.
+        self.kinematic_roles = []
+        for track in snapshot.enemy_tracks:
+            if track.card_name and track.card_name != "unknown":
+                continue
+            role, confidence = self.card_intel.coarse_role(
+                track.speed, is_air=None
+            )
+            self.kinematic_roles.append({
+                "track": track.track_id, "role": role,
+                "confidence": confidence, "speed": round(track.speed, 3),
+            })
+
+        # Feed measured velocity into the two new entity features.
+        for idx in range(6, MAX_ENTITIES):
+            if entity_mask[idx]:
+                continue
+            ex = float(entities[idx, 2] * ARENA_WIDTH)
+            ey = float(entities[idx, 3] * ARENA_HEIGHT)
+            nearest = None
+            best_d = 1.5
+            for track in snapshot.enemy_tracks:
+                d = float(np.hypot(track.x - ex, track.y - ey))
+                if d < best_d:
+                    best_d = d
+                    nearest = track
+            if nearest is not None:
+                entities[idx, 7] = float(np.clip(nearest.vx / ARENA_WIDTH, -1, 1))
+                entities[idx, 8] = float(np.clip(nearest.vy / ARENA_HEIGHT, -1, 1))
+
         # Counter knowledge: only mask out a card that is *useless* against
         # everything currently on the board (e.g. a ground-only troop facing
         # a lone Balloon).  Ranking is advisory; we never override a legal
@@ -1319,6 +1429,44 @@ class PerceptionAdapter:
                     _, fallback = max(scored_slots)
                     card_mask[fallback] = True
 
+        # Lethal spell-cycle endgame: in the last 30 s or overtime, if an
+        # enemy tower is low enough for our spell, stop overcommitting at the
+        # bridge and keep a spell in hand.
+        try:
+            spell_power = []
+            for s in range(4):
+                c = self.card_intel.get(self.tracked_hand[s])
+                if c is not None and hand_cards[s] in (8, 9, 14, 16):
+                    spell_power.append(float(c.damage))
+            cycle_now = False
+            for ratio in self.enemy_tower_hp_est.values():
+                if lethal_spell_cycle(ratio, spell_power,
+                                      max(0.0, 180.0 - now_s), now_s >= 180.0):
+                    cycle_now = True
+                    break
+            if cycle_now:
+                for slot in range(4):
+                    if hand_cards[slot] in WIN_CONDITION_IDS and card_mask[slot]:
+                        card_mask[slot] = False
+            self.endgame_spell_cycle = cycle_now
+        except Exception:
+            self.endgame_spell_cycle = False
+
+        # Tempo punish: when the opponent is nearly broke AND their counter
+        # to a building-targeting win condition is not in the inferred hand,
+        # open the opposite bridge for exactly that window.
+        opp = self.opponent_state
+        if opp is not None and opp.opposite_lane_punish and not snapshot.under_threat:
+            punish_x_min, punish_x_max = (12, 15) if (snapshot.threat_x or 9) < 9 else (2, 5)
+            for slot in range(4):
+                if not card_mask[slot]:
+                    continue
+                if hand_cards[slot] not in (3, 11):   # Giant / Hog Rider
+                    continue
+                for tile_y in (13, 14):
+                    for tile_x in range(punish_x_min, punish_x_max + 1):
+                        card_tile_mask[slot, tile_y * ARENA_WIDTH + tile_x] = True
+
         # A detected push tightens troop deployment to the threatened lane.
         if snapshot.push_detected and snapshot.defense_target is not None:
             target_x, target_y = snapshot.defense_target
@@ -1337,6 +1485,60 @@ class PerceptionAdapter:
                 if focused.any():
                     card_tile_mask[slot] = focused
                     card_mask[slot] = True
+
+        # Kiting: drag slow melee attackers diagonally across the centre into
+        # both Princess Towers instead of feeding them a direct tank fight.
+        try:
+            for track in snapshot.enemy_tracks:
+                role, _ = self.card_intel.coarse_role(track.speed)
+                if not should_kite(role, track.speed, track.y):
+                    continue
+                for slot in range(4):
+                    if not card_mask[slot] or hand_cards[slot] not in (1, 5):
+                        continue  # Knight / Mini PEKKA only
+                    for tile_x, tile_y in kite_tiles(track.x, track.y):
+                        card_tile_mask[slot, tile_y * ARENA_WIDTH + tile_x] = True
+        except Exception:
+            pass
+
+        # Velocity-compensated spells: aim where the unit WILL be after the
+        # ADB dispatch and projectile flight, not where it is now.
+        try:
+            spell_slots = [s for s in range(4) if hand_cards[s] in (8, 9, 14, 16)
+                           and card_mask[s] and snapshot.enemy_tracks]
+            for slot in spell_slots:
+                cname = self.tracked_hand[slot]
+                target = min(snapshot.enemy_tracks, key=lambda t: t.y)
+                lead_x, lead_y = self.card_intel.spell_lead_target(
+                    cname, {"x": target.x, "y": target.y,
+                            "vx": target.vx, "vy": target.vy}
+                )
+                radius_tiles = self.card_intel.get(cname).area_radius_tiles or 2.0
+                r = int(round(max(1.0, min(4.0, radius_tiles))))
+                focused = np.zeros_like(card_tile_mask[slot])
+                for ty in range(max(12, int(lead_y) - r), min(32, int(lead_y) + r + 1)):
+                    for tx in range(max(0, int(lead_x) - r), min(18, int(lead_x) + r + 1)):
+                        focused[ty * ARENA_WIDTH + tx] = True
+                if focused.any():
+                    card_tile_mask[slot] = focused
+        except Exception:
+            pass
+
+        # King activation: pull fragile win conditions into the King Tower's
+        # range while it is still at full HP.
+        try:
+            for track in snapshot.enemy_tracks:
+                tiles = king_activation_tiles(track.card_name)
+                if not tiles:
+                    continue
+                for slot in range(4):
+                    if not card_mask[slot] or hand_cards[slot] not in (1, 5, 13):
+                        continue
+                    for tile_x, tile_y in tiles:
+                        if tile_y * ARENA_WIDTH + tile_x < TOTAL_TILES:
+                            card_tile_mask[slot, tile_y * ARENA_WIDTH + tile_x] = True
+        except Exception:
+            pass
 
         # Wrap in PyTorch batch tensors [1, ...] on target device
         obs = {
@@ -2579,12 +2781,12 @@ def main():
     if os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
+            model.load_state_dict(adapt_legacy_state_dict(ckpt["model_state_dict"]))
             step = ckpt.get("global_step", 0)
             upd = ckpt.get("update_count", 0)
             print(f"[Model Loaded]   Checkpoint Step {step} | Update {upd}")
         else:
-            model.load_state_dict(ckpt)
+            model.load_state_dict(adapt_legacy_state_dict(ckpt))
             print("[Model Loaded]   Raw state dict loaded.")
     else:
         print(f"[Warning] Checkpoint '{args.checkpoint}' not found. Using randomly initialized weights.")
@@ -2934,6 +3136,12 @@ def main():
                     perception.deployed_card_names.clear()
                     perception.blocked_slots.clear()
                     perception.board_tracker.reset()
+                    perception.arena_monitor.reset()
+                    perception.opponent_tracker.reset()
+                    perception._prev_track_ids = set()
+                    perception._my_activity_flag = False
+                    perception.enemy_tower_hp_est = {"left": 1.0, "right": 1.0, "king": 1.0}
+                    perception.endgame_spell_cycle = False
                     if recorder is not None:
                         recorder.session["match_index"] = completed_matches + 1
                     perception.read_hand(frame, force_refresh=True)
@@ -3082,6 +3290,21 @@ def main():
                             "tower_hp": {k: round(v.hp_ratio, 2)
                                          for k, v in perception.board_snapshot.towers.items()},
                             "counters": perception.counter_advice,
+                            "kinematic_roles": perception.kinematic_roles,
+                            "opponent": ({
+                                "elixir": perception.opponent_state.elixir,
+                                "elixir_low": perception.opponent_state.elixir_low,
+                                "elixir_diff": perception.opponent_state.elixir_diff,
+                                "seen_cards": perception.opponent_state.seen_cards,
+                                "cycle": perception.opponent_state.cycle,
+                                "counter_locked": perception.opponent_state.counter_locked,
+                                "counter_available": perception.opponent_state.counter_available,
+                                "counter_name": perception.opponent_state.counter_name,
+                                "punish": perception.opponent_state.opposite_lane_punish,
+                            } if perception.opponent_state is not None else None),
+                            "full_hp_blobs": len(perception.full_hp_blobs),
+                            "endgame_spell_cycle": bool(getattr(perception, "endgame_spell_cycle", False)),
+                            "enemy_tower_hp_est": dict(perception.enemy_tower_hp_est),
                         } if perception.board_snapshot is not None else None),
                     }
                     try:
@@ -3098,6 +3321,7 @@ def main():
                 # hand slot).  Unverified taps are rejected, blocked for the
                 # next two ticks and never enter the match statistics.
                 last_action_verified = False
+                last_play_quality = 1.0
                 if (chosen_card != 4 and not cooldown_active
                         and (now - last_deploy_time >= min_deploy_cooldown)
                         and perception.elixir_visible):
@@ -3129,6 +3353,24 @@ def main():
                                 elixir_before=elixir_before,
                             )
                             if verified:
+                                # Credit assignment: a verified tap that hit
+                                # nothing (e.g. a late Arrows on empty grass)
+                                # gets a tiny training weight so the learner
+                                # stops repeating it.
+                                try:
+                                    play_quality, quality_reason = \
+                                        self.card_intel.evaluate_play_quality(
+                                            cname, tile_x, tile_y,
+                                            [{"x": t.x, "y": t.y}
+                                             for t in perception.board_snapshot.enemy_tracks]
+                                            if perception.board_snapshot else [],
+                                            under_threat=bool(perception.board_snapshot
+                                                              and perception.board_snapshot.under_threat),
+                                        )
+                                except Exception:
+                                    play_quality, quality_reason = 1.0, "quality unknown"
+                                last_play_quality = play_quality
+                                self._my_activity_flag = True
                                 last_action_verified = True
                                 # Teach the identity memory what this card
                                 # looks like on the battlefield.  The
@@ -3192,7 +3434,7 @@ def main():
                         done=False,
                         result=None,
                         t_ms=int(perception.match_time_elapsed * 1000),
-                        weight=1.0 if last_action_verified else 0.0,
+                        weight=last_play_quality if last_action_verified else 0.0,
                         verified=last_action_verified,
                     )
 

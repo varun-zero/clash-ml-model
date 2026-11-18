@@ -14,7 +14,9 @@ from cr_alphastar_agent.config import (
     WIN_CONDITION_IDS, DEFENSIVE_CARD_IDS,
     CARDS_CATALOG
 )
-from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
+from cr_alphastar_agent.model.alphastar_cr_net import (
+    AlphaStarCRNet, adapt_legacy_state_dict,
+)
 from cr_alphastar_agent.env.crsim_replica_env import CRSIM_NAME_TO_ID
 from cr_alphastar_agent.env.tactical_masks import EnemyUnit, build_tactical_masks
 from cr_alphastar_agent.utils.card_classifier import VisualCardClassifier
@@ -41,7 +43,7 @@ def create_environment_state(hand_ids, elixir, active_enemy_units=None, device="
     num_active_enemies = len(active_enemy_units)
 
     # 1. Scalars: [own_elixir_norm, opp_elixir_est, time_norm, is_ot]
-    scalars = torch.tensor([[elixir / 10.0, 0.5, 0.8, 0.0]], dtype=torch.float32, device=device)
+    scalars = torch.tensor([[elixir / 10.0, 0.5, 0.8, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=device)
 
     # 2. Hand cards: 4 cards + next card (dummy 1)
     hand_cards = torch.tensor([hand_ids + [1]], dtype=torch.long, device=device)
@@ -61,7 +63,7 @@ def create_environment_state(hand_ids, elixir, active_enemy_units=None, device="
         [0.0, -1.0, 9.0 / 18.0,  31.0 / 32.0,  1.0, 0.0, 1.0],  # 5: Enemy King
     ]
     for i, t in enumerate(towers):
-        entities[0, i] = torch.tensor(t, dtype=torch.float32, device=device)
+        entities[0, i, :len(t)] = torch.tensor(t, dtype=torch.float32, device=device)
         entity_mask[0, i] = False
         gx = int(np.clip(t[2] * ARENA_WIDTH, 0, ARENA_WIDTH - 1))
         gy = int(np.clip(t[3] * ARENA_HEIGHT, 0, ARENA_HEIGHT - 1))
@@ -73,7 +75,7 @@ def create_environment_state(hand_ids, elixir, active_enemy_units=None, device="
     for idx, (cid, ex, ey) in enumerate(active_enemy_units, start=6):
         norm_x = ex / 18.0
         norm_y = ey / 32.0
-        entities[0, idx] = torch.tensor([cid / 16.0, -1.0, norm_x, norm_y, 1.0, 0.0, 1.0], device=device)
+        entities[0, idx, :7] = torch.tensor([cid / 16.0, -1.0, norm_x, norm_y, 1.0, 0.0, 1.0], device=device)
         entity_mask[0, idx] = False
         arena_grid[0, 2, int(np.clip(ey, 0, 31)), int(np.clip(ex, 0, 17))] = 1.0
 
@@ -112,9 +114,9 @@ def run_diagnostics():
     model = AlphaStarCRNet().to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(adapt_legacy_state_dict(ckpt["model_state_dict"]))
     else:
-        model.load_state_dict(ckpt)
+        model.load_state_dict(adapt_legacy_state_dict(ckpt))
     model.eval()
     print(f"Loaded checkpoint: {checkpoint_path}")
     

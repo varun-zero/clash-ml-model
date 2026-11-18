@@ -22,11 +22,14 @@ from cr_alphastar_agent.config import (
     ENT_COEF, VF_COEF, MAX_GRAD_NORM, PPO_EPOCHS, ROLLOUT_STEPS,
     NUM_ENVS, EFFECTIVE_BATCH_SIZE, SNAPSHOT_INTERVAL, ARENA_WIDTH, ARENA_HEIGHT,
     TOTAL_TILES, MAX_ENTITIES, D_MODEL, POPULAR_DECKS,
+    ENTITY_FEATURES, SCALAR_FEATURES,
     sample_random_deck, STAGE_1_END_UPDATE, STAGE_2_END_UPDATE,
     CURRENT_DECK, CURRENT_DECK_IDS, resolve_deck_ids, resolve_deck_names,
     SPELL_CARD_IDS, ELIXIR_LEAK_WEIGHT
 )
-from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
+from cr_alphastar_agent.model.alphastar_cr_net import (
+    AlphaStarCRNet, adapt_legacy_state_dict,
+)
 from cr_alphastar_agent.env.replica_env import ClashRoyaleReplicaEnv
 from cr_alphastar_agent.env.crsim_replica_env import CrSimReplicaEnv
 from cr_alphastar_agent.env.tactical_coach import (
@@ -49,7 +52,9 @@ persp = _perspective(0)
 ENTROPY_CARD_CEILING = 0.90
 ENTROPY_TILE_CEILING = 2.80
 ENTROPY_CARD_COEF = 0.015
-ENTROPY_TILE_COEF = 0.0005
+#: Raised from 0.0005 for PFSP league training: the old value let the tile
+#: head collapse onto a single tile ((2, 13) in live matches).
+ENTROPY_TILE_COEF = 0.004
 
 # After a behaviour-cloning warm start the critic needs a few updates to
 # settle before the actor is allowed to move.
@@ -161,9 +166,9 @@ class RolloutBuffer:
 
         # Observations buffer
         self.obs = {
-            "scalars": torch.zeros((num_steps, num_envs, 4), dtype=torch.float32, device=device),
+            "scalars": torch.zeros((num_steps, num_envs, SCALAR_FEATURES), dtype=torch.float32, device=device),
             "hand_cards": torch.zeros((num_steps, num_envs, 5), dtype=torch.long, device=device),
-            "entities": torch.zeros((num_steps, num_envs, MAX_ENTITIES, 7), dtype=torch.float32, device=device),
+            "entities": torch.zeros((num_steps, num_envs, MAX_ENTITIES, ENTITY_FEATURES), dtype=torch.float32, device=device),
             "entity_mask": torch.ones((num_steps, num_envs, MAX_ENTITIES), dtype=torch.bool, device=device),
             "arena_grid": torch.zeros((num_steps, num_envs, 6, ARENA_HEIGHT, ARENA_WIDTH), dtype=torch.float32, device=device),
             "card_mask": torch.zeros((num_steps, num_envs, 5), dtype=torch.bool, device=device),
@@ -385,7 +390,7 @@ class HybridPPOTrainer:
                 ref_ckpt = torch.load(ref_path, map_location=self.device, weights_only=False)
                 ref_state = ref_ckpt.get("model_state_dict", ref_ckpt)
                 self.bc_reference_model = AlphaStarCRNet().to(self.device)
-                self.bc_reference_model.load_state_dict(ref_state)
+                self.bc_reference_model.load_state_dict(adapt_legacy_state_dict(ref_state))
                 self.bc_reference_model.eval()
                 for param in self.bc_reference_model.parameters():
                     param.requires_grad_(False)
@@ -410,7 +415,7 @@ class HybridPPOTrainer:
         if self.bc_anchor_kl > 0.0 and self.bc_reference_model is None:
             self.bc_reference_model = AlphaStarCRNet().to(self.device)
             ref_dict = state_dict if state_dict is not None else copy.deepcopy(self.model.state_dict())
-            self.bc_reference_model.load_state_dict(ref_dict)
+            self.bc_reference_model.load_state_dict(adapt_legacy_state_dict(ref_dict))
             self.bc_reference_model.eval()
             for param in self.bc_reference_model.parameters():
                 param.requires_grad_(False)
@@ -505,7 +510,7 @@ class HybridPPOTrainer:
         try:
             ckpt = torch.load(path, map_location=self.device, weights_only=False)
             state = ckpt.get("model_state_dict", ckpt)
-            self.model.load_state_dict(state)
+            self.model.load_state_dict(adapt_legacy_state_dict(state))
             print(f"[HybridPPOTrainer] Initialised weights from {os.path.basename(path)}")
             return True
         except Exception as exc:
@@ -1235,7 +1240,7 @@ class HybridPPOTrainer:
         if os.path.exists(latest_path):
             try:
                 ckpt = torch.load(latest_path, map_location=self.device)
-                self.model.load_state_dict(ckpt["model_state_dict"])
+                self.model.load_state_dict(adapt_legacy_state_dict(ckpt["model_state_dict"]))
                 self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 if "scaler_state_dict" in ckpt and bool(ckpt["scaler_state_dict"]) and self.use_amp:
                     self.scaler.load_state_dict(ckpt["scaler_state_dict"])

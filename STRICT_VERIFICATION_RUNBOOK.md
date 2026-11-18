@@ -505,6 +505,28 @@ keys, so training can be resumed normally afterwards.
 
 ---
 
+## 5c. Elite upgrades
+
+Offline checks for the new subsystems live in
+`tests/test_opponent_and_full_hp.py` and `tests/test_pro_geometry.py`:
+
+* opponent Elixir regeneration (1x/2x/3x), exact card cost subtraction,
+  idle resync to 10, 4-play cycle lockout and the punish window;
+* background subtraction finds a full-HP unit against a static plate and
+  excludes active unit boxes from background updates;
+* kinematic typing separates air swarms from ground tanks;
+* kite tiles cross the centre, King activation coordinates are exact,
+  spell leads track a moving unit, and lethal spell cycles require a low
+  tower in the final 30 s / overtime.
+
+The observation shape changed to 7 scalars and 9 entity features. Existing
+checkpoints are padded with zero-weight input columns by
+`adapt_legacy_state_dict()`, so upgrading is behaviour-preserving until the
+new columns are trained. Always verify `python tools/diagnose_truth.py` after
+a checkpoint change.
+
+---
+
 ## 6. History file hygiene
 
 `trophy_climb_history.json` is a log, not a source of truth.

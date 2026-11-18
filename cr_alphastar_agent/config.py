@@ -212,7 +212,10 @@ STAGE_2_END_UPDATE = 300  # Randomized Decks Every Match vs Scripted Bot Sets
 # Neural Network Architecture Specs
 MAX_ENTITIES = 40
 D_MODEL = 128
-ENTITY_FEATURES = 7  # [card_id_norm, side, x_norm, y_norm, hp_ratio, is_air, state]
+ENTITY_FEATURES = 9  # [card_id_norm, side, x_norm, y_norm, hp_ratio, is_air, state, vx_norm, vy_norm]
+#: Scalars: [own_elixir, opp_elixir, time_norm, is_ot, elixir_diff,
+#:           counter_available, under_threat]
+SCALAR_FEATURES = 7
 SPATIAL_CHANNELS = 6  # [p_ground, p_air, opp_ground, opp_air, buildings_towers, valid_deployment]
 
 # RL Hyperparameters (OpenAI Five & AlphaStar)

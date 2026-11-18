@@ -27,7 +27,9 @@ from cr_alphastar_agent.config import (  # noqa: E402
     ARENA_WIDTH, TOTAL_TILES, get_hardware_profile,
 )
 from cr_alphastar_agent.env.live_recorder import load_live_replays, rows_to_dataset  # noqa: E402
-from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet  # noqa: E402
+from cr_alphastar_agent.model.alphastar_cr_net import (
+    AlphaStarCRNet, adapt_legacy_state_dict,
+)  # noqa: E402
 
 
 def build_tensors(dataset: dict, device: torch.device) -> tuple[dict, torch.Tensor]:
@@ -84,7 +86,7 @@ def main() -> None:
     if ckpt_path.exists():
         payload = torch.load(ckpt_path, map_location=device, weights_only=False)
         state = payload.get("model_state_dict", payload)
-        model.load_state_dict(state)
+        model.load_state_dict(adapt_legacy_state_dict(state))
         print(f"[Live BC] Initialised from {ckpt_path}")
     else:
         print(f"[Live BC] WARNING: {ckpt_path} not found, starting from scratch")

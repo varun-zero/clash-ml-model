@@ -19,7 +19,8 @@ from crsim.engine import (
     load_model, ARENA_W, ARENA_H, RIVER_Y, RIVER_HALF, MAX_ELIXIR, TICK_MS
 )
 from cr_alphastar_agent.config import (
-    ARENA_WIDTH, ARENA_HEIGHT, TOTAL_TILES, MAX_ENTITIES,
+    ARENA_WIDTH, ARENA_HEIGHT, TOTAL_TILES, MAX_ENTITIES, ENTITY_FEATURES,
+    SCALAR_FEATURES,
     ACTION_REPEAT, DEFAULT_DECK, CARDS_CATALOG, SPELL_CARD_IDS,
     WIN_CONDITION_IDS, DEFENSIVE_CARD_IDS, DECK_NAME_ALIASES,
     OPP_ELIXIR_SOURCE, DEFENSE_PRIORITY_WEIGHT, SPELL_VALUE_WEIGHT,
@@ -421,9 +422,12 @@ class CrSimReplicaEnv:
         hand_cards = np.array(hand_ids + [next_id], dtype=np.int64)
 
         # 3. Entities & Entity Mask: Shape [40, 7]
-        # Feature: [card_id_norm, side (+1/-1), x_norm, y_norm, hp_ratio, is_air, state]
-        entities = np.zeros((MAX_ENTITIES, 7), dtype=np.float32)
+        # Feature: [card_id_norm, side, x_norm, y_norm, hp_ratio, is_air,
+        #           state, vx_norm, vy_norm]
+        entities = np.zeros((MAX_ENTITIES, ENTITY_FEATURES), dtype=np.float32)
         entity_mask = np.ones(MAX_ENTITIES, dtype=bool)
+        prev_positions = getattr(self, "_entity_pos", {}).get(player_id, {})
+        new_positions: dict = {}
 
         # Sort towers first so Crown Towers always occupy slots 0..5
         all_towers = [u for u in b.units if isinstance(u, CrTower)]
@@ -450,8 +454,18 @@ class CrSimReplicaEnv:
             is_air = 1.0 if getattr(u, "flying", False) else 0.0
             state = 1.0 if u.hp > 0 else 0.0
 
-            entities[idx] = [cid / 16.0, side, norm_x, norm_y, hp_ratio, is_air, state]
+            # Velocity in tiles per decision tick, normalised by arena size.
+            px, py = prev_positions.get(id(u), (cx, cy))
+            vx = np.clip((cx - px) / ARENA_W, -1.0, 1.0)
+            vy = np.clip((cy - py) / ARENA_H, -1.0, 1.0)
+            new_positions[id(u)] = (cx, cy)
+            entities[idx] = [cid / 16.0, side, norm_x, norm_y, hp_ratio,
+                             is_air, state, float(vx), float(vy)]
             entity_mask[idx] = False
+
+        if not hasattr(self, "_entity_pos"):
+            self._entity_pos = {}
+        self._entity_pos[player_id] = new_positions
 
         # Fallback guard
         if entity_mask.all():
@@ -545,6 +559,24 @@ class CrSimReplicaEnv:
         card_tiles = bundle.card_tile_mask
         # Keep legacy tile_mask as union; network uses per-card mask when present.
         tile_mask = bundle.tile_mask
+
+        # Enriched scalars.  The first four are the legacy values, so old
+        # checkpoints stay valid (new input columns are zero-initialised).
+        elixir_diff = float(np.clip(
+            (float(b.elixir[team]) - float(b.elixir[opp_team])) / 10.0, -1.0, 1.0))
+        counter_available = 0.0
+        if self.battle is not None:
+            own_hand = set(b.hand[team])
+            from cr_alphastar_agent.env.opponent_tracker import COUNTERS_TO_BUILDING_TARGETERS
+            counter_available = 1.0 if any(
+                name in own_hand for name in COUNTERS_TO_BUILDING_TARGETERS
+            ) else 0.0
+        under_threat = 1.0 if bundle.under_threat else 0.0
+        scalars = np.concatenate([
+            scalars,
+            np.array([elixir_diff, counter_available, under_threat],
+                     dtype=np.float32),
+        ]).astype(np.float32)
 
         return {
             "scalars": scalars,

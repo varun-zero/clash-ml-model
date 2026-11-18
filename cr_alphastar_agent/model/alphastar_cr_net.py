@@ -16,11 +16,43 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 from cr_alphastar_agent.config import (
     ARENA_WIDTH, ARENA_HEIGHT, TOTAL_TILES, MAX_ENTITIES, D_MODEL,
-    ENTITY_FEATURES, SPATIAL_CHANNELS, NUM_CARDS, SPELL_CARD_IDS
+    ENTITY_FEATURES, SPATIAL_CHANNELS, NUM_CARDS, SCALAR_FEATURES,
+    SPELL_CARD_IDS
 )
 
 # Nucleus (top-p) sampling threshold for the tile head.
 TOP_P_NUCLEUS = 0.85
+
+
+def adapt_legacy_state_dict(state: dict) -> dict:
+    """Pad older checkpoints to the current observation dimensions.
+
+    The 7-scalar / 9-entity observations extend the previous 4-scalar /
+    7-entity ones.  Old weights are kept verbatim and the columns for the new
+    inputs are zero-initialised, so an upgraded checkpoint behaves *exactly*
+    as before until it is fine-tuned on the richer observation.
+    """
+    out = dict(state)
+    scalar_key = None
+    entity_key = None
+    for key in out:
+        if key.endswith("scalar_tower.0.weight") or key.endswith("scalar_fc.0.weight"):
+            scalar_key = key
+        elif key.endswith("entity_proj.weight"):
+            entity_key = key
+    if scalar_key is not None:
+        weight = out[scalar_key]
+        target = SCALAR_FEATURES + 5 * 32
+        if weight.ndim == 2 and weight.shape[1] < target:
+            pad = weight.new_zeros((weight.shape[0], target - weight.shape[1]))
+            out[scalar_key] = torch.cat([weight, pad], dim=1)
+    if entity_key is not None:
+        weight = out[entity_key]
+        if weight.ndim == 2 and weight.shape[1] < ENTITY_FEATURES:
+            pad = weight.new_zeros((weight.shape[0],
+                                    ENTITY_FEATURES - weight.shape[1]))
+            out[entity_key] = torch.cat([weight, pad], dim=1)
+    return out
 
 
 class AlphaStarCRNet(nn.Module):
@@ -44,7 +76,7 @@ class AlphaStarCRNet(nn.Module):
         self.card_emb = nn.Embedding(num_cards + 1, 32, padding_idx=0)
         # 4 scalars: [own_elixir_norm, enemy_elixir_est_norm, time_norm, is_overtime] + 5 cards * 32
         self.scalar_fc = nn.Sequential(
-            nn.Linear(4 + 5 * 32, d_model),
+            nn.Linear(SCALAR_FEATURES + 5 * 32, d_model),
             nn.SiLU(),
             nn.Linear(d_model, d_model)
         )

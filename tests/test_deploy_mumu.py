@@ -131,11 +131,11 @@ def test_frame_to_obs_encodes_tracked_card_names_as_policy_ids():
     assert next_id == CRSIM_NAME_TO_ID[adapter.tracked_next]
 
     obs = adapter.frame_to_obs(frame)
-    assert obs["scalars"].shape == (1, 4)
+    assert obs["scalars"].shape == (1, 7)
     assert obs["hand_cards"].shape == (1, 5)
     assert obs["hand_cards"].dtype == torch.int64
     assert obs["hand_cards"].tolist() == [[*hand_ids, next_id]]
-    assert obs["entities"].shape == (1, 40, 7)
+    assert obs["entities"].shape == (1, 40, 9)
     assert obs["entity_mask"].shape == (1, 40)
     assert obs["arena_grid"].shape == (1, 6, 32, 18)
     assert obs["card_mask"].shape == (1, 5)

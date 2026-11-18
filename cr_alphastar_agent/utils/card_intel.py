@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import numpy as np
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -24,6 +25,10 @@ _LOGIC_PATH = os.path.join(_PROJECT_ROOT, "data", "logic.json")
 
 #: Engine range units are 1/1000 of a tile (see crsim/engine.py).
 _RANGE_PER_TILE = 1000.0
+#: Engine conversion: Speed u -> tiles/s = 0.0125 * u (crsim/engine.py:53).
+SPEED_TILE_S_PER_UNIT = 0.0125
+ARENA_WIDTH_TILES = 18
+ARENA_HEIGHT_TILES = 32
 #: Default character level used by the simulator.
 DEFAULT_LEVEL = 11
 
@@ -81,6 +86,7 @@ class CardStats:
     # Set by the loader from the unit's speed field; kept out of the frozen
     # dataclass constructor so equality/hash stay stable.
     speed_hint: float = 0.0
+    projectile_speed_tiles_s: float = 0.0
 
 
 @dataclass
@@ -161,9 +167,13 @@ class CardIntel:
             # own action script.  Resolve all three so spell matchups get a
             # real damage number instead of a silent zero.
             area_radius = _num(row.get("Radius")) / _RANGE_PER_TILE
+            projectile_speed = 0.0
             projectile_name = row.get("Projectile")
             if projectile_name:
                 projectile = self.logic.get("projectiles", {}).get(projectile_name, {}) or {}
+                # Engine conversion: projectile Speed -> tiles/s = 0.01 * u
+                # (crsim/engine.py PROJECTILE_TILE_S_PER_UNIT).
+                projectile_speed = _num(projectile.get("Speed")) * 0.01
                 if dmg <= 0:
                     dmg = _num(projectile.get("Damage"))
                 if dmg > 0:
@@ -219,7 +229,8 @@ class CardIntel:
                 area_radius_tiles=area_radius,
                 rarity=str(row.get("Rarity") or ""),
                 icon=str(row.get("IconFile") or ""),
-                speed_hint=_num(unit.get("Speed")) / 1000.0,
+                speed_hint=_num(unit.get("Speed")) * SPEED_TILE_S_PER_UNIT,
+                projectile_speed_tiles_s=projectile_speed,
             )
             self.cards[stats.name] = stats
             self._index_aliases[self._key(stats.name)] = stats.name
@@ -338,6 +349,114 @@ class CardIntel:
                 why.append("low-DPS tank vs tank")
 
         return CounterScore(our_card, enemy_card, float(score), why)
+
+    def candidates_by_kinematics(self, speed_tiles_s: float,
+                                 is_air: Optional[bool] = None,
+                                 tolerance: float = 0.30) -> List[Tuple[str, float]]:
+        """Zero-shot unit typing from observed movement speed.
+
+        ``data/logic.json`` stores each unit's raw ``Speed``.  The simulator
+        converts it with ``SPEED_TILE_S_PER_UNIT = 0.0125`` (crsim/engine.py),
+        giving distinct speed tiers: Slow ~0.56, Medium ~0.75, Fast ~1.13 and
+        Very Fast ~1.5 tiles/s.  Matching the observed velocity against those
+        tiers identifies air swarms versus slow tanks even when no sprite
+        template has been learned yet.
+        """
+        speed_tiles_s = max(0.0, float(speed_tiles_s))
+        results: List[Tuple[str, float]] = []
+        for name, card in self.cards.items():
+            if card.spell or card.building or card.speed_hint <= 0:
+                continue
+            if is_air is not None and card.flying != is_air:
+                continue
+            delta = abs(card.speed_hint - speed_tiles_s)
+            if delta > tolerance:
+                continue
+            confidence = max(0.0, 1.0 - delta / max(tolerance, 1e-6))
+            results.append((name, round(confidence, 3)))
+        results.sort(key=lambda item: -item[1])
+        return results
+
+    def coarse_role(self, speed_tiles_s: float,
+                    is_air: Optional[bool] = None) -> Tuple[str, float]:
+        """Coarse but immediate role label for an unseen unit."""
+        candidates = self.candidates_by_kinematics(speed_tiles_s, is_air)
+        if not candidates:
+            return ("unknown", 0.0)
+        name, confidence = candidates[0]
+        card = self.cards.get(name)
+        if card is None:
+            return ("unknown", 0.0)
+        if card.is_swarm:
+            role = "air_swarm" if card.flying else "ground_swarm"
+        elif card.is_tank:
+            role = "air_tank" if card.flying else "ground_tank"
+        elif card.is_support:
+            role = "air_support" if card.flying else "ground_support"
+        else:
+            role = "air_unit" if card.flying else "ground_unit"
+        return role, confidence
+
+    def evaluate_play_quality(self, card_name: str, tile_x: float, tile_y: float,
+                              enemies: Sequence[Dict[str, float]],
+                              under_threat: bool = False,
+                              affordable_defense: bool = False) -> Tuple[float, str]:
+        """Score how useful a verified play was, for training credit.
+
+        This is deliberately conservative: a play is only punished when the
+        frame gives clear evidence it accomplished nothing.
+
+        * spells must actually cover an enemy — an Arrows on empty grass is
+          the classic "useless late spell";
+        * win conditions played while our tower is under threat and a cheap
+          defender is in hand are bad tempo;
+        * troops aimed more than 6 tiles from any enemy on an empty board are
+          treated as neutral (they may be a legitimate slow roll).
+        """
+        card = self.get(card_name)
+        if card is None:
+            return 1.0, "unknown card - neutral"
+
+        if card.spell or card.instant_damage > 0:
+            radius = max(0.9, card.area_radius_tiles or 2.0)
+            hits = [e for e in enemies
+                    if (float(e.get("x", 0)) - tile_x) ** 2
+                    + (float(e.get("y", 0)) - tile_y) ** 2 <= radius ** 2]
+            if not hits:
+                return 0.05, "spell hit nothing (wasted elixir)"
+            quality = min(1.0, 0.55 + 0.2 * len(hits))
+            return quality, f"spell hit {len(hits)} target(s)"
+
+        if card.cost >= 4 and under_threat and affordable_defense:
+            return 0.35, "expensive play while under threat with cheap defence"
+
+        return 1.0, "no negative evidence"
+
+    def spell_lead_target(self, card_name: str, enemy: Dict[str, float],
+                          king_pos: Tuple[float, float] = (9.0, 3.0),
+                          dispatch_s: float = 0.35) -> Tuple[float, float]:
+        """Kinematic interception point for a spell.
+
+        ``enemy`` needs ``x``, ``y`` and optionally ``vx``/``vy`` in tiles per
+        second (from :class:`BoardTracker`).  The lead accounts for the ADB
+        dispatch latency plus projectile flight, and is clamped so a fast
+        unit cannot pull the target absurdly far.
+        """
+        x = float(enemy.get("x", 0.0))
+        y = float(enemy.get("y", 0.0))
+        vx = float(enemy.get("vx", 0.0))
+        vy = float(enemy.get("vy", 0.0))
+        card = self.get(card_name)
+        speed = float(card.projectile_speed_tiles_s) if card is not None else 0.0
+        if speed <= 0:
+            speed = 12.0    # instant area effects (Zap)
+        distance = float(np.hypot(x - king_pos[0], y - king_pos[1]))
+        flight = min(0.4, distance / speed)
+        lead = min(0.85, dispatch_s + flight)
+        return (
+            float(np.clip(x + vx * lead, 0, ARENA_WIDTH_TILES - 1)),
+            float(np.clip(y + vy * lead, 0, ARENA_HEIGHT_TILES - 1)),
+        )
 
     def best_counters(self, our_hand: Sequence[str],
                       enemy_cards: Sequence[str]) -> List[CounterScore]:

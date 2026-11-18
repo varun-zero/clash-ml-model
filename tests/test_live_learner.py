@@ -36,7 +36,7 @@ def make_rows(count: int, weight: float = 1.0) -> list:
     rng = np.random.default_rng(7)
     for i in range(count):
         obs = {
-            "scalars": rng.random(4).astype(np.float32),
+            "scalars": rng.random(7).astype(np.float32),
             "hand_cards": np.array([1, 2, 5, 9, 8], dtype=np.int64),
             "entities": np.zeros((40, ENTITY_FEATURES), dtype=np.float32),
             "entity_mask": np.ones(40, dtype=bool),
@@ -71,7 +71,7 @@ def test_recorder_handles_cuda_tensors(tmp_path):
     path = tmp_path / "replay.jsonl"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     obs = {
-        "scalars": torch.randn(1, 4, device=device),
+        "scalars": torch.randn(1, 7, device=device),
         "hand_cards": torch.tensor([[1, 2, 3, 4, 5]], device=device),
     }
     recorder = LiveMatchRecorder(str(path))
@@ -80,7 +80,20 @@ def test_recorder_handles_cuda_tensors(tmp_path):
     row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
     assert row["verified"] is True
     assert row["weight"] == 1.0
-    assert len(row["obs"]["scalars"][0]) == 4
+    assert len(row["obs"]["scalars"][0]) == 7
+
+
+def test_legacy_checkpoint_is_padded_to_the_new_observation_shape():
+    from cr_alphastar_agent.model.alphastar_cr_net import adapt_legacy_state_dict
+    model = AlphaStarCRNet()
+    state = model.state_dict()
+    old = dict(state)
+    old["scalar_fc.0.weight"] = old["scalar_fc.0.weight"][:, :164].clone()
+    old["entity_proj.weight"] = old["entity_proj.weight"][:, :7].clone()
+    adapted = adapt_legacy_state_dict(old)
+    AlphaStarCRNet().load_state_dict(adapted)
+    assert adapted["scalar_fc.0.weight"].shape[1] == 167
+    assert adapted["entity_proj.weight"].shape[1] == 9
 
 
 def test_no_update_for_unverified_outcome(learner):

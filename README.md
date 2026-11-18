@@ -250,6 +250,36 @@ cannot prove is recorded as `UNVERIFIED`, never as a win.
   attempt is logged in `checkpoints/live_learning_log.jsonl`. Disable with
   `--no-learn`.
 
+### 5c. Elite upgrades: hidden state, full-HP vision and pro geometry
+
+* `env/opponent_tracker.py` maintains a **live opponent Elixir counter** (start
+  5, +1/2.8 s / 1.4 s / 0.93 s by phase, exact card costs from `logic.json`,
+  resync to 10 after 3 s idle) and the **8-card FIFO cycle**. It exposes
+  `elixir_diff`, `counter_available` and the opposite-lane punish window.
+* `env/arena_monitor.py` keeps an EMA of the static arena and uses
+  `cv2.absdiff` to find troops at **100% HP**, including on stone bridges and
+  tower bases where HP-bar colour detection is blind.
+* Zero-shot unit typing from `logic.json` kinematics: measured speed tiers
+  (0.56 / 0.75 / 1.13 / 1.5 tiles/s) plus river-crossing behaviour separate
+  air swarms from slow tanks without a learned sprite template.
+* `env/pro_geometry.py`: cross-lane kite tiles `(10, 11)` / `(7, 11)`, King
+  activation coordinates, velocity-compensated spell leads (ADB latency +
+  projectile flight) and a lethal spell-cycle endgame mode.
+* Wasteful plays get near-zero training weight (e.g. a spell that hits nothing,
+  an expensive overcommit while under threat), so the learner stops repeating
+  them.
+* Observation tensors are now **7 scalars and 9 entity features** (velocity).
+  Old checkpoints load unchanged: `adapt_legacy_state_dict()` zero-pads the
+  two affected input layers, so behaviour is identical until fine-tuned.
+
+To rebuild the spatial policy with PFSP league training (fixes bridge stacking):
+
+```powershell
+python -m cr_alphastar_agent.train --total-updates 500 --num-envs 8 \
+  --entropy-preset diverse --init-bc checkpoints/latest.pt
+```
+(`ENTROPY_TILE_COEF` is now 0.004.)
+
 ---
 
 ## Competitive v2 (additive, public-information agent)

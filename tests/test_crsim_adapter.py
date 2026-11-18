@@ -19,9 +19,9 @@ def initial_observation(simulator):
 
 def test_observation_shapes_and_dtypes(initial_observation):
     expected_shapes = {
-        "scalars": (4,),
+        "scalars": (7,),
         "hand_cards": (5,),
-        "entities": (40, 7),
+        "entities": (40, 9),
         "entity_mask": (40,),
         "arena_grid": (6, 32, 18),
         "card_mask": (5,),
@@ -72,8 +72,8 @@ def test_step_both_advances_a_valid_wait_action(simulator):
         simulator.step_both(wait, wait)
     )
 
-    assert obs_blue["scalars"].shape == (4,)
-    assert obs_red["scalars"].shape == (4,)
+    assert obs_blue["scalars"].shape == (7,)
+    assert obs_red["scalars"].shape == (7,)
     assert np.isfinite([reward_blue, reward_red]).all()
     assert isinstance(terminated, bool)
     assert isinstance(truncated, bool)

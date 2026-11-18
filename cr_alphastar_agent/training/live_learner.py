@@ -30,6 +30,9 @@ import torch
 import torch.nn.functional as F
 
 from cr_alphastar_agent.config import TOTAL_TILES
+from cr_alphastar_agent.model.alphastar_cr_net import (
+    AlphaStarCRNet, adapt_legacy_state_dict,
+)
 
 MIN_DECISIONS = 12
 LEARNING_RATE = 1e-5
@@ -171,7 +174,6 @@ class LiveLearner:
         self.log_path = log_path or os.path.join(
             os.path.dirname(os.path.abspath(checkpoint_path)), "live_learning_log.jsonl"
         )
-        from cr_alphastar_agent.model.alphastar_cr_net import AlphaStarCRNet
         self.model = AlphaStarCRNet().to(self.device)
         self._load_weights(self.model)
         self.model.train()
@@ -182,7 +184,7 @@ class LiveLearner:
         payload = torch.load(self.checkpoint_path, map_location=self.device,
                              weights_only=False)
         state = payload.get("model_state_dict", payload)
-        model.load_state_dict(state)
+        model.load_state_dict(adapt_legacy_state_dict(state))
 
     # -------------------------------------------------------------- public API
     def after_match(self, rows: Sequence[Dict[str, Any]], result: str,
