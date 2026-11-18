@@ -276,9 +276,12 @@ To rebuild the spatial policy with PFSP league training (fixes bridge stacking):
 
 ```powershell
 python -m cr_alphastar_agent.train --total-updates 500 --num-envs 8 \
-  --entropy-preset diverse --init-bc checkpoints/latest.pt
+  --opponents self_play --pure-self-play \
+  --init-bc checkpoints/latest.pt --checkpoint-dir checkpoints/pfsp_run
 ```
-(`ENTROPY_TILE_COEF` is now 0.004.)
+The entropy coefficient is set in code (`ENTROPY_TILE_COEF = 0.004`); there is
+no `--entropy-preset` CLI flag. `--opponents self_play` is required or the
+CLI defaults to rule-based scripted opponents.
 
 ---
 

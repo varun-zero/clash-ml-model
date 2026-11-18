@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from collections import Counter
 from typing import Dict, List, Tuple, Optional, Any
 
 from cr_alphastar_agent.config import (
@@ -288,6 +289,8 @@ class HybridPPOTrainer:
         self.batch_p1_wins = 0
         self.batch_p2_wins = 0
         self.batch_draws = 0
+        # Tile-usage histogram: the direct measure of spatial collapse.
+        self.batch_tiles: Counter = Counter()
         self.batch_tactical_zones = {
             "Back-of-King Slow-Roll": 0,
             "Center Split": 0,
@@ -809,6 +812,7 @@ class HybridPPOTrainer:
         self.batch_p1_wins = 0
         self.batch_p2_wins = 0
         self.batch_draws = 0
+        self.batch_tiles.clear()
         for k in self.batch_tactical_zones:
             self.batch_tactical_zones[k] = 0
 
@@ -844,6 +848,7 @@ class HybridPPOTrainer:
 
                 if 0 <= slot <= 3:
                     t_idx = int(act[1])
+                    self.batch_tiles[t_idx] += 1
                     tx = float(t_idx % ARENA_WIDTH)
                     ty = float(t_idx // ARENA_WIDTH)
                     if ty <= 4.0:
@@ -1144,6 +1149,10 @@ class HybridPPOTrainer:
             "batch_win_rate": batch_win_rate,
             "tactical_zones": dict(self.batch_tactical_zones),
             "tactical_zone_pcts": zone_pcts,
+            "distinct_tiles": len(self.batch_tiles),
+            "top_tile_share": round(
+                max(self.batch_tiles.values()) / max(1, sum(self.batch_tiles.values())), 4
+            ),
         })
 
         # Append to telemetry history and generate obsidian graph
@@ -1166,6 +1175,8 @@ class HybridPPOTrainer:
             "batch_losses": batch_p2,
             "batch_draws": batch_d,
             "batch_win_rate": float(batch_win_rate),
+            "distinct_tiles": len(self.batch_tiles),
+            "top_tile_share": float(avg_metrics.get("top_tile_share", 0.0)),
         }
         self.training_history.append(history_entry)
         self._save_training_history()

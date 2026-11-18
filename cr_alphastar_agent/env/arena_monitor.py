@@ -82,10 +82,11 @@ class ArenaMonitor:
         diff = cv2.absdiff(current, self.background.astype(np.int16))
         grey = cv2.cvtColor(diff.astype(np.uint8), cv2.COLOR_BGR2GRAY)
         _, mask = cv2.threshold(grey, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
-        # Ignore the animated river band and the screen edges.
+        # Do NOT blank the river band here.  The EMA background already
+        # absorbs the static river and its shimmer; masking rows 0.43..0.58
+        # split any troop standing on a bridge into thin strips and recreated
+        # the very bridge blindness this detector is meant to fix.
         h, w = mask.shape[:2]
-        ry0, ry1 = int(0.43 * h), int(0.58 * h)
-        mask[ry0:ry1, :] = 0
         mask[:, :int(0.05 * w)] = 0
         mask[:, int(0.95 * w):] = 0
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,

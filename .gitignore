@@ -20,6 +20,7 @@ dist/
 .vscode/
 
 # Intermediate training checkpoints (keep latest.pt and history)
+checkpoints/pfsp_run/
 checkpoints/ckpt_step_*.pt
 checkpoints/**/ckpt_step_*.pt
 checkpoints/pool/archive_pre_tactical/
