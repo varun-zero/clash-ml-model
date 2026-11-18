@@ -283,6 +283,16 @@ The entropy coefficient is set in code (`ENTROPY_TILE_COEF = 0.004`); there is
 no `--entropy-preset` CLI flag. `--opponents self_play` is required or the
 CLI defaults to rule-based scripted opponents.
 
+Win rate against the league is **not** a strength metric in self-play: the
+opponent is either the same live network, a frozen past self, or a fixed
+tactical bot. To measure real improvement, run a seat-swapped head-to-head
+between two checkpoints on identical decks/seeds (greedy actions, Wilson CI):
+
+```powershell
+python tools/head_to_head.py --challenger checkpoints/pfsp_run/latest.pt \
+  --baseline checkpoints/latest.pt --matches 100 --envs 16
+```
+
 ---
 
 ## Competitive v2 (additive, public-information agent)
