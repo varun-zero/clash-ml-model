@@ -55,13 +55,19 @@ def batch_obs(obs_list, device: torch.device):
     }
 
 
-def act_batched(net: AlphaStarCRNet, obs_list, device: torch.device) -> np.ndarray:
+def act_batched(net: AlphaStarCRNet, obs_list, device: torch.device,
+                sampled: bool = False, sample_seed: int = 0) -> np.ndarray:
     if not obs_list:
         return np.empty((0, 2), dtype=np.int64)
     batch = batch_obs(obs_list, device)
     with torch.no_grad():
+        # Common random numbers: both networks draw the same uniforms at the
+        # same decision, so the comparison is paired rather than noisy.
+        if sampled:
+            torch.manual_seed(sample_seed)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            actions, _, _, _ = net.get_action_and_value(batch, deterministic=True)
+            actions, _, _, _ = net.get_action_and_value(
+                batch, deterministic=not sampled)
     return actions.squeeze(0).cpu().numpy() if len(obs_list) == 1 else actions.cpu().numpy()
 
 
@@ -88,6 +94,8 @@ def main(argv=None) -> int:
                     help="decision cap per game (sim naturally ends at ~750)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--sampled", action="store_true",
+                    help="sample actions with paired seeds instead of greedy argmax")
     args = ap.parse_args(argv)
 
     device = torch.device(args.device if args.device != "auto"
@@ -107,12 +115,17 @@ def main(argv=None) -> int:
     # Even envs: A is Player 1.  Odd envs: B is Player 1.  Seat bias cancels.
     seats = [("A", "B") if i % 2 == 0 else ("B", "A") for i in range(n)]
     cur_p1 = [envs[i].reset(seed=args.seed + i)[0] for i in range(n)]
+    init_hp = [
+        {t: sum(envs[i]._get_tower_hps(t).values()) for t in (0, 1)}
+        for i in range(n)
+    ]
     game_id = [args.seed + i for i in range(n)]
     steps = [0] * n
     results = []  # dicts
     next_game = args.seed + n
     t0 = time.time()
     last_reported = 0
+    decision_idx = 0
 
     while len(results) < args.matches:
         # Gather every env's P1 and P2 observation, grouped by which net acts.
@@ -125,9 +138,12 @@ def main(argv=None) -> int:
         actions = {}
         for name in ("A", "B"):
             entries = pending[name]
-            acts = act_batched(nets[name], [o for _, o in entries], device)
+            acts = act_batched(nets[name], [o for _, o in entries], device,
+                               sampled=args.sampled,
+                               sample_seed=args.seed + 10_000 + decision_idx)
             for (i, _), a in zip(entries, acts):
                 actions[(i, name)] = a
+        decision_idx += 1
 
         for i in range(n):
             p1_name, p2_name = seats[i]
@@ -144,6 +160,13 @@ def main(argv=None) -> int:
             c1 = int(battle.crowns[0]) if battle else 0
             c2 = int(battle.crowns[1]) if battle else 0
             winner = p1_name if c1 > c2 else (p2_name if c2 > c1 else "DRAW")
+            # Continuous strength signal: tower damage dealt minus taken.
+            # Works even when the game ends 0-0 crowns.
+            final0 = sum(envs[i]._get_tower_hps(0).values())
+            final1 = sum(envs[i]._get_tower_hps(1).values())
+            dealt_to_1 = max(0.0, init_hp[i][1] - final1)  # by blue / P1
+            dealt_to_0 = max(0.0, init_hp[i][0] - final0)  # by red / P2
+            a_net_damage = (dealt_to_1 - dealt_to_0) if p1_name == "A" else (dealt_to_0 - dealt_to_1)
             results.append({
                 "game": game_id[i],
                 "winner": winner,
@@ -151,10 +174,12 @@ def main(argv=None) -> int:
                 "crowns_p1": c1, "crowns_p2": c2,
                 "steps": steps[i],
                 "capped": steps[i] >= args.max_steps,
+                "a_net_damage": round(a_net_damage, 2),
             })
             if len(results) >= args.matches:
                 break
             cur_p1[i] = envs[i].reset(seed=next_game)[0]
+            init_hp[i] = {t: sum(envs[i]._get_tower_hps(t).values()) for t in (0, 1)}
             game_id[i] = next_game
             steps[i] = 0
             next_game += 1
@@ -169,6 +194,9 @@ def main(argv=None) -> int:
     capped = sum(r["capped"] for r in results)
     decisive = a_wins + b_wins
     low, high = wilson_interval(a_wins, decisive)
+    damages = np.array([r["a_net_damage"] for r in results], dtype=np.float64)
+    dmg_mean = float(damages.mean())
+    dmg_se = float(damages.std(ddof=1) / math.sqrt(len(damages))) if len(damages) > 1 else 0.0
     a_as_p1 = [r for r in results if r["p1"] == "A"]
     a_as_p2 = [r for r in results if r["p2"] == "A"]
 
@@ -182,6 +210,8 @@ def main(argv=None) -> int:
           f"(Wilson 95% CI [{low:.3f}, {high:.3f}])")
     print(f"  A as P1: {sum(r['winner']=='A' for r in a_as_p1)}/{len(a_as_p1)}  |  "
           f"A as P2: {sum(r['winner']=='A' for r in a_as_p2)}/{len(a_as_p2)}")
+    print(f"  Mean net tower damage for A: {dmg_mean:+.1f} +/- {1.96*dmg_se:.1f} "
+          f"(95% CI [{dmg_mean-1.96*dmg_se:+.1f}, {dmg_mean+1.96*dmg_se:+.1f}])")
     print(f"  elapsed {time.time() - t0:.0f}s")
     print("=" * 68)
 
@@ -190,7 +220,9 @@ def main(argv=None) -> int:
             "challenger": args.challenger, "baseline": args.baseline,
             "matches": len(results), "a_wins": a_wins, "b_wins": b_wins,
             "draws": draws, "capped": capped, "a_win_rate": a_wins / max(1, decisive),
-            "ci95": [low, high],
+            "ci95": [low, high], "sampled": args.sampled,
+            "a_net_damage_mean": dmg_mean, "a_net_damage_ci95": [
+                dmg_mean - 1.96 * dmg_se, dmg_mean + 1.96 * dmg_se],
             "a_as_p1": {"wins": sum(r["winner"]=="A" for r in a_as_p1), "games": len(a_as_p1)},
             "a_as_p2": {"wins": sum(r["winner"]=="A" for r in a_as_p2), "games": len(a_as_p2)},
             "results": results,
