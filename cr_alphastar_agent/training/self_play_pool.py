@@ -17,6 +17,7 @@ from cr_alphastar_agent.config import (
     PFSP_RUSH_EXPLOITER_RATIO, PFSP_SCRIPTED_RATIO, PFSP_HISTORICAL_RATIO, PFSP_CURRENT_RATIO,
     SNAPSHOT_INTERVAL
 )
+from cr_alphastar_agent.model.alphastar_cr_net import adapt_legacy_state_dict
 from cr_alphastar_agent.env.scripted_bot import ScriptedBot, TacticalProBot
 from cr_alphastar_agent.env.rush_exploiter_bot import RushExploiterBot
 
@@ -54,7 +55,12 @@ class SelfPlayLeagueManager:
             try:
                 ckpt = torch.load(f, map_location=self.device)
                 step = ckpt.get("step", 0)
-                record = SnapshotRecord(step, f, ckpt["model_state_dict"])
+                # Older pool snapshots use the 4-scalar / 7-entity tensors.
+                # Pad them to the current input shape so the frozen opponent
+                # can actually be loaded into the new 7/9-observation model.
+                record = SnapshotRecord(
+                    step, f, adapt_legacy_state_dict(ckpt["model_state_dict"])
+                )
                 self.snapshots.append(record)
             except Exception as e:
                 print(f"[SelfPlayLeague] Error loading snapshot {f}: {e}")
